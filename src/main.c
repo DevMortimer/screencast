@@ -5,6 +5,8 @@
 #include <pthread.h>
 #include <time.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -242,6 +244,39 @@ static void send_render_notification(const char *summary, const char *body)
     waitpid(pid, NULL, 0);
 }
 
+static int final_video_is_valid(const char *final_path)
+{
+    struct stat st;
+    if (stat(final_path, &st) < 0 || st.st_size <= 0)
+        return 0;
+
+    pid_t pid = fork();
+    if (pid < 0) return 0;
+
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            close(devnull);
+        }
+
+        execlp("ffprobe", "ffprobe",
+               "-v", "error",
+               "-select_streams", "v:0",
+               "-show_entries", "stream=codec_type",
+               "-of", "csv=p=0",
+               final_path,
+               (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+        return 0;
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 static int run_final_render(const char *capture_path, const char *final_path)
 {
     const char *preset   = env_default("SCREENCAST_NVENC_FINAL_PRESET", "p7");
@@ -296,6 +331,13 @@ static int run_final_render(const char *capture_path, const char *final_path)
     }
 
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (final_video_is_valid(final_path)) {
+            fprintf(stderr,
+                    "main: ffmpeg exited non-zero but final video validates: %s\n",
+                    final_path);
+            return 0;
+        }
+
         fprintf(stderr,
                 "main: final render failed; intermediate kept at %s\n",
                 capture_path);
