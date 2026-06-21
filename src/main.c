@@ -8,6 +8,7 @@
 
 #include <X11/Xlib.h>
 #include <X11/extensions/Xinerama.h>
+#include <X11/extensions/shape.h>
 #include <libavutil/log.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/time.h>
@@ -51,6 +52,107 @@ typedef struct {
 } RecCtx;
 
 static RecCtx s_rec;
+
+typedef struct {
+    Display *dpy;
+    Window win;
+    GC gc;
+} RecIndicator;
+
+static RecIndicator s_rec_indicator;
+
+/* ── live recording indicator ─────────────────────────────── */
+
+static void indicator_close(void)
+{
+    if (!s_rec_indicator.dpy) return;
+
+    if (s_rec_indicator.gc)
+        XFreeGC(s_rec_indicator.dpy, s_rec_indicator.gc);
+    if (s_rec_indicator.win)
+        XDestroyWindow(s_rec_indicator.dpy, s_rec_indicator.win);
+    XCloseDisplay(s_rec_indicator.dpy);
+    memset(&s_rec_indicator, 0, sizeof(s_rec_indicator));
+}
+
+static int indicator_open(int mon_x, int mon_y, int canvas_w, int canvas_h)
+{
+    (void)canvas_h;
+
+    indicator_close();
+
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) return -1;
+
+    int screen = DefaultScreen(dpy);
+    Window root = RootWindow(dpy, screen);
+    int diameter = 24;
+    int x = mon_x + canvas_w - diameter - 12;
+    int y = mon_y + 12;
+
+    XSetWindowAttributes attrs;
+    memset(&attrs, 0, sizeof(attrs));
+    attrs.override_redirect = True;
+    attrs.background_pixel = BlackPixel(dpy, screen);
+    attrs.event_mask = ExposureMask;
+
+    Window win = XCreateWindow(dpy, root, x, y,
+                               (unsigned int)diameter,
+                               (unsigned int)diameter,
+                               0, CopyFromParent, InputOutput,
+                               CopyFromParent,
+                               CWOverrideRedirect | CWBackPixel | CWEventMask,
+                               &attrs);
+    if (!win) {
+        XCloseDisplay(dpy);
+        return -1;
+    }
+
+    int shape_event = 0, shape_error = 0;
+    if (XShapeQueryExtension(dpy, &shape_event, &shape_error)) {
+        Pixmap mask = XCreatePixmap(dpy, win,
+                                    (unsigned int)diameter,
+                                    (unsigned int)diameter, 1);
+        GC mask_gc = XCreateGC(dpy, mask, 0, NULL);
+        XSetForeground(dpy, mask_gc, 0);
+        XFillRectangle(dpy, mask, mask_gc, 0, 0,
+                       (unsigned int)diameter,
+                       (unsigned int)diameter);
+        XSetForeground(dpy, mask_gc, 1);
+        XFillArc(dpy, mask, mask_gc, 0, 0,
+                 (unsigned int)diameter,
+                 (unsigned int)diameter, 0, 360 * 64);
+        XShapeCombineMask(dpy, win, ShapeBounding, 0, 0, mask, ShapeSet);
+#ifdef ShapeInput
+        XSetForeground(dpy, mask_gc, 0);
+        XFillRectangle(dpy, mask, mask_gc, 0, 0,
+                       (unsigned int)diameter,
+                       (unsigned int)diameter);
+        XShapeCombineMask(dpy, win, ShapeInput, 0, 0, mask, ShapeSet);
+#endif
+        XFreeGC(dpy, mask_gc);
+        XFreePixmap(dpy, mask);
+    }
+
+    GC gc = XCreateGC(dpy, win, 0, NULL);
+    Colormap cmap = DefaultColormap(dpy, screen);
+    XColor red, exact;
+    unsigned long red_pixel = 0xff0000;
+    if (XAllocNamedColor(dpy, cmap, "red", &red, &exact))
+        red_pixel = red.pixel;
+
+    XSetForeground(dpy, gc, red_pixel);
+    XFillArc(dpy, win, gc, 0, 0,
+             (unsigned int)diameter,
+             (unsigned int)diameter, 0, 360 * 64);
+    XMapRaised(dpy, win);
+    XFlush(dpy);
+
+    s_rec_indicator.dpy = dpy;
+    s_rec_indicator.win = win;
+    s_rec_indicator.gc = gc;
+    return 0;
+}
 
 /* ── helper: find which monitor the pointer is on ──────────── */
 
@@ -145,10 +247,15 @@ static int recording_open(void)
     printf("[REC] Opening: %s  monitor=%dx%d+%d+%d\n",
            out_path, s_rec.canvas_w, s_rec.canvas_h, s_rec.mon_x, s_rec.mon_y);
 
+    if (indicator_open(s_rec.mon_x, s_rec.mon_y,
+                       s_rec.canvas_w, s_rec.canvas_h) < 0)
+        fprintf(stderr, "main: live recording indicator unavailable\n");
+
     if (capture_screen_open(&s_rec.screen_cap, SCREEN_DEV,
                              s_rec.mon_x, s_rec.mon_y,
                              s_rec.canvas_w, s_rec.canvas_h, FPS) < 0) {
         fprintf(stderr, "main: screen capture failed\n");
+        indicator_close();
         return -1;
     }
 
@@ -190,6 +297,7 @@ static int recording_open(void)
                      s_rec.cam_w, s_rec.cam_h, cam_fmt,
                      audio_sr, audio_ch, audio_fmt) < 0) {
         fprintf(stderr, "main: encoder open failed\n");
+        indicator_close();
         capture_free(&s_rec.screen_cap);
         if (s_rec.has_cam) capture_free(&s_rec.cam_cap);
         if (s_rec.has_aud) capture_free(&s_rec.aud_cap);
@@ -244,6 +352,8 @@ static void recording_loop(void)
 
 static void recording_close(void)
 {
+    indicator_close();
+
     /* Give capture threads up to 50 ms to drain their current read */
     struct timespec ts = { .tv_nsec = 50000000L };
     nanosleep(&ts, NULL);
