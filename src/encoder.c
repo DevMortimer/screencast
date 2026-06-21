@@ -115,20 +115,21 @@ static int setup_audio(EncoderCtx *enc, int sample_rate,
     enc->aud_stream->time_base = enc->aud_enc->time_base;
 
     /*
-     * Resampler: (stereo S16, rate) → (stereo FLTP, rate).
-     *
-     * Pulse/ALSA PCM frames arrive with AV_CHANNEL_ORDER_UNSPEC.  swr cannot
-     * compare UNSPEC layouts and returns AVERROR_INPUT_CHANGED on every frame
-     * when the init layout is also UNSPEC.  Using AV_CHANNEL_LAYOUT_STEREO
-     * (AV_CHANNEL_ORDER_NATIVE) for both sides of swr avoids this.
+     * Pulse/ALSA frames often arrive with AV_CHANNEL_ORDER_UNSPEC.  Configure
+     * swr with a native layout that has the same channel count as the capture
+     * stream, then up/down-mix to stereo AAC output.
      */
+    int in_channels = (in_ch && in_ch->nb_channels > 0) ? in_ch->nb_channels : 2;
+    AVChannelLayout in_layout;
     AVChannelLayout stereo_layout;
+    av_channel_layout_default(&in_layout, in_channels);
     av_channel_layout_default(&stereo_layout, 2);
     ret = swr_alloc_set_opts2(
         &enc->swr,
         &stereo_layout, AV_SAMPLE_FMT_FLTP, sample_rate,
-        &stereo_layout, in_fmt,             sample_rate,
+        &in_layout,     in_fmt,             sample_rate,
         0, NULL);
+    av_channel_layout_uninit(&in_layout);
     av_channel_layout_uninit(&stereo_layout);
     if (ret < 0) { log_err("swr_alloc_set_opts2", ret); return ret; }
 
@@ -184,13 +185,18 @@ static int setup_sws(EncoderCtx *enc,
             cam_w, cam_h, AV_PIX_FMT_RGBA,
             SWS_BILINEAR, NULL, NULL, NULL);
 
+        enc->sws_cam_main = sws_getContext(
+            enc->cam_main_w, enc->cam_main_h, AV_PIX_FMT_RGBA,
+            cw, ch, AV_PIX_FMT_RGBA,
+            SWS_BILINEAR, NULL, NULL, NULL);
+
         int cs = enc->cam_crop_size;
         enc->sws_cam_scale = sws_getContext(
             cs, cs, AV_PIX_FMT_RGBA,
             enc->overlay_size, enc->overlay_size, AV_PIX_FMT_RGBA,
             SWS_BILINEAR, NULL, NULL, NULL);
 
-        if (!enc->sws_cam_raw || !enc->sws_cam_scale) {
+        if (!enc->sws_cam_raw || !enc->sws_cam_main || !enc->sws_cam_scale) {
             fprintf(stderr, "encoder: sws_getContext (cam) failed\n");
             return -1;
         }
@@ -223,6 +229,19 @@ int encoder_open(EncoderCtx *enc, const char *path,
     enc->cam_src_h     = cam_src_h;
     /* Largest centre-crop square that fits inside the webcam frame */
     enc->cam_crop_size = (cam_src_w < cam_src_h) ? cam_src_w : cam_src_h;
+    if (cam_src_w > 0 && cam_src_h > 0) {
+        if ((int64_t)cam_src_w * canvas_h > (int64_t)canvas_w * cam_src_h) {
+            enc->cam_main_h = cam_src_h;
+            enc->cam_main_w = (int)(((int64_t)cam_src_h * canvas_w) / canvas_h);
+        } else {
+            enc->cam_main_w = cam_src_w;
+            enc->cam_main_h = (int)(((int64_t)cam_src_w * canvas_h) / canvas_w);
+        }
+        if (enc->cam_main_w < 1) enc->cam_main_w = 1;
+        if (enc->cam_main_h < 1) enc->cam_main_h = 1;
+        enc->cam_main_x = (cam_src_w - enc->cam_main_w) / 2;
+        enc->cam_main_y = (cam_src_h - enc->cam_main_h) / 2;
+    }
 
     int ret = avformat_alloc_output_context2(&enc->fmt_ctx, NULL, NULL, path);
     if (ret < 0) { log_err("avformat_alloc_output_context2", ret); return ret; }
@@ -250,11 +269,13 @@ int encoder_open(EncoderCtx *enc, const char *path,
 
     if (cam_src_w > 0) {
         enc->cam_rgba    = malloc((size_t)cam_src_w * cam_src_h * 4);
+        enc->cam_main_crop = malloc((size_t)enc->cam_main_w * enc->cam_main_h * 4);
         enc->cam_crop    = malloc((size_t)enc->cam_crop_size * enc->cam_crop_size * 4);
         enc->cam_overlay = malloc((size_t)enc->overlay_size * enc->overlay_size * 4);
         enc->corner_mask = malloc(sizeof(float) *
                                    (size_t)enc->overlay_size * enc->overlay_size);
-        if (!enc->cam_rgba || !enc->cam_crop || !enc->cam_overlay || !enc->corner_mask)
+        if (!enc->cam_rgba || !enc->cam_main_crop || !enc->cam_crop ||
+            !enc->cam_overlay || !enc->corner_mask)
             return AVERROR(ENOMEM);
 
         /* Pre-build the rounded-corner mask (radius = 1/8 of overlay size) */
@@ -290,10 +311,8 @@ static void draw_rec_dot(uint8_t *rgba, int canvas_w, int canvas_h,
  * Pipeline for one video frame:
  *
  *  mode 1 (display):  screen → RGBA canvas → YUV420P → H264
- *  mode 2 (webcam):   black canvas; cam → RGBA → centre-crop → scale
- *                     → apply corner mask → blend centred on canvas
- *                     → YUV420P → H264
- *  mode 3 (both):     screen → RGBA canvas; same cam pipeline, but
+ *  mode 2 (webcam):   cam → RGBA → aspect crop → full canvas → YUV420P → H264
+ *  mode 3 (both):     screen → RGBA canvas; cam overlay pipeline
  *                     blended in the bottom-right corner → YUV420P → H264
  */
 int encoder_write_video(EncoderCtx *enc, int mode,
@@ -326,8 +345,23 @@ int encoder_write_video(EncoderCtx *enc, int mode,
                       0, enc->cam_src_h, d, ls);
         }
 
-        /* 2b. Centre-crop to a square (copy rows from the cropped region) */
-        {
+        if (mode == 2) {
+            for (int row = 0; row < enc->cam_main_h; row++) {
+                memcpy(enc->cam_main_crop + (size_t)row * enc->cam_main_w * 4,
+                       enc->cam_rgba + ((size_t)(enc->cam_main_y + row) *
+                                        enc->cam_src_w + enc->cam_main_x) * 4,
+                       (size_t)enc->cam_main_w * 4);
+            }
+
+            uint8_t *src[1] = { enc->cam_main_crop };
+            int      sls[1] = { enc->cam_main_w * 4 };
+            uint8_t *dst[1] = { enc->canvas_rgba };
+            int      dls[1] = { cw * 4 };
+            sws_scale(enc->sws_cam_main,
+                      (const uint8_t *const *)src, sls,
+                      0, enc->cam_main_h, dst, dls);
+        } else {
+            /* 2b. Centre-crop to a square (copy rows from the cropped region) */
             int cs = enc->cam_crop_size;
             int ox = (enc->cam_src_w - cs) / 2;
             int oy = (enc->cam_src_h - cs) / 2;
@@ -336,11 +370,8 @@ int encoder_write_video(EncoderCtx *enc, int mode,
                        enc->cam_rgba + ((size_t)(oy + row) * enc->cam_src_w + ox) * 4,
                        (size_t)cs * 4);
             }
-        }
 
-        /* 2c. Scale the square crop to overlay_size × overlay_size */
-        {
-            int      cs    = enc->cam_crop_size;
+            /* 2c. Scale the square crop to overlay_size × overlay_size */
             int      ov    = enc->overlay_size;
             uint8_t *src[1] = { enc->cam_crop };
             int      sls[1] = { cs * 4 };
@@ -349,26 +380,12 @@ int encoder_write_video(EncoderCtx *enc, int mode,
             sws_scale(enc->sws_cam_scale,
                       (const uint8_t *const *)src, sls,
                       0, cs, dst, dls);
-        }
 
-        /* 2d. Force alpha=255; swscale does not set it for RGBA output */
-        {
+            /* 2d. Force alpha=255; swscale does not set it for RGBA output */
             int n = enc->overlay_size * enc->overlay_size;
             for (int i = 0; i < n; i++)
                 enc->cam_overlay[i * 4 + 3] = 255;
-        }
 
-        /* 2e. Blend onto canvas with rounded-corner mask */
-        if (mode == 2) {
-            /* Webcam-only: centre on canvas */
-            int ox = (cw - enc->overlay_size) / 2;
-            int oy = (ch - enc->overlay_size) / 2;
-            composite_blend(enc->canvas_rgba, cw, ch,
-                            enc->cam_overlay,
-                            enc->overlay_size, enc->overlay_size,
-                            ox, oy, enc->corner_mask);
-        } else {
-            /* Both: bottom-right corner with margin */
             composite_blend(enc->canvas_rgba, cw, ch,
                             enc->cam_overlay,
                             enc->overlay_size, enc->overlay_size,
@@ -418,12 +435,13 @@ int encoder_feed_audio(EncoderCtx *enc, AVFrame *raw_frame)
 {
     if (!enc->aud_enc) return 0;
 
-    /* Pulse/ALSA PCM frames carry AV_CHANNEL_ORDER_UNSPEC; swr_convert_frame
-     * returns AVERROR_INPUT_CHANGED for every UNSPEC frame since it cannot
-     * compare unspecified layouts.  Stamp AV_CHANNEL_LAYOUT_STEREO so the
-     * frame matches the AV_CHANNEL_ORDER_NATIVE layout swr was configured with. */
+    /* Stamp a native layout with the captured channel count before resampling. */
+    int in_channels = enc->aud_in_layout.nb_channels > 0
+                      ? enc->aud_in_layout.nb_channels
+                      : raw_frame->ch_layout.nb_channels;
+    if (in_channels <= 0) in_channels = 2;
     av_channel_layout_uninit(&raw_frame->ch_layout);
-    av_channel_layout_default(&raw_frame->ch_layout, 2);
+    av_channel_layout_default(&raw_frame->ch_layout, in_channels);
 
     /* Resample to stereo FLTP (swr_convert_frame reads fmt from the frame) */
     AVFrame *res = av_frame_alloc();
@@ -444,7 +462,11 @@ int encoder_feed_audio(EncoderCtx *enc, AVFrame *raw_frame)
     }
     if (ret < 0) { log_err("swr_convert_frame", ret); av_frame_free(&res); return ret; }
 
-    av_audio_fifo_write(enc->aud_fifo, (void **)res->data, res->nb_samples);
+    ret = av_audio_fifo_write(enc->aud_fifo, (void **)res->data, res->nb_samples);
+    if (ret < res->nb_samples) {
+        av_frame_free(&res);
+        return AVERROR(ENOMEM);
+    }
     av_frame_free(&res);
 
     /* Drain complete 1024-sample frames */
@@ -474,6 +496,24 @@ int encoder_flush(EncoderCtx *enc)
     drain_encoder(enc, enc->vid_enc, enc->vid_stream);
 
     if (enc->aud_enc) {
+        int frame_size = enc->aud_enc->frame_size;
+        while (av_audio_fifo_size(enc->aud_fifo) > 0) {
+            int queued = av_audio_fifo_size(enc->aud_fifo);
+            int take = queued < frame_size ? queued : frame_size;
+
+            av_frame_make_writable(enc->aud_frame);
+            av_samples_set_silence(enc->aud_frame->data, 0, frame_size, 2,
+                                   AV_SAMPLE_FMT_FLTP);
+            av_audio_fifo_read(enc->aud_fifo,
+                               (void **)enc->aud_frame->data, take);
+            enc->aud_frame->pts        = enc->aud_pts;
+            enc->aud_frame->nb_samples = frame_size;
+            enc->aud_pts += frame_size;
+
+            avcodec_send_frame(enc->aud_enc, enc->aud_frame);
+            drain_encoder(enc, enc->aud_enc, enc->aud_stream);
+        }
+
         avcodec_send_frame(enc->aud_enc, NULL);
         drain_encoder(enc, enc->aud_enc, enc->aud_stream);
     }
@@ -502,11 +542,13 @@ void encoder_free(EncoderCtx *enc)
 
     sws_freeContext(enc->sws_screen);
     sws_freeContext(enc->sws_cam_raw);
+    sws_freeContext(enc->sws_cam_main);
     sws_freeContext(enc->sws_cam_scale);
     sws_freeContext(enc->sws_to_yuv);
 
     free(enc->canvas_rgba);
     free(enc->cam_rgba);
+    free(enc->cam_main_crop);
     free(enc->cam_crop);
     free(enc->cam_overlay);
     free(enc->corner_mask);

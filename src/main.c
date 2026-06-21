@@ -167,6 +167,11 @@ static int recording_open(void)
     s_rec.has_aud = 0;
     if (capture_audio_open(&s_rec.aud_cap, AUDIO_DEV) == 0) {
         s_rec.has_aud = 1;
+        printf("[REC] Audio source: %d Hz, %d channel%s, %s\n",
+               s_rec.aud_cap.sample_rate,
+               s_rec.aud_cap.ch_layout.nb_channels,
+               s_rec.aud_cap.ch_layout.nb_channels == 1 ? "" : "s",
+               av_get_sample_fmt_name(s_rec.aud_cap.sample_fmt));
     } else {
         fprintf(stderr, "main: audio not available — video only\n");
         capture_free(&s_rec.aud_cap);

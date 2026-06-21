@@ -31,6 +31,7 @@ typedef struct {
     /* ── Pixel-format conversion (libswscale) ─────── */
     struct SwsContext *sws_screen;   /* screen_pix_fmt  → RGBA canvas */
     struct SwsContext *sws_cam_raw;  /* cam_pix_fmt → RGBA at cam size */
+    struct SwsContext *sws_cam_main; /* RGBA cam crop → full canvas */
     struct SwsContext *sws_cam_scale;/* RGBA square crop → overlay size */
     struct SwsContext *sws_to_yuv;  /* canvas RGBA → YUV420P */
 
@@ -43,9 +44,11 @@ typedef struct {
     /* ── Scratch RGBA buffers ─────────────────────── */
     uint8_t *canvas_rgba;  /* canvas_w * canvas_h * 4 */
     uint8_t *cam_rgba;     /* cam_src_w * cam_src_h * 4 */
+    uint8_t *cam_main_crop;/* webcam crop matched to canvas aspect */
     uint8_t *cam_crop;     /* cam_crop_size² * 4 */
     uint8_t *cam_overlay;  /* overlay_size² * 4 */
     int cam_src_w, cam_src_h, cam_crop_size;
+    int cam_main_x, cam_main_y, cam_main_w, cam_main_h;
 
     /* ── Thread safety ────────────────────────────── */
     pthread_mutex_t write_mutex;

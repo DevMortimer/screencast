@@ -6,7 +6,7 @@ OBJDIR  := build
 SRCS    := $(wildcard $(SRCDIR)/*.c)
 OBJS    := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
 
-PKG     := libavformat libavcodec libavdevice libswscale libswresample libavutil x11
+PKG     := libavformat libavcodec libavdevice libswscale libswresample libavutil x11 xtst
 
 CFLAGS  := $(shell pkg-config --cflags $(PKG)) -pthread -O2 -Wall -Wextra -std=c11
 LDFLAGS := $(shell pkg-config --libs   $(PKG)) -pthread -lm -lXinerama
