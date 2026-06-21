@@ -3,6 +3,7 @@
 #include <libavutil/opt.h>
 #include <glob.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -76,19 +77,43 @@ static int webcam_try_device(CaptureCtx *ctx, const char *device,
 {
     memset(ctx, 0, sizeof(*ctx));
 
+    const char *env_fmt  = getenv("SCREENCAST_CAM_FORMAT");
+    const char *env_fps  = getenv("SCREENCAST_CAM_FPS");
+    const char *env_size = getenv("SCREENCAST_CAM_SIZE");
+    const char *fmt      = (env_fmt  && env_fmt[0])  ? env_fmt  : "mjpeg";
+    const char *fps      = (env_fps  && env_fps[0])  ? env_fps  : "30";
+    const char *size     = (env_size && env_size[0]) ? env_size : NULL;
+
     AVDictionary *opts = NULL;
-    av_dict_set(&opts, "input_format", "mjpeg", 0);
-    av_dict_set(&opts, "framerate",    "30",    0);
+    av_dict_set(&opts, "input_format", fmt, 0);
+    av_dict_set(&opts, "framerate",    fps, 0);
+    if (size)
+        av_dict_set(&opts, "video_size", size, 0);
 
     if (open_input(ctx, "video4linux2", device, &opts) < 0) {
         av_dict_free(&opts);
         capture_free(ctx);
 
+        if (size || (env_fmt && env_fmt[0]) || (env_fps && env_fps[0]))
+            fprintf(stderr,
+                    "capture: requested webcam mode failed "
+                    "(format=%s size=%s fps=%s), falling back\n",
+                    fmt, size ? size : "default", fps);
+
         opts = NULL;
+        av_dict_set(&opts, "input_format", "mjpeg", 0);
+        av_dict_set(&opts, "framerate",    "30",    0);
+
         if (open_input(ctx, "video4linux2", device, &opts) < 0) {
             av_dict_free(&opts);
             capture_free(ctx);
-            return -1;
+
+            opts = NULL;
+            if (open_input(ctx, "video4linux2", device, &opts) < 0) {
+                av_dict_free(&opts);
+                capture_free(ctx);
+                return -1;
+            }
         }
     }
 
