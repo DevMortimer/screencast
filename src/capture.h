@@ -3,6 +3,8 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
 
+typedef int (*CaptureInterruptFn)(void *opaque);
+
 typedef struct {
     AVFormatContext    *fmt_ctx;
     AVCodecContext     *dec_ctx;
@@ -15,7 +17,13 @@ typedef struct {
     int width, height;
     int sample_rate;
     AVChannelLayout ch_layout;
+    CaptureInterruptFn should_interrupt;
+    void               *interrupt_opaque;
 } CaptureCtx;
+
+/* Installs a callback used to interrupt blocking FFmpeg device reads. */
+void capture_set_interrupt(CaptureCtx *ctx, CaptureInterruptFn fn,
+                           void *opaque);
 
 /* Opens x11grab at display_name offset by (x_off, y_off), fixed w×h at fps. */
 int  capture_screen_open(CaptureCtx *ctx, const char *display_name,

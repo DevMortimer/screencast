@@ -30,6 +30,7 @@ with NVIDIA NVENC.
   - `xext`
   - `xinerama`
 - FFmpeg CLI available as `ffmpeg`
+- Desktop notifications via `notify-send`
 - NVIDIA GPU/driver stack with `h264_nvenc` support
 
 On Debian/Ubuntu-based systems, the packages are typically:
@@ -37,7 +38,8 @@ On Debian/Ubuntu-based systems, the packages are typically:
 ```sh
 sudo apt install build-essential pkg-config ffmpeg \
   libavformat-dev libavcodec-dev libavdevice-dev libswscale-dev \
-  libswresample-dev libavutil-dev libx11-dev libxext-dev libxinerama-dev
+  libswresample-dev libavutil-dev libx11-dev libxext-dev \
+  libxinerama-dev libnotify-bin
 ```
 
 ## Build

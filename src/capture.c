@@ -9,6 +9,37 @@
 
 /* ── internal helpers ──────────────────────────────────────── */
 
+static void preserve_interrupt(CaptureCtx *ctx,
+                               CaptureInterruptFn *fn,
+                               void **opaque)
+{
+    *fn = ctx->should_interrupt;
+    *opaque = ctx->interrupt_opaque;
+}
+
+static void restore_interrupt(CaptureCtx *ctx,
+                              CaptureInterruptFn fn,
+                              void *opaque)
+{
+    ctx->should_interrupt = fn;
+    ctx->interrupt_opaque = opaque;
+}
+
+static int capture_interrupted(void *opaque)
+{
+    CaptureCtx *ctx = (CaptureCtx *)opaque;
+    return ctx && ctx->should_interrupt &&
+           ctx->should_interrupt(ctx->interrupt_opaque);
+}
+
+static void attach_interrupt(CaptureCtx *ctx)
+{
+    if (!ctx->fmt_ctx || !ctx->should_interrupt) return;
+
+    ctx->fmt_ctx->interrupt_callback.callback = capture_interrupted;
+    ctx->fmt_ctx->interrupt_callback.opaque = ctx;
+}
+
 static int open_input(CaptureCtx *ctx, const char *fmt_name,
                        const char *device, AVDictionary **opts)
 {
@@ -17,14 +48,23 @@ static int open_input(CaptureCtx *ctx, const char *fmt_name,
         fprintf(stderr, "capture: format '%s' not found\n", fmt_name);
         return -1;
     }
+
+    if (ctx->should_interrupt) {
+        ctx->fmt_ctx = avformat_alloc_context();
+        if (!ctx->fmt_ctx) return AVERROR(ENOMEM);
+        attach_interrupt(ctx);
+    }
+
     int ret = avformat_open_input(&ctx->fmt_ctx, device, fmt, opts);
     if (ret < 0) {
         char errbuf[128];
         av_strerror(ret, errbuf, sizeof(errbuf));
         fprintf(stderr, "capture: cannot open '%s' as '%s': %s\n",
                 device, fmt_name, errbuf);
+        avformat_close_input(&ctx->fmt_ctx);
         return ret;
     }
+    attach_interrupt(ctx);
     av_dict_free(opts);
 
     ret = avformat_find_stream_info(ctx->fmt_ctx, NULL);
@@ -75,7 +115,11 @@ static int open_decoder(CaptureCtx *ctx, enum AVMediaType mtype)
 static int webcam_try_device(CaptureCtx *ctx, const char *device,
                               int *out_w, int *out_h)
 {
+    CaptureInterruptFn fn;
+    void *opaque;
+    preserve_interrupt(ctx, &fn, &opaque);
     memset(ctx, 0, sizeof(*ctx));
+    restore_interrupt(ctx, fn, opaque);
 
     const char *env_fmt  = getenv("SCREENCAST_CAM_FORMAT");
     const char *env_fps  = getenv("SCREENCAST_CAM_FPS");
@@ -156,12 +200,26 @@ static int webcam_try_glob(CaptureCtx *ctx, const char *pattern,
 
 /* ── public ────────────────────────────────────────────────── */
 
+void capture_set_interrupt(CaptureCtx *ctx, CaptureInterruptFn fn,
+                           void *opaque)
+{
+    if (!ctx) return;
+
+    ctx->should_interrupt = fn;
+    ctx->interrupt_opaque = opaque;
+    attach_interrupt(ctx);
+}
+
 int capture_screen_open(CaptureCtx *ctx, const char *display_name,
                          int x_off, int y_off,
                          int width, int height, int fps)
 {
     avdevice_register_all();
+    CaptureInterruptFn fn;
+    void *opaque;
+    preserve_interrupt(ctx, &fn, &opaque);
     memset(ctx, 0, sizeof(*ctx));
+    restore_interrupt(ctx, fn, opaque);
 
     /* x11grab device string: ":0.0+x_off,y_off" */
     char dev[64];
@@ -217,7 +275,11 @@ int capture_webcam_open(CaptureCtx *ctx, const char *device,
 int capture_audio_open(CaptureCtx *ctx, const char *device)
 {
     avdevice_register_all();
+    CaptureInterruptFn fn;
+    void *opaque;
+    preserve_interrupt(ctx, &fn, &opaque);
     memset(ctx, 0, sizeof(*ctx));
+    restore_interrupt(ctx, fn, opaque);
 
     /* Try PulseAudio/PipeWire first — honours the user's default source (mic). */
     AVDictionary *opts = NULL;
@@ -247,6 +309,9 @@ int capture_audio_open(CaptureCtx *ctx, const char *device)
 int capture_read(CaptureCtx *ctx)
 {
     for (;;) {
+        if (capture_interrupted(ctx))
+            return AVERROR_EXIT;
+
         int ret = av_read_frame(ctx->fmt_ctx, ctx->pkt);
         if (ret < 0) return ret;
 
@@ -269,10 +334,14 @@ int capture_read(CaptureCtx *ctx)
 void capture_free(CaptureCtx *ctx)
 {
     if (!ctx) return;
+    CaptureInterruptFn fn;
+    void *opaque;
+    preserve_interrupt(ctx, &fn, &opaque);
     av_frame_free(&ctx->frame);
     av_packet_free(&ctx->pkt);
     avcodec_free_context(&ctx->dec_ctx);
     avformat_close_input(&ctx->fmt_ctx);
     av_channel_layout_uninit(&ctx->ch_layout);
     memset(ctx, 0, sizeof(*ctx));
+    restore_interrupt(ctx, fn, opaque);
 }

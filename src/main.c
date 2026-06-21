@@ -40,6 +40,12 @@ static atomic_llong    s_cam_seq    = 0;
 /* Signal between main and capture threads: 1 while file is open. */
 static atomic_int s_rec_open = 0;
 
+static int recording_interrupted(void *opaque)
+{
+    (void)opaque;
+    return !atomic_load(&g_running) || !atomic_load(&g_recording);
+}
+
 /* ── recording bundle ──────────────────────────────────────── */
 
 typedef struct {
@@ -222,7 +228,21 @@ static const char *env_default(const char *name, const char *fallback)
     return (value && value[0]) ? value : fallback;
 }
 
-static int render_final_video(const char *capture_path, const char *final_path)
+static void send_render_notification(const char *summary, const char *body)
+{
+    pid_t pid = fork();
+    if (pid < 0) return;
+
+    if (pid == 0) {
+        execlp("notify-send", "notify-send",
+               "-a", "screencast", summary, body, (char *)NULL);
+        _exit(127);
+    }
+
+    waitpid(pid, NULL, 0);
+}
+
+static int run_final_render(const char *capture_path, const char *final_path)
 {
     const char *preset   = env_default("SCREENCAST_NVENC_FINAL_PRESET", "p7");
     const char *cq       = env_default("SCREENCAST_NVENC_FINAL_CQ", "16");
@@ -239,7 +259,7 @@ static int render_final_video(const char *capture_path, const char *final_path)
 
     if (pid == 0) {
         execlp("ffmpeg", "ffmpeg",
-               "-hide_banner", "-y",
+               "-hide_banner", "-loglevel", "error", "-y",
                "-hwaccel", "cuda",
                "-hwaccel_output_format", "cuda",
                "-i", capture_path,
@@ -282,11 +302,37 @@ static int render_final_video(const char *capture_path, const char *final_path)
         return -1;
     }
 
-    const char *keep = getenv("SCREENCAST_KEEP_CAPTURE");
-    if (!keep || !keep[0])
-        unlink(capture_path);
+    return 0;
+}
 
-    printf("[REC] Final ready: %s\n", final_path);
+static int render_final_video(const char *capture_path, const char *final_path)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("main: fork render worker");
+        return -1;
+    }
+
+    if (pid == 0) {
+        if (setsid() < 0)
+            perror("main: setsid render worker");
+
+        int ret = run_final_render(capture_path, final_path);
+        if (ret == 0) {
+            const char *keep = getenv("SCREENCAST_KEEP_CAPTURE");
+            if (!keep || !keep[0])
+                unlink(capture_path);
+
+            send_render_notification("Screencast ready", final_path);
+        } else {
+            send_render_notification("Screencast render failed", capture_path);
+        }
+
+        _exit(ret == 0 ? 0 : 1);
+    }
+
+    printf("[REC] Final render running in background (pid %ld): %s\n",
+           (long)pid, final_path);
     return 0;
 }
 
@@ -339,6 +385,10 @@ static int recording_open(void)
            s_rec.capture_path, s_rec.canvas_w, s_rec.canvas_h,
            s_rec.mon_x, s_rec.mon_y);
     printf("[REC] Final:   %s\n", s_rec.final_path);
+
+    capture_set_interrupt(&s_rec.screen_cap, recording_interrupted, NULL);
+    capture_set_interrupt(&s_rec.cam_cap, recording_interrupted, NULL);
+    capture_set_interrupt(&s_rec.aud_cap, recording_interrupted, NULL);
 
     if (indicator_open(s_rec.mon_x, s_rec.mon_y,
                        s_rec.canvas_w, s_rec.canvas_h) < 0)
