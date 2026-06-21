@@ -82,27 +82,27 @@ static int webcam_try_device(CaptureCtx *ctx, const char *device,
     const char *env_size = getenv("SCREENCAST_CAM_SIZE");
     const char *fmt      = (env_fmt  && env_fmt[0])  ? env_fmt  : "mjpeg";
     const char *fps      = (env_fps  && env_fps[0])  ? env_fps  : "30";
-    const char *size     = (env_size && env_size[0]) ? env_size : NULL;
+    const char *size     = (env_size && env_size[0]) ? env_size : "1920x1080";
 
     AVDictionary *opts = NULL;
     av_dict_set(&opts, "input_format", fmt, 0);
     av_dict_set(&opts, "framerate",    fps, 0);
-    if (size)
-        av_dict_set(&opts, "video_size", size, 0);
+    av_dict_set(&opts, "video_size",   size, 0);
 
     if (open_input(ctx, "video4linux2", device, &opts) < 0) {
         av_dict_free(&opts);
         capture_free(ctx);
 
-        if (size || (env_fmt && env_fmt[0]) || (env_fps && env_fps[0]))
-            fprintf(stderr,
-                    "capture: requested webcam mode failed "
-                    "(format=%s size=%s fps=%s), falling back\n",
-                    fmt, size ? size : "default", fps);
+        fprintf(stderr,
+                "capture: requested webcam mode failed "
+                "(format=%s size=%s fps=%s), falling back\n",
+                fmt, size, fps);
 
         opts = NULL;
         av_dict_set(&opts, "input_format", "mjpeg", 0);
         av_dict_set(&opts, "framerate",    "30",    0);
+        if (!env_size || !env_size[0])
+            av_dict_set(&opts, "video_size", "1280x720", 0);
 
         if (open_input(ctx, "video4linux2", device, &opts) < 0) {
             av_dict_free(&opts);

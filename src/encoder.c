@@ -59,15 +59,29 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     enc->vid_enc->pix_fmt      = AV_PIX_FMT_YUV420P;
     enc->vid_enc->gop_size     = fps * 2;
     enc->vid_enc->max_b_frames = 2;
-    enc->vid_enc->bit_rate     = 4000000; /* 4 Mbps */
+    enc->vid_enc->profile      = AV_PROFILE_H264_HIGH;
+    enc->vid_enc->color_primaries = AVCOL_PRI_BT709;
+    enc->vid_enc->color_trc       = AVCOL_TRC_BT709;
+    enc->vid_enc->colorspace      = AVCOL_SPC_BT709;
+    enc->vid_enc->color_range     = AVCOL_RANGE_MPEG;
 
     if (enc->fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
         enc->vid_enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-    /* x264 options: fast encode, minimal latency, reasonable quality */
-    av_opt_set(enc->vid_enc->priv_data, "preset", "fast",        0);
-    av_opt_set(enc->vid_enc->priv_data, "tune",   "zerolatency", 0);
-    av_opt_set(enc->vid_enc->priv_data, "crf",    "23",          0);
+    /*
+     * This writes a file, so prefer x264's lookahead/AQ over low-latency
+     * settings. Env overrides are useful when recording on slower hardware.
+     */
+    const char *preset = getenv("SCREENCAST_X264_PRESET");
+    const char *crf    = getenv("SCREENCAST_X264_CRF");
+    if (!preset || !preset[0]) preset = "medium";
+    if (!crf    || !crf[0])    crf    = "18";
+
+    av_opt_set(enc->vid_enc->priv_data, "preset",     preset, 0);
+    av_opt_set(enc->vid_enc->priv_data, "crf",        crf,    0);
+    av_opt_set(enc->vid_enc->priv_data, "profile",    "high", 0);
+    av_opt_set(enc->vid_enc->priv_data, "aq-mode",    "3",    0);
+    av_opt_set(enc->vid_enc->priv_data, "aq-strength","0.9",  0);
 
     int ret = avcodec_open2(enc->vid_enc, codec, NULL);
     if (ret < 0) { log_err("avcodec_open2 (video)", ret); return ret; }
@@ -163,16 +177,19 @@ static int setup_sws(EncoderCtx *enc,
                       enum AVPixelFormat cam_fmt)
 {
     int cw = enc->canvas_w, ch = enc->canvas_h;
+    int screen_flags = SWS_BILINEAR | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
+    int quality_flags = SWS_LANCZOS | SWS_ACCURATE_RND |
+                        SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
 
     enc->sws_screen = sws_getContext(
         cw, ch, screen_fmt,
         cw, ch, AV_PIX_FMT_RGBA,
-        SWS_BILINEAR, NULL, NULL, NULL);
+        screen_flags, NULL, NULL, NULL);
 
     enc->sws_to_yuv = sws_getContext(
         cw, ch, AV_PIX_FMT_RGBA,
         cw, ch, AV_PIX_FMT_YUV420P,
-        SWS_BILINEAR, NULL, NULL, NULL);
+        quality_flags, NULL, NULL, NULL);
 
     if (!enc->sws_screen || !enc->sws_to_yuv) {
         fprintf(stderr, "encoder: sws_getContext failed\n");
@@ -183,18 +200,18 @@ static int setup_sws(EncoderCtx *enc,
         enc->sws_cam_raw = sws_getContext(
             cam_w, cam_h, cam_fmt,
             cam_w, cam_h, AV_PIX_FMT_RGBA,
-            SWS_BILINEAR, NULL, NULL, NULL);
+            quality_flags, NULL, NULL, NULL);
 
         enc->sws_cam_main = sws_getContext(
             enc->cam_main_w, enc->cam_main_h, AV_PIX_FMT_RGBA,
             cw, ch, AV_PIX_FMT_RGBA,
-            SWS_BILINEAR, NULL, NULL, NULL);
+            quality_flags, NULL, NULL, NULL);
 
         int cs = enc->cam_crop_size;
         enc->sws_cam_scale = sws_getContext(
             cs, cs, AV_PIX_FMT_RGBA,
             enc->overlay_size, enc->overlay_size, AV_PIX_FMT_RGBA,
-            SWS_BILINEAR, NULL, NULL, NULL);
+            quality_flags, NULL, NULL, NULL);
 
         if (!enc->sws_cam_raw || !enc->sws_cam_main || !enc->sws_cam_scale) {
             fprintf(stderr, "encoder: sws_getContext (cam) failed\n");
