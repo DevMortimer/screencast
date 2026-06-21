@@ -42,8 +42,11 @@ static int drain_encoder(EncoderCtx *enc, AVCodecContext *ctx, AVStream *st)
 
 static int setup_video(EncoderCtx *enc, int w, int h, int fps)
 {
-    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-    if (!codec) { fprintf(stderr, "encoder: H264 encoder not found\n"); return -1; }
+    const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
+    if (!codec) {
+        fprintf(stderr, "encoder: h264_nvenc not found; NVIDIA GPU encoding is required\n");
+        return -1;
+    }
 
     enc->vid_stream = avformat_new_stream(enc->fmt_ctx, NULL);
     if (!enc->vid_stream) return AVERROR(ENOMEM);
@@ -58,7 +61,7 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     enc->vid_enc->time_base    = (AVRational){1, 1000000};
     enc->vid_enc->pix_fmt      = AV_PIX_FMT_YUV420P;
     enc->vid_enc->gop_size     = fps * 2;
-    enc->vid_enc->max_b_frames = 2;
+    enc->vid_enc->max_b_frames = 0;
     enc->vid_enc->profile      = AV_PROFILE_H264_HIGH;
     enc->vid_enc->color_primaries = AVCOL_PRI_BT709;
     enc->vid_enc->color_trc       = AVCOL_TRC_BT709;
@@ -69,19 +72,20 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
         enc->vid_enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
     /*
-     * This writes a file, so prefer x264's lookahead/AQ over low-latency
-     * settings. Env overrides are useful when recording on slower hardware.
+     * Real-time capture writes a high-quality intermediate with cheap GPU
+     * rate control. The final file is rendered after recording stops.
      */
-    const char *preset = getenv("SCREENCAST_X264_PRESET");
-    const char *crf    = getenv("SCREENCAST_X264_CRF");
-    if (!preset || !preset[0]) preset = "medium";
-    if (!crf    || !crf[0])    crf    = "18";
+    const char *preset = getenv("SCREENCAST_NVENC_CAPTURE_PRESET");
+    const char *qp     = getenv("SCREENCAST_NVENC_CAPTURE_QP");
+    if (!preset || !preset[0]) preset = "p3";
+    if (!qp     || !qp[0])     qp     = "12";
 
-    av_opt_set(enc->vid_enc->priv_data, "preset",     preset, 0);
-    av_opt_set(enc->vid_enc->priv_data, "crf",        crf,    0);
-    av_opt_set(enc->vid_enc->priv_data, "profile",    "high", 0);
-    av_opt_set(enc->vid_enc->priv_data, "aq-mode",    "3",    0);
-    av_opt_set(enc->vid_enc->priv_data, "aq-strength","0.9",  0);
+    av_opt_set(enc->vid_enc->priv_data, "preset",  preset,   0);
+    av_opt_set(enc->vid_enc->priv_data, "tune",    "hq",     0);
+    av_opt_set(enc->vid_enc->priv_data, "profile", "high",   0);
+    av_opt_set(enc->vid_enc->priv_data, "rc",      "constqp",0);
+    av_opt_set(enc->vid_enc->priv_data, "qp",      qp,       0);
+    av_opt_set(enc->vid_enc->priv_data, "surfaces","16",     0);
 
     int ret = avcodec_open2(enc->vid_enc, codec, NULL);
     if (ret < 0) { log_err("avcodec_open2 (video)", ret); return ret; }
@@ -114,7 +118,7 @@ static int setup_audio(EncoderCtx *enc, int sample_rate,
 
     enc->aud_enc->sample_rate = sample_rate;
     enc->aud_enc->sample_fmt  = AV_SAMPLE_FMT_FLTP;
-    enc->aud_enc->bit_rate    = 128000;
+    enc->aud_enc->bit_rate    = 256000;
     /* Audio PTS uses sample count; time_base = 1/sample_rate */
     enc->aud_enc->time_base   = (AVRational){1, sample_rate};
     av_channel_layout_default(&enc->aud_enc->ch_layout, 2); /* stereo out */
@@ -178,8 +182,12 @@ static int setup_sws(EncoderCtx *enc,
 {
     int cw = enc->canvas_w, ch = enc->canvas_h;
     int screen_flags = SWS_BILINEAR | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
-    int quality_flags = SWS_LANCZOS | SWS_ACCURATE_RND |
-                        SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
+    int yuv_flags = SWS_BICUBIC | SWS_ACCURATE_RND |
+                    SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
+    int cam_full_flags = SWS_LANCZOS | SWS_ACCURATE_RND |
+                         SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
+    int cam_overlay_flags = SWS_BICUBIC | SWS_ACCURATE_RND |
+                            SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
 
     enc->sws_screen = sws_getContext(
         cw, ch, screen_fmt,
@@ -189,7 +197,7 @@ static int setup_sws(EncoderCtx *enc,
     enc->sws_to_yuv = sws_getContext(
         cw, ch, AV_PIX_FMT_RGBA,
         cw, ch, AV_PIX_FMT_YUV420P,
-        quality_flags, NULL, NULL, NULL);
+        yuv_flags, NULL, NULL, NULL);
 
     if (!enc->sws_screen || !enc->sws_to_yuv) {
         fprintf(stderr, "encoder: sws_getContext failed\n");
@@ -200,18 +208,18 @@ static int setup_sws(EncoderCtx *enc,
         enc->sws_cam_raw = sws_getContext(
             cam_w, cam_h, cam_fmt,
             cam_w, cam_h, AV_PIX_FMT_RGBA,
-            quality_flags, NULL, NULL, NULL);
+            screen_flags, NULL, NULL, NULL);
 
         enc->sws_cam_main = sws_getContext(
             enc->cam_main_w, enc->cam_main_h, AV_PIX_FMT_RGBA,
             cw, ch, AV_PIX_FMT_RGBA,
-            quality_flags, NULL, NULL, NULL);
+            cam_full_flags, NULL, NULL, NULL);
 
         int cs = enc->cam_crop_size;
         enc->sws_cam_scale = sws_getContext(
             cs, cs, AV_PIX_FMT_RGBA,
             enc->overlay_size, enc->overlay_size, AV_PIX_FMT_RGBA,
-            quality_flags, NULL, NULL, NULL);
+            cam_overlay_flags, NULL, NULL, NULL);
 
         if (!enc->sws_cam_raw || !enc->sws_cam_main || !enc->sws_cam_scale) {
             fprintf(stderr, "encoder: sws_getContext (cam) failed\n");
@@ -241,6 +249,7 @@ int encoder_open(EncoderCtx *enc, const char *path,
     if (enc->overlay_size > 480) enc->overlay_size = 480;
     enc->overlay_x = canvas_w  - enc->overlay_size - 20;
     enc->overlay_y = canvas_h - enc->overlay_size - 20;
+    enc->cam_overlay_seq = -1;
 
     enc->cam_src_w     = cam_src_w;
     enc->cam_src_h     = cam_src_h;
@@ -286,13 +295,10 @@ int encoder_open(EncoderCtx *enc, const char *path,
 
     if (cam_src_w > 0) {
         enc->cam_rgba    = malloc((size_t)cam_src_w * cam_src_h * 4);
-        enc->cam_main_crop = malloc((size_t)enc->cam_main_w * enc->cam_main_h * 4);
-        enc->cam_crop    = malloc((size_t)enc->cam_crop_size * enc->cam_crop_size * 4);
         enc->cam_overlay = malloc((size_t)enc->overlay_size * enc->overlay_size * 4);
         enc->corner_mask = malloc(sizeof(float) *
                                    (size_t)enc->overlay_size * enc->overlay_size);
-        if (!enc->cam_rgba || !enc->cam_main_crop || !enc->cam_crop ||
-            !enc->cam_overlay || !enc->corner_mask)
+        if (!enc->cam_rgba || !enc->cam_overlay || !enc->corner_mask)
             return AVERROR(ENOMEM);
 
         /* Pre-build the rounded-corner mask (radius = 1/8 of overlay size) */
@@ -333,7 +339,8 @@ static void draw_rec_dot(uint8_t *rgba, int canvas_w, int canvas_h,
  *                     blended in the bottom-right corner → YUV420P → H264
  */
 int encoder_write_video(EncoderCtx *enc, int mode,
-                         AVFrame *screen_frame, AVFrame *cam_frame)
+                         AVFrame *screen_frame, AVFrame *cam_frame,
+                         int64_t cam_seq)
 {
     int cw = enc->canvas_w, ch = enc->canvas_h;
 
@@ -352,8 +359,8 @@ int encoder_write_video(EncoderCtx *enc, int mode,
 
     /* ── 2. Webcam path ── */
     if ((mode == 2 || mode == 3) && cam_frame && enc->cam_src_w > 0) {
-        /* 2a. Decode webcam pixel format → RGBA at native cam resolution */
-        {
+        if (mode == 2 || cam_seq != enc->cam_overlay_seq) {
+            /* 2a. Decode webcam pixel format → RGBA at native cam resolution */
             uint8_t *d[1]  = { enc->cam_rgba };
             int      ls[1] = { enc->cam_src_w * 4 };
             sws_scale(enc->sws_cam_raw,
@@ -363,45 +370,40 @@ int encoder_write_video(EncoderCtx *enc, int mode,
         }
 
         if (mode == 2) {
-            for (int row = 0; row < enc->cam_main_h; row++) {
-                memcpy(enc->cam_main_crop + (size_t)row * enc->cam_main_w * 4,
-                       enc->cam_rgba + ((size_t)(enc->cam_main_y + row) *
-                                        enc->cam_src_w + enc->cam_main_x) * 4,
-                       (size_t)enc->cam_main_w * 4);
-            }
-
-            uint8_t *src[1] = { enc->cam_main_crop };
-            int      sls[1] = { enc->cam_main_w * 4 };
+            uint8_t *src[1] = {
+                enc->cam_rgba + ((size_t)enc->cam_main_y * enc->cam_src_w +
+                                 enc->cam_main_x) * 4
+            };
+            int      sls[1] = { enc->cam_src_w * 4 };
             uint8_t *dst[1] = { enc->canvas_rgba };
             int      dls[1] = { cw * 4 };
             sws_scale(enc->sws_cam_main,
                       (const uint8_t *const *)src, sls,
                       0, enc->cam_main_h, dst, dls);
         } else {
-            /* 2b. Centre-crop to a square (copy rows from the cropped region) */
-            int cs = enc->cam_crop_size;
-            int ox = (enc->cam_src_w - cs) / 2;
-            int oy = (enc->cam_src_h - cs) / 2;
-            for (int row = 0; row < cs; row++) {
-                memcpy(enc->cam_crop + (size_t)row * cs * 4,
-                       enc->cam_rgba + ((size_t)(oy + row) * enc->cam_src_w + ox) * 4,
-                       (size_t)cs * 4);
+            if (cam_seq != enc->cam_overlay_seq) {
+                /* 2b. Centre-crop to a square and scale to overlay size. */
+                int cs = enc->cam_crop_size;
+                int ox = (enc->cam_src_w - cs) / 2;
+                int oy = (enc->cam_src_h - cs) / 2;
+                int ov = enc->overlay_size;
+                uint8_t *src[1] = {
+                    enc->cam_rgba + ((size_t)oy * enc->cam_src_w + ox) * 4
+                };
+                int      sls[1] = { enc->cam_src_w * 4 };
+                uint8_t *dst[1] = { enc->cam_overlay };
+                int      dls[1] = { ov * 4 };
+                sws_scale(enc->sws_cam_scale,
+                          (const uint8_t *const *)src, sls,
+                          0, cs, dst, dls);
+
+                /* 2c. Force alpha=255; swscale does not set it for RGBA output. */
+                int n = enc->overlay_size * enc->overlay_size;
+                for (int i = 0; i < n; i++)
+                    enc->cam_overlay[i * 4 + 3] = 255;
+
+                enc->cam_overlay_seq = cam_seq;
             }
-
-            /* 2c. Scale the square crop to overlay_size × overlay_size */
-            int      ov    = enc->overlay_size;
-            uint8_t *src[1] = { enc->cam_crop };
-            int      sls[1] = { cs * 4 };
-            uint8_t *dst[1] = { enc->cam_overlay };
-            int      dls[1] = { ov * 4 };
-            sws_scale(enc->sws_cam_scale,
-                      (const uint8_t *const *)src, sls,
-                      0, cs, dst, dls);
-
-            /* 2d. Force alpha=255; swscale does not set it for RGBA output */
-            int n = enc->overlay_size * enc->overlay_size;
-            for (int i = 0; i < n; i++)
-                enc->cam_overlay[i * 4 + 3] = 255;
 
             composite_blend(enc->canvas_rgba, cw, ch,
                             enc->cam_overlay,
@@ -565,8 +567,6 @@ void encoder_free(EncoderCtx *enc)
 
     free(enc->canvas_rgba);
     free(enc->cam_rgba);
-    free(enc->cam_main_crop);
-    free(enc->cam_crop);
     free(enc->cam_overlay);
     free(enc->corner_mask);
 

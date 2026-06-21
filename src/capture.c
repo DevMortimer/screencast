@@ -80,7 +80,7 @@ static int webcam_try_device(CaptureCtx *ctx, const char *device,
     const char *env_fmt  = getenv("SCREENCAST_CAM_FORMAT");
     const char *env_fps  = getenv("SCREENCAST_CAM_FPS");
     const char *env_size = getenv("SCREENCAST_CAM_SIZE");
-    const char *fmt      = (env_fmt  && env_fmt[0])  ? env_fmt  : "mjpeg";
+    const char *fmt      = (env_fmt  && env_fmt[0])  ? env_fmt  : "nv12";
     const char *fps      = (env_fps  && env_fps[0])  ? env_fps  : "30";
     const char *size     = (env_size && env_size[0]) ? env_size : "1920x1080";
 
@@ -102,7 +102,7 @@ static int webcam_try_device(CaptureCtx *ctx, const char *device,
         av_dict_set(&opts, "input_format", "mjpeg", 0);
         av_dict_set(&opts, "framerate",    "30",    0);
         if (!env_size || !env_size[0])
-            av_dict_set(&opts, "video_size", "1280x720", 0);
+            av_dict_set(&opts, "video_size", "1920x1080", 0);
 
         if (open_input(ctx, "video4linux2", device, &opts) < 0) {
             av_dict_free(&opts);

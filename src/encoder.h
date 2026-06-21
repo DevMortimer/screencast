@@ -39,13 +39,12 @@ typedef struct {
     int overlay_size;   /* side length of the square overlay (px) */
     int overlay_x;      /* top-left x of overlay on canvas */
     int overlay_y;      /* top-left y of overlay on canvas */
+    int64_t cam_overlay_seq; /* last webcam frame scaled into cam_overlay */
     float *corner_mask; /* overlay_size² floats */
 
     /* ── Scratch RGBA buffers ─────────────────────── */
     uint8_t *canvas_rgba;  /* canvas_w * canvas_h * 4 */
     uint8_t *cam_rgba;     /* cam_src_w * cam_src_h * 4 */
-    uint8_t *cam_main_crop;/* webcam crop matched to canvas aspect */
-    uint8_t *cam_crop;     /* cam_crop_size² * 4 */
     uint8_t *cam_overlay;  /* overlay_size² * 4 */
     int cam_src_w, cam_src_h, cam_crop_size;
     int cam_main_x, cam_main_y, cam_main_w, cam_main_h;
@@ -77,7 +76,8 @@ int  encoder_open(EncoderCtx *enc, const char *path,
  * cam_frame may be NULL when no webcam is open or no frame arrived yet.
  */
 int  encoder_write_video(EncoderCtx *enc, int mode,
-                          AVFrame *screen_frame, AVFrame *cam_frame);
+                          AVFrame *screen_frame, AVFrame *cam_frame,
+                          int64_t cam_seq);
 
 /* Resample raw audio into FIFO; encodes full 1024-sample chunks. */
 int  encoder_feed_audio(EncoderCtx *enc, AVFrame *raw_frame);

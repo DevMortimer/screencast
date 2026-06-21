@@ -5,6 +5,8 @@
 #include <pthread.h>
 #include <time.h>
 #include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <X11/Xlib.h>
 #include <X11/extensions/Xinerama.h>
@@ -33,6 +35,7 @@
  */
 static pthread_mutex_t s_cam_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static AVFrame        *s_cam_latest = NULL;
+static atomic_llong    s_cam_seq    = 0;
 
 /* Signal between main and capture threads: 1 while file is open. */
 static atomic_int s_rec_open = 0;
@@ -49,6 +52,8 @@ typedef struct {
     int cam_w, cam_h;
     int has_cam;
     int has_aud;
+    char capture_path[512];
+    char final_path[512];
 } RecCtx;
 
 static RecCtx s_rec;
@@ -193,19 +198,96 @@ static void get_active_monitor(int *out_x, int *out_y, int *out_w, int *out_h)
 
 /* ── helper: build timestamped output path ─────────────────── */
 
-static void make_output_path(char *buf, size_t n)
+static void make_output_paths(char *final_buf, size_t final_n,
+                              char *capture_buf, size_t capture_n)
 {
     time_t t       = time(NULL);
     struct tm *tm  = localtime(&t);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", tm);
-    snprintf(buf, n, "%s/screencast_%s.mp4", getenv("HOME"), ts);
+    snprintf(final_buf, final_n, "%s/screencast_%s.mp4", getenv("HOME"), ts);
+    snprintf(capture_buf, capture_n, "%s/screencast_%s_capture.mp4",
+             getenv("HOME"), ts);
 }
 
 static const char *get_webcam_device(void)
 {
     const char *dev = getenv("SCREENCAST_WEBCAM_DEV");
     return (dev && dev[0]) ? dev : WEBCAM_DEV;
+}
+
+static const char *env_default(const char *name, const char *fallback)
+{
+    const char *value = getenv(name);
+    return (value && value[0]) ? value : fallback;
+}
+
+static int render_final_video(const char *capture_path, const char *final_path)
+{
+    const char *preset   = env_default("SCREENCAST_NVENC_FINAL_PRESET", "p7");
+    const char *cq       = env_default("SCREENCAST_NVENC_FINAL_CQ", "16");
+    const char *lookahead= env_default("SCREENCAST_NVENC_FINAL_LOOKAHEAD", "32");
+    const char *aq       = env_default("SCREENCAST_NVENC_FINAL_AQ", "10");
+
+    printf("[REC] Rendering final: %s\n", final_path);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("main: fork ffmpeg");
+        return -1;
+    }
+
+    if (pid == 0) {
+        execlp("ffmpeg", "ffmpeg",
+               "-hide_banner", "-y",
+               "-hwaccel", "cuda",
+               "-hwaccel_output_format", "cuda",
+               "-i", capture_path,
+               "-map", "0",
+               "-c:v", "h264_nvenc",
+               "-preset", preset,
+               "-tune", "hq",
+               "-profile:v", "high",
+               "-rc", "vbr",
+               "-cq:v", cq,
+               "-b:v", "0",
+               "-rc-lookahead:v", lookahead,
+               "-spatial-aq:v", "1",
+               "-temporal-aq:v", "1",
+               "-aq-strength:v", aq,
+               "-multipass:v", "fullres",
+               "-bf:v", "3",
+               "-b_ref_mode:v", "middle",
+               "-colorspace", "bt709",
+               "-color_primaries", "bt709",
+               "-color_trc", "bt709",
+               "-c:a", "copy",
+               "-movflags", "+faststart",
+               final_path,
+               (char *)NULL);
+        perror("main: exec ffmpeg");
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("main: wait ffmpeg");
+        return -1;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr,
+                "main: final render failed; intermediate kept at %s\n",
+                capture_path);
+        return -1;
+    }
+
+    const char *keep = getenv("SCREENCAST_KEEP_CAPTURE");
+    if (!keep || !keep[0])
+        unlink(capture_path);
+
+    printf("[REC] Final ready: %s\n", final_path);
+    return 0;
 }
 
 /* ── webcam thread ─────────────────────────────────────────── */
@@ -222,6 +304,7 @@ static void *webcam_thread(void *arg)
         pthread_mutex_lock(&s_cam_mutex);
         if (s_cam_latest) av_frame_free(&s_cam_latest);
         s_cam_latest = copy;
+        atomic_fetch_add(&s_cam_seq, 1);
         pthread_mutex_unlock(&s_cam_mutex);
     }
     return NULL;
@@ -247,11 +330,15 @@ static int recording_open(void)
 {
     get_active_monitor(&s_rec.mon_x, &s_rec.mon_y,
                        &s_rec.canvas_w, &s_rec.canvas_h);
+    s_rec.capture_path[0] = '\0';
+    s_rec.final_path[0] = '\0';
 
-    char out_path[512];
-    make_output_path(out_path, sizeof(out_path));
-    printf("[REC] Opening: %s  monitor=%dx%d+%d+%d\n",
-           out_path, s_rec.canvas_w, s_rec.canvas_h, s_rec.mon_x, s_rec.mon_y);
+    make_output_paths(s_rec.final_path, sizeof(s_rec.final_path),
+                      s_rec.capture_path, sizeof(s_rec.capture_path));
+    printf("[REC] Capture: %s  monitor=%dx%d+%d+%d\n",
+           s_rec.capture_path, s_rec.canvas_w, s_rec.canvas_h,
+           s_rec.mon_x, s_rec.mon_y);
+    printf("[REC] Final:   %s\n", s_rec.final_path);
 
     if (indicator_open(s_rec.mon_x, s_rec.mon_y,
                        s_rec.canvas_w, s_rec.canvas_h) < 0)
@@ -297,7 +384,7 @@ static int recording_open(void)
     const AVChannelLayout *audio_ch = s_rec.has_aud ? &s_rec.aud_cap.ch_layout : NULL;
     enum AVSampleFormat audio_fmt = s_rec.has_aud ? s_rec.aud_cap.sample_fmt : AV_SAMPLE_FMT_NONE;
 
-    if (encoder_open(&s_rec.enc, out_path,
+    if (encoder_open(&s_rec.enc, s_rec.capture_path,
                      s_rec.canvas_w, s_rec.canvas_h, FPS,
                      s_rec.screen_cap.pix_fmt,
                      s_rec.cam_w, s_rec.cam_h, cam_fmt,
@@ -320,6 +407,8 @@ static void recording_loop(void)
 {
     pthread_t cam_tid = 0, aud_tid = 0;
     AudioArg aud_arg  = { &s_rec.aud_cap, &s_rec.enc };
+    int64_t last_webcam_seq = -1;
+    struct timespec cam_poll = { .tv_nsec = 1000000L };
 
     if (s_rec.has_cam)
         pthread_create(&cam_tid, NULL, webcam_thread, &s_rec.cam_cap);
@@ -327,24 +416,51 @@ static void recording_loop(void)
         pthread_create(&aud_tid, NULL, audio_thread, &aud_arg);
 
     while (atomic_load(&g_running) && atomic_load(&g_recording)) {
-        /* av_read_frame blocks ≈1/fps seconds — acceptable stop latency */
-        if (capture_read(&s_rec.screen_cap) < 0) continue;
-
         int mode = atomic_load(&g_mode);
-
-        /* Grab a reference to the latest webcam frame if needed */
         AVFrame *cam_copy = NULL;
-        if ((mode == MODE_WEBCAM || mode == MODE_BOTH) && s_rec.has_cam) {
-            pthread_mutex_lock(&s_cam_mutex);
-            if (s_cam_latest) {
-                cam_copy = av_frame_alloc();
-                av_frame_ref(cam_copy, s_cam_latest);
+        int64_t cam_seq = -1;
+
+        if (mode == MODE_WEBCAM && s_rec.has_cam) {
+            /*
+             * Webcam-only recordings should be paced by the camera.  Waiting
+             * on x11grab here limits webcam-only output to the screen capture
+             * rate even though the screen frame is ignored.
+             */
+            while (atomic_load(&g_running) && atomic_load(&g_recording)) {
+                pthread_mutex_lock(&s_cam_mutex);
+                int64_t latest_seq = atomic_load(&s_cam_seq);
+                if (s_cam_latest && latest_seq != last_webcam_seq) {
+                    cam_copy = av_frame_alloc();
+                    av_frame_ref(cam_copy, s_cam_latest);
+                    cam_seq = latest_seq;
+                    last_webcam_seq = latest_seq;
+                }
+                pthread_mutex_unlock(&s_cam_mutex);
+
+                if (cam_copy)
+                    break;
+                nanosleep(&cam_poll, NULL);
             }
-            pthread_mutex_unlock(&s_cam_mutex);
+
+            if (!cam_copy)
+                continue;
+        } else {
+            /* av_read_frame blocks ≈1/fps seconds — acceptable stop latency */
+            if (capture_read(&s_rec.screen_cap) < 0) continue;
+
+            if (mode == MODE_BOTH && s_rec.has_cam) {
+                pthread_mutex_lock(&s_cam_mutex);
+                if (s_cam_latest) {
+                    cam_copy = av_frame_alloc();
+                    av_frame_ref(cam_copy, s_cam_latest);
+                    cam_seq = atomic_load(&s_cam_seq);
+                }
+                pthread_mutex_unlock(&s_cam_mutex);
+            }
         }
 
         encoder_write_video(&s_rec.enc, mode,
-                            s_rec.screen_cap.frame, cam_copy);
+                            s_rec.screen_cap.frame, cam_copy, cam_seq);
 
         if (cam_copy) av_frame_free(&cam_copy);
     }
@@ -358,6 +474,10 @@ static void recording_loop(void)
 
 static void recording_close(void)
 {
+    int should_render = s_rec.enc.header_written &&
+                        s_rec.capture_path[0] &&
+                        s_rec.final_path[0];
+
     indicator_close();
 
     /* Give capture threads up to 50 ms to drain their current read */
@@ -374,7 +494,9 @@ static void recording_close(void)
     if (s_cam_latest) { av_frame_free(&s_cam_latest); s_cam_latest = NULL; }
     pthread_mutex_unlock(&s_cam_mutex);
 
-    printf("[REC] Stopped.\n");
+    printf("[REC] Capture stopped.\n");
+    if (should_render)
+        render_final_video(s_rec.capture_path, s_rec.final_path);
 }
 
 /* ── hotkey thread wrapper ─────────────────────────────────── */
