@@ -22,7 +22,7 @@
 
 #define FPS         30
 #define SCREEN_DEV  ":0.0"
-#define WEBCAM_DEV  "/dev/video0"
+#define WEBCAM_DEV  "auto"
 #define AUDIO_DEV   "default"
 
 /* ── shared state ──────────────────────────────────────────── */
@@ -202,6 +202,12 @@ static void make_output_path(char *buf, size_t n)
     snprintf(buf, n, "%s/screencast_%s.mp4", getenv("HOME"), ts);
 }
 
+static const char *get_webcam_device(void)
+{
+    const char *dev = getenv("SCREENCAST_WEBCAM_DEV");
+    return (dev && dev[0]) ? dev : WEBCAM_DEV;
+}
+
 /* ── webcam thread ─────────────────────────────────────────── */
 
 static void *webcam_thread(void *arg)
@@ -263,7 +269,7 @@ static int recording_open(void)
     s_rec.has_cam = 0;
     s_rec.cam_w   = 0;
     s_rec.cam_h   = 0;
-    if (capture_webcam_open(&s_rec.cam_cap, WEBCAM_DEV,
+    if (capture_webcam_open(&s_rec.cam_cap, get_webcam_device(),
                              &s_rec.cam_w, &s_rec.cam_h) == 0) {
         s_rec.has_cam = 1;
     } else {
