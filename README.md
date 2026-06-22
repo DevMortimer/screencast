@@ -73,6 +73,9 @@ Hotkeys:
 | `Win+Shift+B` | Record display, webcam, and microphone |
 | `Win+Esc` | Stop recording and exit |
 
+Changing to a different recording mode shows a 3-second desktop notification.
+Pressing the hotkey for the already-active mode does not send another one.
+
 Recordings are written to the home directory:
 
 - Intermediate capture: `~/screencast_YYYYMMDD_HHMMSS_capture.mp4`

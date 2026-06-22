@@ -3,6 +3,8 @@
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <X11/Xlib.h>
 #include <X11/XKBlib.h>
 #include <X11/keysym.h>
@@ -22,6 +24,37 @@ static int grab_error_handler(Display *dpy, XErrorEvent *err)
     if (err->error_code == BadAccess)
         s_grab_errors++;
     return 0;
+}
+
+static const char *mode_label(RecordMode mode)
+{
+    switch (mode) {
+    case MODE_DISPLAY: return "Display mode";
+    case MODE_WEBCAM:  return "Webcam mode";
+    case MODE_BOTH:    return "Both mode";
+    default:           return NULL;
+    }
+}
+
+static void send_mode_notification(RecordMode mode)
+{
+    const char *label = mode_label(mode);
+    if (!label) return;
+
+    pid_t pid = fork();
+    if (pid < 0) return;
+
+    if (pid == 0) {
+        execlp("notify-send", "notify-send",
+               "-a", "screencast",
+               "-t", "3000",
+               "Screencast mode changed",
+               label,
+               (char *)NULL);
+        _exit(127);
+    }
+
+    waitpid(pid, NULL, 0);
 }
 
 static unsigned int get_num_lock_mask(Display *dpy)
@@ -85,11 +118,15 @@ static void ungrab_key(KeySym sym, unsigned int base_mods)
 static void set_mode(RecordMode new_mode)
 {
     int cur_mode = atomic_load(&g_mode);
-    if (atomic_load(&g_recording) && cur_mode == (int)new_mode)
+    if (cur_mode == (int)new_mode) {
+        if (!atomic_load(&g_recording))
+            atomic_store(&g_recording, 1);
         return;
+    }
 
     atomic_store(&g_mode,      (int)new_mode);
     atomic_store(&g_recording, 1);
+    send_mode_notification(new_mode);
 }
 
 int hotkeys_init(void)
