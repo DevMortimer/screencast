@@ -1,11 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
 #include <signal.h>
-#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -230,6 +230,49 @@ static const char *env_default(const char *name, const char *fallback)
     return (value && value[0]) ? value : fallback;
 }
 
+static int wait_for_child(pid_t pid, int *status, const char *label)
+{
+    for (;;) {
+        pid_t ret = waitpid(pid, status, 0);
+        if (ret == pid)
+            return 0;
+
+        if (ret < 0 && errno == EINTR)
+            continue;
+
+        if (ret < 0)
+            fprintf(stderr, "main: wait %s: %s\n", label, strerror(errno));
+        else
+            fprintf(stderr, "main: wait %s: unexpected pid %ld\n",
+                    label, (long)ret);
+        return -1;
+    }
+}
+
+static int child_exited_successfully(int status)
+{
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static void log_child_status(const char *label, int status)
+{
+    if (WIFEXITED(status)) {
+        fprintf(stderr, "main: %s exited with status %d\n",
+                label, WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        fprintf(stderr, "main: %s terminated by signal %d",
+                label, WTERMSIG(status));
+#ifdef WCOREDUMP
+        if (WCOREDUMP(status))
+            fprintf(stderr, " (core dumped)");
+#endif
+        fprintf(stderr, "\n");
+    } else {
+        fprintf(stderr, "main: %s ended with unexpected wait status 0x%x\n",
+                label, status);
+    }
+}
+
 static void send_render_notification(const char *summary, const char *body)
 {
     pid_t pid = fork();
@@ -241,7 +284,8 @@ static void send_render_notification(const char *summary, const char *body)
         _exit(127);
     }
 
-    waitpid(pid, NULL, 0);
+    int status = 0;
+    wait_for_child(pid, &status, "notify-send");
 }
 
 static int final_video_is_valid(const char *final_path)
@@ -250,31 +294,30 @@ static int final_video_is_valid(const char *final_path)
     if (stat(final_path, &st) < 0 || st.st_size <= 0)
         return 0;
 
-    pid_t pid = fork();
-    if (pid < 0) return 0;
-
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            close(devnull);
-        }
-
-        execlp("ffprobe", "ffprobe",
-               "-v", "error",
-               "-select_streams", "v:0",
-               "-show_entries", "stream=codec_type",
-               "-of", "csv=p=0",
-               final_path,
-               (char *)NULL);
-        _exit(127);
-    }
-
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0)
+    AVFormatContext *fmt = NULL;
+    int ret = avformat_open_input(&fmt, final_path, NULL, NULL);
+    if (ret < 0)
         return 0;
 
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    ret = avformat_find_stream_info(fmt, NULL);
+    if (ret < 0) {
+        avformat_close_input(&fmt);
+        return 0;
+    }
+
+    int valid = 0;
+    for (unsigned int i = 0; i < fmt->nb_streams; i++) {
+        AVCodecParameters *par = fmt->streams[i]->codecpar;
+        if (par->codec_type == AVMEDIA_TYPE_VIDEO &&
+            par->codec_id != AV_CODEC_ID_NONE &&
+            par->width > 0 && par->height > 0) {
+            valid = 1;
+            break;
+        }
+    }
+
+    avformat_close_input(&fmt);
+    return valid;
 }
 
 static int run_final_render(const char *capture_path, const char *final_path)
@@ -325,15 +368,14 @@ static int run_final_render(const char *capture_path, const char *final_path)
     }
 
     int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        perror("main: wait ffmpeg");
+    if (wait_for_child(pid, &status, "ffmpeg") < 0)
         return -1;
-    }
 
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    if (!child_exited_successfully(status)) {
+        log_child_status("ffmpeg", status);
         if (final_video_is_valid(final_path)) {
             fprintf(stderr,
-                    "main: ffmpeg exited non-zero but final video validates: %s\n",
+                    "main: ffmpeg did not report success but final video validates: %s\n",
                     final_path);
             return 0;
         }
