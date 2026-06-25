@@ -368,11 +368,11 @@ static int run_final_render(const char *capture_path, const char *final_path)
     }
 
     int status = 0;
-    if (wait_for_child(pid, &status, "ffmpeg") < 0)
-        return -1;
+    int wait_ok = (wait_for_child(pid, &status, "ffmpeg") == 0);
 
-    if (!child_exited_successfully(status)) {
-        log_child_status("ffmpeg", status);
+    if (!wait_ok || !child_exited_successfully(status)) {
+        if (wait_ok)
+            log_child_status("ffmpeg", status);
         if (final_video_is_valid(final_path)) {
             fprintf(stderr,
                     "main: ffmpeg did not report success but final video validates: %s\n",
@@ -400,6 +400,11 @@ static int render_final_video(const char *capture_path, const char *final_path)
     if (pid == 0) {
         if (setsid() < 0)
             perror("main: setsid render worker");
+
+        /* The parent may run with SIGCHLD=SIG_IGN (inherited from the desktop
+         * launcher) which causes waitpid() to return ECHILD immediately instead
+         * of blocking.  Reset to SIG_DFL so we can properly wait for ffmpeg. */
+        signal(SIGCHLD, SIG_DFL);
 
         int ret = run_final_render(capture_path, final_path);
         if (ret == 0) {
