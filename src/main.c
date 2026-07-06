@@ -25,9 +25,17 @@
 /* ── configuration ─────────────────────────────────────────── */
 
 #define FPS         30
-#define SCREEN_DEV  ":0.0"
+#define SCREEN_DEV  ":0.0"   /* fallback when $DISPLAY is unset */
 #define WEBCAM_DEV  "auto"
 #define AUDIO_DEV   "default"
+
+/* The session's display can drift (e.g. GDM restarts leave X on :1),
+ * so grab whatever the process was launched under. */
+static const char *screen_dev(void)
+{
+    const char *d = getenv("DISPLAY");
+    return (d && *d) ? d : SCREEN_DEV;
+}
 
 /* ── shared state ──────────────────────────────────────────── */
 
@@ -483,7 +491,7 @@ static int recording_open(void)
                        s_rec.canvas_w, s_rec.canvas_h) < 0)
         fprintf(stderr, "main: live recording indicator unavailable\n");
 
-    if (capture_screen_open(&s_rec.screen_cap, SCREEN_DEV,
+    if (capture_screen_open(&s_rec.screen_cap, screen_dev(),
                              s_rec.mon_x, s_rec.mon_y,
                              s_rec.canvas_w, s_rec.canvas_h, FPS) < 0) {
         fprintf(stderr, "main: screen capture failed\n");
