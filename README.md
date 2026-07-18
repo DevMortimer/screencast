@@ -103,7 +103,7 @@ The recorder can be tuned with environment variables:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SCREENCAST_OUTPUT` | first output | Wayland output name to capture (e.g. `DP-1`, `HDMI-A-1`). Match `wlr-randr`/`niri msg outputs` names. |
+| `SCREENCAST_OUTPUT` | focused output | Wayland output name to capture (e.g. `DP-1`, `HDMI-A-1`). Match `wlr-randr`/`niri msg outputs` names. When unset, the focused output is used on niri (`niri msg focused-output`), else the first output. |
 | `SCREENCAST_DRAW_MOUSE` | `1` | Composite the cursor into the recording; set to `0` to hide it. |
 | `SCREENCAST_WEBCAM_DEV` | `auto` | Webcam device path, or `auto` to scan `/dev/v4l` and `/dev/video*`. |
 | `SCREENCAST_CAM_FORMAT` | `nv12` | Requested webcam input format. |

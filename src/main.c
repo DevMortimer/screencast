@@ -25,11 +25,42 @@
 #define WEBCAM_DEV  "auto"
 #define AUDIO_DEV   "default"
 
-/* Empty/NULL selects the first Wayland output. */
+/*
+ * Which output to capture.  SCREENCAST_OUTPUT wins; otherwise ask niri for the
+ * focused output so we record the monitor the user is actually on.  Returns
+ * NULL if neither is available, and wlcap falls back to the first output.
+ */
 static const char *screen_output(void)
 {
-    const char *o = getenv("SCREENCAST_OUTPUT");
-    return (o && *o) ? o : NULL;
+    static char buf[128];
+
+    const char *env = getenv("SCREENCAST_OUTPUT");
+    if (env && *env) return env;
+
+    FILE *fp = popen("niri msg --json focused-output 2>/dev/null", "r");
+    if (!fp) return NULL;
+
+    char json[1024];
+    size_t n = fread(json, 1, sizeof(json) - 1, fp);
+    pclose(fp);
+    if (n == 0) return NULL;
+    json[n] = '\0';
+
+    /* Pull the value of the first "name":"…" pair. */
+    const char *key = strstr(json, "\"name\"");
+    if (!key) return NULL;
+    const char *colon = strchr(key, ':');
+    if (!colon) return NULL;
+    const char *q1 = strchr(colon, '"');
+    if (!q1) return NULL;
+    const char *q2 = strchr(q1 + 1, '"');
+    if (!q2) return NULL;
+
+    size_t len = (size_t)(q2 - q1 - 1);
+    if (len == 0 || len >= sizeof(buf)) return NULL;
+    memcpy(buf, q1 + 1, len);
+    buf[len] = '\0';
+    return buf;
 }
 
 /* ── shared state ──────────────────────────────────────────── */
