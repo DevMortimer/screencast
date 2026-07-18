@@ -2,24 +2,48 @@ CC      := gcc
 TARGET  := screencast
 SRCDIR  := src
 OBJDIR  := build
+PROTODIR:= protocols
 
 SRCS    := $(wildcard $(SRCDIR)/*.c)
 OBJS    := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
 
-PKG     := libavformat libavcodec libavdevice libswscale libswresample libavutil x11 xext
+# Vendored Wayland protocol (wlr-screencopy); code generated at build time.
+PROTO_XML := $(PROTODIR)/wlr-screencopy-unstable-v1.xml
+PROTO_HDR := $(OBJDIR)/wlr-screencopy-unstable-v1-client-protocol.h
+PROTO_SRC := $(OBJDIR)/wlr-screencopy-unstable-v1-protocol.c
+PROTO_OBJ := $(OBJDIR)/wlr-screencopy-unstable-v1-protocol.o
 
-CFLAGS  := $(shell pkg-config --cflags $(PKG)) -pthread -O2 -Wall -Wextra -std=c11
-LDFLAGS := $(shell pkg-config --libs   $(PKG)) -pthread -lm -lXinerama
+SCANNER := wayland-scanner
+
+PKG     := libavformat libavcodec libavdevice libswscale libswresample \
+           libavutil wayland-client
+
+CFLAGS  := $(shell pkg-config --cflags $(PKG)) -I$(OBJDIR) -pthread \
+           -O2 -Wall -Wextra -std=c11
+LDFLAGS := $(shell pkg-config --libs   $(PKG)) -pthread -lm
 
 all: $(OBJDIR) $(TARGET)
 
 $(OBJDIR):
 	mkdir -p $@
 
-$(TARGET): $(OBJS)
+# ── generated protocol code ─────────────────────────────────
+$(PROTO_HDR): $(PROTO_XML) | $(OBJDIR)
+	$(SCANNER) client-header $< $@
+
+$(PROTO_SRC): $(PROTO_XML) | $(OBJDIR)
+	$(SCANNER) private-code $< $@
+
+$(PROTO_OBJ): $(PROTO_SRC)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# wlcap.c is the only source that includes the generated header.
+$(OBJDIR)/wlcap.o: $(PROTO_HDR)
+
+$(TARGET): $(OBJS) $(PROTO_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-$(OBJDIR)/%.o: $(SRCDIR)/%.c
+$(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:

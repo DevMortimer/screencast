@@ -19,16 +19,20 @@ typedef struct {
     AVChannelLayout ch_layout;
     CaptureInterruptFn should_interrupt;
     void               *interrupt_opaque;
+    /* Non-NULL for the Wayland screen source (wlcap); NULL for libav sources. */
+    void               *wl_backend;
 } CaptureCtx;
 
 /* Installs a callback used to interrupt blocking FFmpeg device reads. */
 void capture_set_interrupt(CaptureCtx *ctx, CaptureInterruptFn fn,
                            void *opaque);
 
-/* Opens x11grab at display_name offset by (x_off, y_off), fixed w×h at fps. */
-int  capture_screen_open(CaptureCtx *ctx, const char *display_name,
-                          int x_off, int y_off,
-                          int width, int height, int fps);
+/*
+ * Opens the Wayland screen source (wlr-screencopy) for the given output name
+ * (NULL/empty selects the first output), capped at fps.  The captured output's
+ * size and pixel format are written back into ctx (width/height/pix_fmt).
+ */
+int  capture_screen_open(CaptureCtx *ctx, const char *output_name, int fps);
 
 /* Opens v4l2; actual resolution written to *out_w, *out_h. */
 int  capture_webcam_open(CaptureCtx *ctx, const char *device,

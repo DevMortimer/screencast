@@ -1,23 +1,27 @@
 # Screencast
 
-A small X11 screencast recorder written in C. It records the active monitor,
-optional webcam video, and optional microphone audio, then renders a final MP4
-with NVIDIA NVENC.
+A small Wayland screencast recorder written in C. It records an output via the
+`wlr-screencopy` protocol, optional webcam video, and optional microphone
+audio, then renders a final MP4 with NVIDIA NVENC.
+
+It targets wlroots-based compositors (niri, Sway, Hyprland, river, …) that
+implement `wlr-screencopy-unstable-v1`.
 
 ## Features
 
-- Records the monitor containing the mouse pointer.
+- Records a Wayland output via `wlr-screencopy` (shm buffers).
 - Supports display-only, webcam-only, and display-plus-webcam modes.
 - Captures microphone audio from PulseAudio/PipeWire `default`, with ALSA
   fallback.
-- Adds a circular red recording indicator while capture is active.
+- Burns a small red recording indicator into the top-right of the video.
 - Writes a high-quality intermediate MP4 and transcodes it to a final
   `h264_nvenc` MP4.
 
 ## Requirements
 
-- Linux with X11
-- GCC and `make`
+- A wlroots-based Wayland compositor with `wlr-screencopy-unstable-v1`.
+- GCC and `make`.
+- `wayland-scanner` and the `wayland-client` library.
 - FFmpeg development libraries:
   - `libavformat`
   - `libavcodec`
@@ -25,22 +29,21 @@ with NVIDIA NVENC.
   - `libswscale`
   - `libswresample`
   - `libavutil`
-- X11 development libraries:
-  - `x11`
-  - `xext`
-  - `xinerama`
-- FFmpeg CLI available as `ffmpeg`
-- Desktop notifications via `notify-send`
-- NVIDIA GPU/driver stack with `h264_nvenc` support
+- FFmpeg CLI available as `ffmpeg`.
+- Desktop notifications via `notify-send`.
+- NVIDIA GPU/driver stack with `h264_nvenc` support.
 
 On Debian/Ubuntu-based systems, the packages are typically:
 
 ```sh
 sudo apt install build-essential pkg-config ffmpeg \
   libavformat-dev libavcodec-dev libavdevice-dev libswscale-dev \
-  libswresample-dev libavutil-dev libx11-dev libxext-dev \
-  libxinerama-dev libnotify-bin
+  libswresample-dev libavutil-dev libwayland-dev wayland-protocols \
+  libnotify-bin
 ```
+
+The `wlr-screencopy-unstable-v1.xml` protocol is vendored under `protocols/`,
+so `wlr-protocols` is not required to build.
 
 ## Build
 
@@ -58,23 +61,33 @@ make clean
 
 ## Usage
 
-Run the recorder from an X11 session:
+Wayland compositors own global keybindings, so — unlike the old X11 version —
+`screencast` no longer grabs hotkeys itself. Instead it is a small
+daemon/controller:
 
 ```sh
-./screencast
+screencast display   # start recording the screen + mic (becomes a daemon)
+screencast webcam    # switch the running recorder to webcam + mic
+screencast both      # switch to screen + webcam overlay + mic
+screencast stop      # stop and render the final MP4
 ```
 
-Hotkeys:
+The first record command starts a background daemon and begins recording. Later
+invocations reach that daemon over a control socket
+(`$XDG_RUNTIME_DIR/screencast.sock`) and switch its mode live within the same
+file. `screencast stop` ends the recording and kicks off the final render.
 
-| Hotkey | Action |
-| --- | --- |
-| `Win+Shift+D` | Record display and microphone |
-| `Win+Shift+W` | Record webcam and microphone |
-| `Win+Shift+B` | Record display, webcam, and microphone |
-| `Win+Esc` | Stop recording and exit |
+Bind these to compositor keys. For **niri** (`config.kdl`), using the original
+screencast shortcuts:
 
-Changing to a different recording mode shows a 3-second desktop notification.
-Pressing the hotkey for the already-active mode does not send another one.
+```kdl
+binds {
+    Mod+Shift+D { spawn "screencast" "display"; }
+    Mod+Shift+W { spawn "screencast" "webcam"; }
+    Mod+Shift+B { spawn "screencast" "both"; }
+    Mod+Escape  { spawn "screencast" "stop"; }
+}
+```
 
 Recordings are written to the home directory:
 
@@ -90,6 +103,8 @@ The recorder can be tuned with environment variables:
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `SCREENCAST_OUTPUT` | first output | Wayland output name to capture (e.g. `DP-1`, `HDMI-A-1`). Match `wlr-randr`/`niri msg outputs` names. |
+| `SCREENCAST_DRAW_MOUSE` | `1` | Composite the cursor into the recording; set to `0` to hide it. |
 | `SCREENCAST_WEBCAM_DEV` | `auto` | Webcam device path, or `auto` to scan `/dev/v4l` and `/dev/video*`. |
 | `SCREENCAST_CAM_FORMAT` | `nv12` | Requested webcam input format. |
 | `SCREENCAST_CAM_FPS` | `30` | Requested webcam frame rate. |
@@ -105,10 +120,10 @@ The recorder can be tuned with environment variables:
 Example:
 
 ```sh
-SCREENCAST_WEBCAM_DEV=/dev/video2 SCREENCAST_KEEP_CAPTURE=1 ./screencast
+SCREENCAST_OUTPUT=DP-1 SCREENCAST_KEEP_CAPTURE=1 screencast display
 ```
 
 ## Notes
 
-This program uses X11 APIs directly for capture and global hotkeys. I don't
-care about Wayland.
+Screen capture uses `wlr-screencopy-unstable-v1` with `wl_shm` buffers. The
+webcam (v4l2) and audio (PulseAudio/PipeWire) paths use FFmpeg's libavdevice.

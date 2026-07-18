@@ -10,14 +10,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <X11/Xlib.h>
-#include <X11/extensions/Xinerama.h>
-#include <X11/extensions/shape.h>
 #include <libavutil/log.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/time.h>
 
-#include "hotkeys.h"
+#include "control.h"
 #include "capture.h"
 #include "encoder.h"
 #include "composite.h"
@@ -25,16 +22,14 @@
 /* ── configuration ─────────────────────────────────────────── */
 
 #define FPS         30
-#define SCREEN_DEV  ":0.0"   /* fallback when $DISPLAY is unset */
 #define WEBCAM_DEV  "auto"
 #define AUDIO_DEV   "default"
 
-/* The session's display can drift (e.g. GDM restarts leave X on :1),
- * so grab whatever the process was launched under. */
-static const char *screen_dev(void)
+/* Empty/NULL selects the first Wayland output. */
+static const char *screen_output(void)
 {
-    const char *d = getenv("DISPLAY");
-    return (d && *d) ? d : SCREEN_DEV;
+    const char *o = getenv("SCREENCAST_OUTPUT");
+    return (o && *o) ? o : NULL;
 }
 
 /* ── shared state ──────────────────────────────────────────── */
@@ -63,8 +58,7 @@ typedef struct {
     CaptureCtx cam_cap;
     CaptureCtx aud_cap;
     EncoderCtx enc;
-    int mon_x, mon_y;       /* active monitor origin */
-    int canvas_w, canvas_h; /* active monitor size   */
+    int canvas_w, canvas_h; /* captured output size */
     int cam_w, cam_h;
     int has_cam;
     int has_aud;
@@ -73,144 +67,6 @@ typedef struct {
 } RecCtx;
 
 static RecCtx s_rec;
-
-typedef struct {
-    Display *dpy;
-    Window win;
-    GC gc;
-} RecIndicator;
-
-static RecIndicator s_rec_indicator;
-
-/* ── live recording indicator ─────────────────────────────── */
-
-static void indicator_close(void)
-{
-    if (!s_rec_indicator.dpy) return;
-
-    if (s_rec_indicator.gc)
-        XFreeGC(s_rec_indicator.dpy, s_rec_indicator.gc);
-    if (s_rec_indicator.win)
-        XDestroyWindow(s_rec_indicator.dpy, s_rec_indicator.win);
-    XCloseDisplay(s_rec_indicator.dpy);
-    memset(&s_rec_indicator, 0, sizeof(s_rec_indicator));
-}
-
-static int indicator_open(int mon_x, int mon_y, int canvas_w, int canvas_h)
-{
-    (void)canvas_h;
-
-    indicator_close();
-
-    Display *dpy = XOpenDisplay(NULL);
-    if (!dpy) return -1;
-
-    int screen = DefaultScreen(dpy);
-    Window root = RootWindow(dpy, screen);
-    int diameter = 24;
-    int x = mon_x + canvas_w - diameter - 12;
-    int y = mon_y + 12;
-
-    XSetWindowAttributes attrs;
-    memset(&attrs, 0, sizeof(attrs));
-    attrs.override_redirect = True;
-    attrs.background_pixel = BlackPixel(dpy, screen);
-    attrs.event_mask = ExposureMask;
-
-    Window win = XCreateWindow(dpy, root, x, y,
-                               (unsigned int)diameter,
-                               (unsigned int)diameter,
-                               0, CopyFromParent, InputOutput,
-                               CopyFromParent,
-                               CWOverrideRedirect | CWBackPixel | CWEventMask,
-                               &attrs);
-    if (!win) {
-        XCloseDisplay(dpy);
-        return -1;
-    }
-
-    int shape_event = 0, shape_error = 0;
-    if (XShapeQueryExtension(dpy, &shape_event, &shape_error)) {
-        Pixmap mask = XCreatePixmap(dpy, win,
-                                    (unsigned int)diameter,
-                                    (unsigned int)diameter, 1);
-        GC mask_gc = XCreateGC(dpy, mask, 0, NULL);
-        XSetForeground(dpy, mask_gc, 0);
-        XFillRectangle(dpy, mask, mask_gc, 0, 0,
-                       (unsigned int)diameter,
-                       (unsigned int)diameter);
-        XSetForeground(dpy, mask_gc, 1);
-        XFillArc(dpy, mask, mask_gc, 0, 0,
-                 (unsigned int)diameter,
-                 (unsigned int)diameter, 0, 360 * 64);
-        XShapeCombineMask(dpy, win, ShapeBounding, 0, 0, mask, ShapeSet);
-#ifdef ShapeInput
-        XSetForeground(dpy, mask_gc, 0);
-        XFillRectangle(dpy, mask, mask_gc, 0, 0,
-                       (unsigned int)diameter,
-                       (unsigned int)diameter);
-        XShapeCombineMask(dpy, win, ShapeInput, 0, 0, mask, ShapeSet);
-#endif
-        XFreeGC(dpy, mask_gc);
-        XFreePixmap(dpy, mask);
-    }
-
-    GC gc = XCreateGC(dpy, win, 0, NULL);
-    Colormap cmap = DefaultColormap(dpy, screen);
-    XColor red, exact;
-    unsigned long red_pixel = 0xff0000;
-    if (XAllocNamedColor(dpy, cmap, "red", &red, &exact))
-        red_pixel = red.pixel;
-
-    XSetForeground(dpy, gc, red_pixel);
-    XFillArc(dpy, win, gc, 0, 0,
-             (unsigned int)diameter,
-             (unsigned int)diameter, 0, 360 * 64);
-    XMapRaised(dpy, win);
-    XFlush(dpy);
-
-    s_rec_indicator.dpy = dpy;
-    s_rec_indicator.win = win;
-    s_rec_indicator.gc = gc;
-    return 0;
-}
-
-/* ── helper: find which monitor the pointer is on ──────────── */
-
-static void get_active_monitor(int *out_x, int *out_y, int *out_w, int *out_h)
-{
-    *out_x = 0; *out_y = 0; *out_w = 1920; *out_h = 1080;
-
-    Display *dpy = XOpenDisplay(NULL);
-    if (!dpy) return;
-
-    Screen *scr = DefaultScreenOfDisplay(dpy);
-    *out_w = WidthOfScreen(scr);
-    *out_h = HeightOfScreen(scr);
-
-    Window root = DefaultRootWindow(dpy);
-    Window d1, d2;
-    int ptr_x, ptr_y, d3, d4;
-    unsigned int d5;
-    XQueryPointer(dpy, root, &d1, &d2, &ptr_x, &ptr_y, &d3, &d4, &d5);
-
-    int n;
-    XineramaScreenInfo *screens = XineramaQueryScreens(dpy, &n);
-    if (screens) {
-        for (int i = 0; i < n; i++) {
-            int sx = screens[i].x_org, sy = screens[i].y_org;
-            int sw = screens[i].width, sh = screens[i].height;
-            if (ptr_x >= sx && ptr_x < sx + sw &&
-                ptr_y >= sy && ptr_y < sy + sh) {
-                *out_x = sx; *out_y = sy;
-                *out_w = sw; *out_h = sh;
-                break;
-            }
-        }
-        XFree(screens);
-    }
-    XCloseDisplay(dpy);
-}
 
 /* ── helper: build timestamped output path ─────────────────── */
 
@@ -279,21 +135,6 @@ static void log_child_status(const char *label, int status)
         fprintf(stderr, "main: %s ended with unexpected wait status 0x%x\n",
                 label, status);
     }
-}
-
-static void send_render_notification(const char *summary, const char *body)
-{
-    pid_t pid = fork();
-    if (pid < 0) return;
-
-    if (pid == 0) {
-        execlp("notify-send", "notify-send",
-               "-a", "screencast", summary, body, (char *)NULL);
-        _exit(127);
-    }
-
-    int status = 0;
-    wait_for_child(pid, &status, "notify-send");
 }
 
 static int final_video_is_valid(const char *final_path)
@@ -420,9 +261,9 @@ static int render_final_video(const char *capture_path, const char *final_path)
             if (!keep || !keep[0])
                 unlink(capture_path);
 
-            send_render_notification("Screencast ready", final_path);
+            control_notify("Screencast ready", final_path);
         } else {
-            send_render_notification("Screencast render failed", capture_path);
+            control_notify("Screencast render failed", capture_path);
         }
 
         _exit(ret == 0 ? 0 : 1);
@@ -471,33 +312,26 @@ static void *audio_thread(void *arg)
 
 static int recording_open(void)
 {
-    get_active_monitor(&s_rec.mon_x, &s_rec.mon_y,
-                       &s_rec.canvas_w, &s_rec.canvas_h);
     s_rec.capture_path[0] = '\0';
     s_rec.final_path[0] = '\0';
 
     make_output_paths(s_rec.final_path, sizeof(s_rec.final_path),
                       s_rec.capture_path, sizeof(s_rec.capture_path));
-    printf("[REC] Capture: %s  monitor=%dx%d+%d+%d\n",
-           s_rec.capture_path, s_rec.canvas_w, s_rec.canvas_h,
-           s_rec.mon_x, s_rec.mon_y);
-    printf("[REC] Final:   %s\n", s_rec.final_path);
 
     capture_set_interrupt(&s_rec.screen_cap, recording_interrupted, NULL);
     capture_set_interrupt(&s_rec.cam_cap, recording_interrupted, NULL);
     capture_set_interrupt(&s_rec.aud_cap, recording_interrupted, NULL);
 
-    if (indicator_open(s_rec.mon_x, s_rec.mon_y,
-                       s_rec.canvas_w, s_rec.canvas_h) < 0)
-        fprintf(stderr, "main: live recording indicator unavailable\n");
-
-    if (capture_screen_open(&s_rec.screen_cap, screen_dev(),
-                             s_rec.mon_x, s_rec.mon_y,
-                             s_rec.canvas_w, s_rec.canvas_h, FPS) < 0) {
+    if (capture_screen_open(&s_rec.screen_cap, screen_output(), FPS) < 0) {
         fprintf(stderr, "main: screen capture failed\n");
-        indicator_close();
         return -1;
     }
+    s_rec.canvas_w = s_rec.screen_cap.width;
+    s_rec.canvas_h = s_rec.screen_cap.height;
+
+    printf("[REC] Capture: %s  output=%dx%d\n",
+           s_rec.capture_path, s_rec.canvas_w, s_rec.canvas_h);
+    printf("[REC] Final:   %s\n", s_rec.final_path);
 
     /* Webcam is optional — continue without it if missing */
     s_rec.has_cam = 0;
@@ -537,7 +371,6 @@ static int recording_open(void)
                      s_rec.cam_w, s_rec.cam_h, cam_fmt,
                      audio_sr, audio_ch, audio_fmt) < 0) {
         fprintf(stderr, "main: encoder open failed\n");
-        indicator_close();
         capture_free(&s_rec.screen_cap);
         if (s_rec.has_cam) capture_free(&s_rec.cam_cap);
         if (s_rec.has_aud) capture_free(&s_rec.aud_cap);
@@ -570,8 +403,8 @@ static void recording_loop(void)
         if (mode == MODE_WEBCAM && s_rec.has_cam) {
             /*
              * Webcam-only recordings should be paced by the camera.  Waiting
-             * on x11grab here limits webcam-only output to the screen capture
-             * rate even though the screen frame is ignored.
+             * on the screen source here limits webcam-only output to the
+             * screen capture rate even though the screen frame is ignored.
              */
             while (atomic_load(&g_running) && atomic_load(&g_recording)) {
                 pthread_mutex_lock(&s_cam_mutex);
@@ -592,7 +425,7 @@ static void recording_loop(void)
             if (!cam_copy)
                 continue;
         } else {
-            /* av_read_frame blocks ≈1/fps seconds — acceptable stop latency */
+            /* screen grab blocks ≈1/fps seconds — acceptable stop latency */
             if (capture_read(&s_rec.screen_cap) < 0) continue;
 
             if (mode == MODE_BOTH && s_rec.has_cam) {
@@ -625,8 +458,6 @@ static void recording_close(void)
                         s_rec.capture_path[0] &&
                         s_rec.final_path[0];
 
-    indicator_close();
-
     /* Give capture threads up to 50 ms to drain their current read */
     struct timespec ts = { .tv_nsec = 50000000L };
     nanosleep(&ts, NULL);
@@ -646,15 +477,6 @@ static void recording_close(void)
         render_final_video(s_rec.capture_path, s_rec.final_path);
 }
 
-/* ── hotkey thread wrapper ─────────────────────────────────── */
-
-static void *hotkey_thread(void *arg)
-{
-    (void)arg;
-    hotkeys_run();
-    return NULL;
-}
-
 /* ── entry point ───────────────────────────────────────────── */
 
 static void sig_stop(int sig)
@@ -664,17 +486,53 @@ static void sig_stop(int sig)
     atomic_store(&g_running,   0);
 }
 
-int main(void)
+static void usage(const char *argv0)
 {
+    fprintf(stderr,
+        "usage: %s <display|webcam|both|stop>\n"
+        "\n"
+        "  display   record the screen + microphone\n"
+        "  webcam    record the webcam + microphone\n"
+        "  both      record screen + webcam overlay + microphone\n"
+        "  stop      stop the running recorder and render the final file\n"
+        "\n"
+        "The first record command starts a background daemon; later commands\n"
+        "switch its mode over the control socket.  Bind these to compositor\n"
+        "keys (niri): Mod+Shift+D / W / B to record, Mod+Escape to stop.\n",
+        argv0);
+}
+
+int main(int argc, char **argv)
+{
+    const char *cmd = (argc > 1) ? argv[1] : "display";
+
+    /* If a daemon is already running, this invocation is just a controller. */
+    if (control_client_send(cmd) == 0)
+        return 0;
+
+    /* No daemon running. */
+    if (control_is_stop(cmd))
+        return 0; /* nothing to stop */
+
+    int mode = control_parse_mode(cmd);
+    if (mode < 0) {
+        usage(argv[0]);
+        return 1;
+    }
+
     signal(SIGINT,  sig_stop);
     signal(SIGTERM, sig_stop);
 
     av_log_set_level(AV_LOG_ERROR);
 
-    if (hotkeys_init() < 0) return 1;
+    atomic_store(&g_mode,      mode);
+    atomic_store(&g_recording, 1);
+    atomic_store(&g_running,   1);
 
-    pthread_t hk_tid;
-    pthread_create(&hk_tid, NULL, hotkey_thread, NULL);
+    if (control_server_start() < 0)
+        return 1;
+
+    control_notify("Screencast recording", control_mode_label(mode));
 
     struct timespec poll = { .tv_nsec = 20000000L }; /* 20 ms */
 
@@ -682,14 +540,16 @@ int main(void)
         if (atomic_load(&g_recording)) {
             /*
              * Open a fresh MP4, run the encode loop until g_recording drops,
-             * then flush and close.  If the user presses another mode key
-             * during close, the next iteration opens a new file.
+             * then flush and close.  Mode changes are applied live inside the
+             * loop, so one file spans the whole daemon lifetime.
              */
             if (recording_open() == 0) {
                 printf("[REC] Mode %d active.\n", atomic_load(&g_mode));
                 recording_loop();
             } else {
+                /* Capture could not start — don't spin re-opening it. */
                 atomic_store(&g_recording, 0);
+                atomic_store(&g_running, 0);
             }
             recording_close();
         } else {
@@ -697,14 +557,14 @@ int main(void)
         }
     }
 
-    /* Make sure we close any session left open by a rapid Win+Esc */
+    /* Make sure we close any session left open by a rapid stop */
     if (atomic_load(&s_rec_open)) {
         atomic_store(&g_recording, 0);
         recording_close();
     }
 
-    pthread_join(hk_tid, NULL);
-    hotkeys_cleanup();
+    control_notify("Screencast stopped", NULL);
+    control_server_stop();
     printf("[INFO] Exited cleanly.\n");
     return 0;
 }

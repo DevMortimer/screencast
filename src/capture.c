@@ -1,4 +1,5 @@
 #include "capture.h"
+#include "wlcap.h"
 #include <libavdevice/avdevice.h>
 #include <libavutil/opt.h>
 #include <glob.h>
@@ -210,36 +211,43 @@ void capture_set_interrupt(CaptureCtx *ctx, CaptureInterruptFn fn,
     attach_interrupt(ctx);
 }
 
-int capture_screen_open(CaptureCtx *ctx, const char *display_name,
-                         int x_off, int y_off,
-                         int width, int height, int fps)
+int capture_screen_open(CaptureCtx *ctx, const char *output_name, int fps)
 {
-    avdevice_register_all();
     CaptureInterruptFn fn;
     void *opaque;
     preserve_interrupt(ctx, &fn, &opaque);
     memset(ctx, 0, sizeof(*ctx));
     restore_interrupt(ctx, fn, opaque);
 
-    /* x11grab device string: ":0.0+x_off,y_off" */
-    char dev[64];
-    snprintf(dev, sizeof(dev), "%s+%d,%d", display_name, x_off, y_off);
+    /* draw the cursor into the recording by default, like x11grab did */
+    const char *env_cur = getenv("SCREENCAST_DRAW_MOUSE");
+    int overlay_cursor = (!env_cur || env_cur[0] != '0');
 
-    AVDictionary *opts = NULL;
-    char size_str[32], fps_str[8];
-    snprintf(size_str, sizeof(size_str), "%dx%d", width, height);
-    snprintf(fps_str,  sizeof(fps_str),  "%d",    fps);
-    av_dict_set(&opts, "video_size", size_str, 0);
-    av_dict_set(&opts, "framerate",  fps_str,  0);
-    av_dict_set(&opts, "draw_mouse", "1",      0);
-    av_dict_set(&opts, "rtbufsize",  "100M",   0);
+    WlCapInfo info;
+    WlCap *wl = wlcap_open(output_name, overlay_cursor, fps, &info);
+    if (!wl) return -1;
 
-    if (open_input(ctx, "x11grab", dev, &opts) < 0) return -1;
-    if (open_decoder(ctx, AVMEDIA_TYPE_VIDEO) < 0) return -1;
+    ctx->wl_backend = wl;
+    ctx->width      = info.width;
+    ctx->height     = info.height;
+    ctx->pix_fmt    = (enum AVPixelFormat)info.av_pix_fmt;
 
-    ctx->width   = ctx->dec_ctx->width;
-    ctx->height  = ctx->dec_ctx->height;
-    ctx->pix_fmt = ctx->dec_ctx->pix_fmt;
+    ctx->frame = av_frame_alloc();
+    if (!ctx->frame) { wlcap_close(wl); ctx->wl_backend = NULL; return -1; }
+    ctx->frame->format = ctx->pix_fmt;
+    ctx->frame->width  = info.width;
+    ctx->frame->height = info.height;
+
+    uint8_t *base = wlcap_buffer(wl);
+    if (info.y_invert) {
+        /* Present the frame flipped via a negative stride so swscale reads it
+         * top-to-bottom without an extra copy. */
+        ctx->frame->data[0]     = base + (size_t)info.stride * (info.height - 1);
+        ctx->frame->linesize[0] = -info.stride;
+    } else {
+        ctx->frame->data[0]     = base;
+        ctx->frame->linesize[0] = info.stride;
+    }
     return 0;
 }
 
@@ -308,6 +316,13 @@ int capture_audio_open(CaptureCtx *ctx, const char *device)
 
 int capture_read(CaptureCtx *ctx)
 {
+    if (ctx->wl_backend) {
+        if (capture_interrupted(ctx))
+            return AVERROR_EXIT;
+        /* Grabs into the shm buffer already aliased by ctx->frame->data[0]. */
+        return wlcap_grab(ctx->wl_backend) < 0 ? AVERROR(EIO) : 0;
+    }
+
     for (;;) {
         if (capture_interrupted(ctx))
             return AVERROR_EXIT;
@@ -337,6 +352,16 @@ void capture_free(CaptureCtx *ctx)
     CaptureInterruptFn fn;
     void *opaque;
     preserve_interrupt(ctx, &fn, &opaque);
+    if (ctx->wl_backend) {
+        /* frame->data[0] aliases the wlcap shm buffer — don't let av_frame_free
+         * touch it (it holds no AVBufferRef, so this is just tidiness). */
+        if (ctx->frame) {
+            ctx->frame->data[0]     = NULL;
+            ctx->frame->linesize[0] = 0;
+        }
+        wlcap_close(ctx->wl_backend);
+        ctx->wl_backend = NULL;
+    }
     av_frame_free(&ctx->frame);
     av_packet_free(&ctx->pkt);
     avcodec_free_context(&ctx->dec_ctx);
