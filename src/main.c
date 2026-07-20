@@ -16,6 +16,7 @@
 
 #include "control.h"
 #include "capture.h"
+#include "pwcam.h"
 #include "encoder.h"
 #include "composite.h"
 #include "mixer.h"
@@ -89,13 +90,14 @@ static int recording_interrupted(void *opaque)
 
 typedef struct {
     CaptureCtx screen_cap;
-    CaptureCtx cam_cap;
+    PwCam     *pwcam;      /* webcam via PipeWire */
     CaptureCtx mic_cap;    /* microphone (default source) */
     CaptureCtx desk_cap;   /* desktop audio (default sink's monitor) */
     EncoderCtx enc;
     MixerCtx  *mixer;      /* mixes mic + desktop into one track */
     int canvas_w, canvas_h; /* captured output size */
     int cam_w, cam_h;
+    enum AVPixelFormat cam_fmt; /* webcam frame format negotiated by PipeWire */
     int has_cam;
     int has_mic;
     int has_desktop;
@@ -325,24 +327,20 @@ static int render_final_video(const char *capture_path, const char *final_path)
     return 0;
 }
 
-/* ── webcam thread ─────────────────────────────────────────── */
+/* ── webcam frames (delivered by the PipeWire capture thread) ─ */
 
-static void *webcam_thread(void *arg)
+/*
+ * Publish one webcam frame into the shared latest-frame slot the record loop
+ * reads.  Ownership of `frame` passes to us; it replaces the previous latest.
+ */
+static void cam_frame_cb(void *user, AVFrame *frame)
 {
-    CaptureCtx *cap = (CaptureCtx *)arg;
-    while (atomic_load(&g_running) && atomic_load(&s_rec_open)) {
-        if (capture_read(cap) < 0) continue;
-
-        AVFrame *copy = av_frame_alloc();
-        av_frame_ref(copy, cap->frame);
-
-        pthread_mutex_lock(&s_cam_mutex);
-        if (s_cam_latest) av_frame_free(&s_cam_latest);
-        s_cam_latest = copy;
-        atomic_fetch_add(&s_cam_seq, 1);
-        pthread_mutex_unlock(&s_cam_mutex);
-    }
-    return NULL;
+    (void)user;
+    pthread_mutex_lock(&s_cam_mutex);
+    if (s_cam_latest) av_frame_free(&s_cam_latest);
+    s_cam_latest = frame;
+    atomic_fetch_add(&s_cam_seq, 1);
+    pthread_mutex_unlock(&s_cam_mutex);
 }
 
 /* ── audio threads ─────────────────────────────────────────── */
@@ -377,7 +375,6 @@ static int recording_open(void)
                       s_rec.capture_path, sizeof(s_rec.capture_path));
 
     capture_set_interrupt(&s_rec.screen_cap, recording_interrupted, NULL);
-    capture_set_interrupt(&s_rec.cam_cap, recording_interrupted, NULL);
     capture_set_interrupt(&s_rec.mic_cap, recording_interrupted, NULL);
     capture_set_interrupt(&s_rec.desk_cap, recording_interrupted, NULL);
 
@@ -392,16 +389,34 @@ static int recording_open(void)
            s_rec.capture_path, s_rec.canvas_w, s_rec.canvas_h);
     printf("[REC] Final:   %s\n", s_rec.final_path);
 
-    /* Webcam is optional — continue without it if missing */
+    /* Webcam is optional — continue without it if missing.  Captured via
+     * PipeWire so the camera can be shared with a running meeting app. */
     s_rec.has_cam = 0;
+    s_rec.pwcam   = NULL;
     s_rec.cam_w   = 0;
     s_rec.cam_h   = 0;
-    if (capture_webcam_open(&s_rec.cam_cap, get_webcam_device(),
-                             &s_rec.cam_w, &s_rec.cam_h) == 0) {
+    s_rec.cam_fmt = AV_PIX_FMT_NONE;
+    {
+        int cam_w_hint = 0, cam_h_hint = 0, cam_fps_hint = 0;
+        const char *size = getenv("SCREENCAST_CAM_SIZE");
+        if (size && size[0]) sscanf(size, "%dx%d", &cam_w_hint, &cam_h_hint);
+        const char *fps = getenv("SCREENCAST_CAM_FPS");
+        if (fps && fps[0]) cam_fps_hint = atoi(fps);
+
+        PwCamInfo info;
+        s_rec.pwcam = pwcam_open(get_webcam_device(),
+                                 cam_w_hint, cam_h_hint, cam_fps_hint,
+                                 &info, cam_frame_cb, NULL);
+        if (s_rec.pwcam) {
+            s_rec.cam_w   = info.width;
+            s_rec.cam_h   = info.height;
+            s_rec.cam_fmt = info.av_fmt;
+        }
+    }
+    if (s_rec.pwcam) {
         s_rec.has_cam = 1;
     } else {
         fprintf(stderr, "main: webcam not available — display+audio only\n");
-        capture_free(&s_rec.cam_cap);
     }
 
     /* Microphone — the default source. Best-effort. */
@@ -456,7 +471,7 @@ static int recording_open(void)
     control_notify("Screencast audio", audio_sources);
 
     enum AVPixelFormat cam_fmt = s_rec.has_cam
-                                 ? s_rec.cam_cap.pix_fmt
+                                 ? s_rec.cam_fmt
                                  : AV_PIX_FMT_NONE;
 
     /* The encoder is fed the mixer's canonical format, not any raw source. */
@@ -481,7 +496,7 @@ static int recording_open(void)
     if (enc_ret < 0) {
         fprintf(stderr, "main: encoder open failed\n");
         capture_free(&s_rec.screen_cap);
-        if (s_rec.has_cam)     capture_free(&s_rec.cam_cap);
+        if (s_rec.has_cam)     { pwcam_close(s_rec.pwcam); s_rec.pwcam = NULL; }
         if (s_rec.has_mic)     capture_free(&s_rec.mic_cap);
         if (s_rec.has_desktop) capture_free(&s_rec.desk_cap);
         if (s_rec.mixer) { mixer_destroy(s_rec.mixer); s_rec.mixer = NULL; }
@@ -496,14 +511,14 @@ static int recording_open(void)
 
 static void recording_loop(void)
 {
-    pthread_t cam_tid = 0, mic_tid = 0, desk_tid = 0;
+    pthread_t mic_tid = 0, desk_tid = 0;
     AudioArg mic_arg  = { &s_rec.mic_cap,  s_rec.mixer, MIX_SRC_MIC };
     AudioArg desk_arg = { &s_rec.desk_cap, s_rec.mixer, MIX_SRC_DESKTOP };
     int64_t last_webcam_seq = -1;
     struct timespec cam_poll = { .tv_nsec = 1000000L };
 
-    if (s_rec.has_cam)
-        pthread_create(&cam_tid, NULL, webcam_thread, &s_rec.cam_cap);
+    /* The webcam has no thread here: the PipeWire capture thread pushes frames
+     * into s_cam_latest via cam_frame_cb for the whole recording lifetime. */
     if (s_rec.has_mic)
         pthread_create(&mic_tid, NULL, audio_thread, &mic_arg);
     if (s_rec.has_desktop)
@@ -560,7 +575,6 @@ static void recording_loop(void)
     }
 
     atomic_store(&s_rec_open, 0);
-    if (cam_tid)  pthread_join(cam_tid, NULL);
     if (mic_tid)  pthread_join(mic_tid, NULL);
     if (desk_tid) pthread_join(desk_tid, NULL);
 }
@@ -581,7 +595,8 @@ static void recording_close(void)
     encoder_free(&s_rec.enc);
     if (s_rec.mixer) { mixer_destroy(s_rec.mixer); s_rec.mixer = NULL; }
     capture_free(&s_rec.screen_cap);
-    if (s_rec.has_cam)     capture_free(&s_rec.cam_cap);
+    /* Stop the PipeWire thread first so no late cam_frame_cb races the free. */
+    if (s_rec.has_cam)     { pwcam_close(s_rec.pwcam); s_rec.pwcam = NULL; }
     if (s_rec.has_mic)     capture_free(&s_rec.mic_cap);
     if (s_rec.has_desktop) capture_free(&s_rec.desk_cap);
 

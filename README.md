@@ -11,6 +11,9 @@ implement `wlr-screencopy-unstable-v1`.
 
 - Records a Wayland output via `wlr-screencopy` (shm buffers).
 - Supports display-only, webcam-only, and display-plus-webcam modes.
+- Captures the webcam as a **PipeWire** client, so the camera can be recorded
+  *while* another app (e.g. a meeting) is using it. The webcam path is
+  display-server-agnostic and works under both Xorg and Wayland.
 - Captures microphone audio (PulseAudio/PipeWire `default`, ALSA fallback) and
   desktop audio (the default sink's monitor), mixed into a single track. Either
   source is best-effort: whatever is available is recorded.
@@ -30,9 +33,11 @@ implement `wlr-screencopy-unstable-v1`.
   - `libswscale`
   - `libswresample`
   - `libavutil`
+- `libpipewire-0.3` (the webcam is captured as a PipeWire client).
 - FFmpeg CLI available as `ffmpeg`.
 - Desktop notifications via `notify-send`.
 - NVIDIA GPU/driver stack with `h264_nvenc` support.
+- A running PipeWire server is needed for the webcam (and for desktop audio).
 
 On Debian/Ubuntu-based systems, the packages are typically:
 
@@ -40,7 +45,7 @@ On Debian/Ubuntu-based systems, the packages are typically:
 sudo apt install build-essential pkg-config ffmpeg \
   libavformat-dev libavcodec-dev libavdevice-dev libswscale-dev \
   libswresample-dev libavutil-dev libwayland-dev wayland-protocols \
-  libnotify-bin
+  libpipewire-0.3-dev libnotify-bin
 ```
 
 The `wlr-screencopy-unstable-v1.xml` protocol is vendored under `protocols/`,
@@ -108,10 +113,9 @@ The recorder can be tuned with environment variables:
 | `SCREENCAST_DRAW_MOUSE` | `1` | Composite the cursor into the recording; set to `0` to hide it. |
 | `SCREENCAST_DESKTOP_AUDIO` | `1` | Mix desktop audio (default sink's monitor) into the track; set to `0` to record microphone only. |
 | `SCREENCAST_DESKTOP_DEV` | `@DEFAULT_MONITOR@` | PulseAudio/PipeWire source for desktop audio. Override with a concrete monitor name from `pactl list sources` (e.g. `alsa_output.<…>.monitor`). |
-| `SCREENCAST_WEBCAM_DEV` | `auto` | Webcam device path, or `auto` to scan `/dev/v4l` and `/dev/video*`. |
-| `SCREENCAST_CAM_FORMAT` | `nv12` | Requested webcam input format. |
-| `SCREENCAST_CAM_FPS` | `30` | Requested webcam frame rate. |
-| `SCREENCAST_CAM_SIZE` | `1920x1080` | Requested webcam capture size. |
+| `SCREENCAST_WEBCAM_DEV` | `auto` | PipeWire camera target (node name or serial), or `auto` for the system default camera. Not a `/dev/video*` path. |
+| `SCREENCAST_CAM_FPS` | `30` | Preferred webcam frame rate (a PipeWire negotiation hint). |
+| `SCREENCAST_CAM_SIZE` | `1280x720` | Preferred webcam capture size (a PipeWire negotiation hint; resolution defers to the shared camera stream when another app is also using the camera). |
 | `SCREENCAST_NVENC_CAPTURE_PRESET` | `p3` | NVENC preset for the real-time intermediate capture. |
 | `SCREENCAST_NVENC_CAPTURE_QP` | `12` | Constant QP for the intermediate capture. |
 | `SCREENCAST_NVENC_FINAL_PRESET` | `p7` | NVENC preset for the final render. |
@@ -129,7 +133,10 @@ SCREENCAST_OUTPUT=DP-1 SCREENCAST_KEEP_CAPTURE=1 screencast display
 ## Notes
 
 Screen capture uses `wlr-screencopy-unstable-v1` with `wl_shm` buffers. The
-webcam (v4l2) and audio (PulseAudio/PipeWire) paths use FFmpeg's libavdevice.
+webcam is captured as a PipeWire client (`libpipewire`), which lets the camera
+be shared with another app that is also on PipeWire — see
+`docs/adr/0002-webcam-capture-via-pipewire.md`. The audio paths use FFmpeg's
+libavdevice.
 
 Microphone and desktop audio are captured as two independent sources, each
 resampled to a canonical 48 kHz stereo format and summed (unity gain, hard

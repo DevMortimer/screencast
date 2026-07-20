@@ -16,7 +16,7 @@ PROTO_OBJ := $(OBJDIR)/wlr-screencopy-unstable-v1-protocol.o
 SCANNER := wayland-scanner
 
 PKG     := libavformat libavcodec libavdevice libswscale libswresample \
-           libavutil wayland-client
+           libavutil wayland-client libpipewire-0.3
 
 CFLAGS  := $(shell pkg-config --cflags $(PKG)) -I$(OBJDIR) -pthread \
            -O2 -Wall -Wextra -std=c11

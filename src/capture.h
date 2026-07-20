@@ -34,10 +34,6 @@ void capture_set_interrupt(CaptureCtx *ctx, CaptureInterruptFn fn,
  */
 int  capture_screen_open(CaptureCtx *ctx, const char *output_name, int fps);
 
-/* Opens v4l2; actual resolution written to *out_w, *out_h. */
-int  capture_webcam_open(CaptureCtx *ctx, const char *device,
-                          int *out_w, int *out_h);
-
 /*
  * Opens the default microphone source (PulseAudio/PipeWire "default", with an
  * ALSA fallback on `device`).

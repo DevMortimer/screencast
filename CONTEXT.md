@@ -6,6 +6,31 @@ capture vocabulary so the code and docs agree.
 
 ## Language
 
+### Video capture
+
+**Display capture**:
+The screen output recorded via the `wlr-screencopy` protocol. This is the only
+capture path bound to Wayland.
+_Avoid_: screen grab, output capture
+
+**Webcam**:
+The user's camera video, captured as a PipeWire client from the camera node.
+Distinct from display capture; overlaid on the display in `both` mode.
+_Avoid_: camera video, cam, facecam
+
+**Camera node**:
+The PipeWire graph node representing the shared camera source that screencast
+captures from. Selected automatically as the system default unless overridden.
+_Avoid_: /dev/video, V4L2 device, camera device file
+
+**Fan-out**:
+PipeWire owning one physical camera and serving its frames to multiple
+simultaneous consumers (e.g. a meeting app and screencast at once). Only works
+when every consumer goes through PipeWire.
+_Avoid_: camera sharing, multiplexing, exclusive access
+
+### Audio
+
 **Source**:
 A capture device that audio is read *from* (a microphone, or the monitor of a
 sink). PulseAudio/PipeWire concept.

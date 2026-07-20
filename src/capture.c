@@ -2,11 +2,9 @@
 #include "wlcap.h"
 #include <libavdevice/avdevice.h>
 #include <libavutil/opt.h>
-#include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 /* ── internal helpers ──────────────────────────────────────── */
 
@@ -113,92 +111,6 @@ static int open_decoder(CaptureCtx *ctx, enum AVMediaType mtype)
     return 0;
 }
 
-static int webcam_try_device(CaptureCtx *ctx, const char *device,
-                              int *out_w, int *out_h)
-{
-    CaptureInterruptFn fn;
-    void *opaque;
-    preserve_interrupt(ctx, &fn, &opaque);
-    memset(ctx, 0, sizeof(*ctx));
-    restore_interrupt(ctx, fn, opaque);
-
-    const char *env_fmt  = getenv("SCREENCAST_CAM_FORMAT");
-    const char *env_fps  = getenv("SCREENCAST_CAM_FPS");
-    const char *env_size = getenv("SCREENCAST_CAM_SIZE");
-    const char *fmt      = (env_fmt  && env_fmt[0])  ? env_fmt  : "nv12";
-    const char *fps      = (env_fps  && env_fps[0])  ? env_fps  : "30";
-    const char *size     = (env_size && env_size[0]) ? env_size : "1920x1080";
-
-    AVDictionary *opts = NULL;
-    av_dict_set(&opts, "input_format", fmt, 0);
-    av_dict_set(&opts, "framerate",    fps, 0);
-    av_dict_set(&opts, "video_size",   size, 0);
-
-    if (open_input(ctx, "video4linux2", device, &opts) < 0) {
-        av_dict_free(&opts);
-        capture_free(ctx);
-
-        fprintf(stderr,
-                "capture: requested webcam mode failed "
-                "(format=%s size=%s fps=%s), falling back\n",
-                fmt, size, fps);
-
-        opts = NULL;
-        av_dict_set(&opts, "input_format", "mjpeg", 0);
-        av_dict_set(&opts, "framerate",    "30",    0);
-        if (!env_size || !env_size[0])
-            av_dict_set(&opts, "video_size", "1920x1080", 0);
-
-        if (open_input(ctx, "video4linux2", device, &opts) < 0) {
-            av_dict_free(&opts);
-            capture_free(ctx);
-
-            opts = NULL;
-            if (open_input(ctx, "video4linux2", device, &opts) < 0) {
-                av_dict_free(&opts);
-                capture_free(ctx);
-                return -1;
-            }
-        }
-    }
-
-    if (open_decoder(ctx, AVMEDIA_TYPE_VIDEO) < 0) {
-        capture_free(ctx);
-        return -1;
-    }
-
-    ctx->width   = ctx->dec_ctx->width;
-    ctx->height  = ctx->dec_ctx->height;
-    ctx->pix_fmt = ctx->dec_ctx->pix_fmt;
-    *out_w = ctx->width;
-    *out_h = ctx->height;
-    fprintf(stderr, "capture: webcam using %s (%dx%d)\n",
-            device, ctx->width, ctx->height);
-    return 0;
-}
-
-static int webcam_try_glob(CaptureCtx *ctx, const char *pattern,
-                            int *out_w, int *out_h)
-{
-    glob_t matches;
-    memset(&matches, 0, sizeof(matches));
-
-    if (glob(pattern, 0, NULL, &matches) != 0) {
-        globfree(&matches);
-        return -1;
-    }
-
-    for (size_t i = 0; i < matches.gl_pathc; i++) {
-        if (webcam_try_device(ctx, matches.gl_pathv[i], out_w, out_h) == 0) {
-            globfree(&matches);
-            return 0;
-        }
-    }
-
-    globfree(&matches);
-    return -1;
-}
-
 /* ── public ────────────────────────────────────────────────── */
 
 void capture_set_interrupt(CaptureCtx *ctx, CaptureInterruptFn fn,
@@ -249,35 +161,6 @@ int capture_screen_open(CaptureCtx *ctx, const char *output_name, int fps)
         ctx->frame->linesize[0] = info.stride;
     }
     return 0;
-}
-
-int capture_webcam_open(CaptureCtx *ctx, const char *device,
-                         int *out_w, int *out_h)
-{
-    avdevice_register_all();
-
-    if (device && device[0] && strcmp(device, "auto") != 0) {
-        return webcam_try_device(ctx, device, out_w, out_h);
-    }
-
-    if (webcam_try_glob(ctx, "/dev/v4l/by-id/*-video-index0",
-                        out_w, out_h) == 0)
-        return 0;
-    if (webcam_try_glob(ctx, "/dev/v4l/by-path/*-video-index0",
-                        out_w, out_h) == 0)
-        return 0;
-
-    for (int i = 0; i < 64; i++) {
-        char path[32];
-        struct stat st;
-        snprintf(path, sizeof(path), "/dev/video%d", i);
-        if (stat(path, &st) < 0 || !S_ISCHR(st.st_mode))
-            continue;
-        if (webcam_try_device(ctx, path, out_w, out_h) == 0)
-            return 0;
-    }
-
-    return -1;
 }
 
 /*
