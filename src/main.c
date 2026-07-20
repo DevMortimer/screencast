@@ -132,6 +132,19 @@ static const char *env_default(const char *name, const char *fallback)
     return (value && value[0]) ? value : fallback;
 }
 
+/* One-line "[REC] <label>: <rate> Hz, <ch>, <fmt>" for an opened audio source;
+ * dev, when non-NULL, is appended in parentheses (the desktop monitor name). */
+static void report_audio_source(const char *label, const CaptureCtx *cap,
+                                const char *dev)
+{
+    printf("[REC] %s: %d Hz, %d channel%s, %s",
+           label, cap->sample_rate, cap->ch_layout.nb_channels,
+           cap->ch_layout.nb_channels == 1 ? "" : "s",
+           av_get_sample_fmt_name(cap->sample_fmt));
+    if (dev) printf(" (%s)", dev);
+    putchar('\n');
+}
+
 static int wait_for_child(pid_t pid, int *status, const char *label)
 {
     for (;;) {
@@ -395,11 +408,7 @@ static int recording_open(void)
     s_rec.has_mic = 0;
     if (capture_audio_open(&s_rec.mic_cap, AUDIO_DEV) == 0) {
         s_rec.has_mic = 1;
-        printf("[REC] Microphone: %d Hz, %d channel%s, %s\n",
-               s_rec.mic_cap.sample_rate,
-               s_rec.mic_cap.ch_layout.nb_channels,
-               s_rec.mic_cap.ch_layout.nb_channels == 1 ? "" : "s",
-               av_get_sample_fmt_name(s_rec.mic_cap.sample_fmt));
+        report_audio_source("Microphone", &s_rec.mic_cap, NULL);
     } else {
         fprintf(stderr, "main: microphone not available\n");
         capture_free(&s_rec.mic_cap);
@@ -408,17 +417,12 @@ static int recording_open(void)
     /* Desktop audio — the default sink's monitor. On by default; best-effort. */
     s_rec.has_desktop = 0;
     const char *desktop_env = getenv("SCREENCAST_DESKTOP_AUDIO");
-    int want_desktop = !(desktop_env && desktop_env[0] == '0');
+    int want_desktop = !(desktop_env && strcmp(desktop_env, "0") == 0);
     if (want_desktop) {
         const char *desktop_dev = env_default("SCREENCAST_DESKTOP_DEV", DESKTOP_DEV);
         if (capture_audio_open_monitor(&s_rec.desk_cap, desktop_dev) == 0) {
             s_rec.has_desktop = 1;
-            printf("[REC] Desktop audio: %d Hz, %d channel%s, %s (%s)\n",
-                   s_rec.desk_cap.sample_rate,
-                   s_rec.desk_cap.ch_layout.nb_channels,
-                   s_rec.desk_cap.ch_layout.nb_channels == 1 ? "" : "s",
-                   av_get_sample_fmt_name(s_rec.desk_cap.sample_fmt),
-                   desktop_dev);
+            report_audio_source("Desktop audio", &s_rec.desk_cap, desktop_dev);
         } else {
             fprintf(stderr, "main: desktop audio not available (%s)\n", desktop_dev);
             capture_free(&s_rec.desk_cap);
@@ -443,13 +447,13 @@ static int recording_open(void)
         }
     }
 
-    if (!s_rec.has_aud)
-        fprintf(stderr, "main: no audio sources — video only\n");
-    else
-        printf("[REC] Audio: %s\n",
-               s_rec.has_mic && s_rec.has_desktop ? "mic + desktop (mixed)"
-               : s_rec.has_mic                    ? "mic only"
-                                                  : "desktop only");
+    const char *audio_sources =
+        !s_rec.has_aud                     ? "none (video only)"
+        : s_rec.has_mic && s_rec.has_desktop ? "mic + desktop (mixed)"
+        : s_rec.has_mic                    ? "mic only"
+                                           : "desktop only";
+    fprintf(stderr, "[REC] Audio: %s\n", audio_sources);
+    control_notify("Screencast audio", audio_sources);
 
     enum AVPixelFormat cam_fmt = s_rec.has_cam
                                  ? s_rec.cam_cap.pix_fmt

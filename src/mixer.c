@@ -45,32 +45,32 @@ static float clampf(float v)
  */
 static void mixer_drain_locked(MixerCtx *m)
 {
-    int k = -1;
+    int n_ready = -1;
     for (int i = 0; i < MIX_SRC_COUNT; i++) {
         if (!m->active[i]) continue;
         int sz = av_audio_fifo_size(m->fifo[i]);
-        if (k < 0 || sz < k) k = sz;
+        if (n_ready < 0 || sz < n_ready) n_ready = sz;
     }
-    if (k <= 0) return;
-    if (k > m->fifo_cap) k = m->fifo_cap;
+    if (n_ready <= 0) return;
+    if (n_ready > m->fifo_cap) n_ready = m->fifo_cap;
 
     float *acc0 = (float *)m->mixed->data[0];
     float *acc1 = (float *)m->mixed->data[1];
-    memset(acc0, 0, (size_t)k * sizeof(float));
-    memset(acc1, 0, (size_t)k * sizeof(float));
+    memset(acc0, 0, (size_t)n_ready * sizeof(float));
+    memset(acc1, 0, (size_t)n_ready * sizeof(float));
 
     for (int i = 0; i < MIX_SRC_COUNT; i++) {
         if (!m->active[i]) continue;
         void *dst[MIX_CHANNELS] = { m->scratch[0], m->scratch[1] };
-        if (av_audio_fifo_read(m->fifo[i], dst, k) < k) continue;
+        if (av_audio_fifo_read(m->fifo[i], dst, n_ready) < n_ready) continue;
         const float *s0 = m->scratch[0];
         const float *s1 = m->scratch[1];
-        for (int n = 0; n < k; n++) { acc0[n] += s0[n]; acc1[n] += s1[n]; }
+        for (int n = 0; n < n_ready; n++) { acc0[n] += s0[n]; acc1[n] += s1[n]; }
     }
 
-    for (int n = 0; n < k; n++) { acc0[n] = clampf(acc0[n]); acc1[n] = clampf(acc1[n]); }
+    for (int n = 0; n < n_ready; n++) { acc0[n] = clampf(acc0[n]); acc1[n] = clampf(acc1[n]); }
 
-    m->mixed->nb_samples  = k;
+    m->mixed->nb_samples  = n_ready;
     m->mixed->sample_rate = MIX_SAMPLE_RATE;
     if (m->sink) m->sink(m->user, m->mixed);
 }
@@ -122,7 +122,7 @@ int mixer_feed(MixerCtx *m, MixSource src, AVFrame *raw,
         return 0;
 
     /* Pulse/ALSA frames often carry AV_CHANNEL_ORDER_UNSPEC — stamp a native
-     * layout with the captured channel count so swr accepts them (as encoder). */
+     * layout with the captured channel count so swr accepts them. */
     int in_ch = (in_layout && in_layout->nb_channels > 0)
                 ? in_layout->nb_channels
                 : raw->ch_layout.nb_channels;
