@@ -16,11 +16,14 @@
 #include <libavutil/pixdesc.h>
 
 /*
- * The raw pixel formats we accept from PipeWire.  Webcams commonly expose
- * planar YUV (NV12/I420) rather than packed RGB, so both are offered; the
- * frame copy below is plane-aware.  Whatever the camera picks, the existing
- * encoder swscale stage converts it into the overlay.  (Encoded formats like
- * MJPEG are not offered — we only take raw video.)
+ * The raw pixel formats we accept from PipeWire.  We offer the two planar YUV
+ * layouts cameras prefer (NV12/I420) plus the packed formats USB webcams
+ * commonly emit natively — YUY2/UYVY above all, and the RGB/BGR variants — so
+ * negotiation succeeds on whatever the sensor actually produces rather than
+ * forcing an upstream conversion.  The frame copy below is plane-aware, and
+ * whatever the camera picks, the existing encoder swscale stage converts it
+ * into the overlay.  (Encoded formats like MJPEG are not offered — we only
+ * take raw video.)
  */
 static enum AVPixelFormat spa_to_av(uint32_t spa_fmt)
 {
@@ -168,10 +171,22 @@ static void on_process(void *data)
                           : av_image_get_linesize(pw->av_fmt, pw->width, i);
         }
     } else {
-        /* One block: derive plane offsets/strides from the geometry. */
+        /* One block: lay the planes out from the geometry, but honor the
+         * negotiated row stride, which may pad each row beyond width*bpp.
+         * av_image_fill_arrays derives strides from width alone and would
+         * shear a padded frame, so scale the plane linesizes up by the
+         * padding ratio before filling the pointers. */
         uint8_t *base = (uint8_t *)d0->data + d0->chunk->offset;
-        av_image_fill_arrays(src_data, src_ls, base, pw->av_fmt,
-                             pw->width, pw->height, 1);
+        if (av_image_fill_linesizes(src_ls, pw->av_fmt, pw->width) >= 0) {
+            int natural = src_ls[0];
+            int negotiated = d0->chunk->stride;
+            if (natural > 0 && negotiated > natural) {
+                for (int i = 0; i < n_planes; i++)
+                    src_ls[i] = (int)((int64_t)src_ls[i] * negotiated / natural);
+            }
+            av_image_fill_pointers(src_data, pw->av_fmt, pw->height,
+                                   base, src_ls);
+        }
     }
 
     av_image_copy(f->data, f->linesize,
@@ -244,10 +259,12 @@ PwCam *pwcam_open(const char *target, int want_w, int want_h, int want_fps,
             &SPA_RECTANGLE((uint32_t)w, (uint32_t)h),
             &SPA_RECTANGLE(1, 1),
             &SPA_RECTANGLE(4096, 4096)),
-        SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
-            &SPA_FRACTION((uint32_t)fps, 1),
-            &SPA_FRACTION(1, 1),
-            &SPA_FRACTION(1000, 1)));
+        /* Pin the framerate: PipeWire rate-adapts the shared sensor stream
+         * per-client, so this is honored independently of what another
+         * consumer negotiated.  (Resolution, by contrast, is offered as a
+         * range above and defers to the shared stream.) */
+        SPA_FORMAT_VIDEO_framerate,
+            SPA_POD_Fraction(&SPA_FRACTION((uint32_t)fps, 1)));
 
     if (pw_thread_loop_start(pw->loop) < 0) { pwcam_close(pw); return NULL; }
 

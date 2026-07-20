@@ -33,9 +33,13 @@ V4L2 webcam path is **removed entirely** — this is PipeWire-only, no fallback.
   target (node name/serial via `PW_KEY_TARGET_OBJECT`), not a device path.
 - Pixel format is negotiated by PipeWire and mapped to an `AVPixelFormat`; the
   existing `composite`/encoder swscale path is unchanged. `SCREENCAST_CAM_FORMAT`
-  is dropped. `SCREENCAST_CAM_SIZE`/`SCREENCAST_CAM_FPS` survive as negotiation
-  *hints*: fps is honored per-client; resolution defers to the shared sensor
-  stream and the actually-negotiated size is read back and scaled locally.
+  is dropped. We offer the raw layouts a webcam is likely to produce — planar
+  NV12/I420 plus the packed formats USB cameras commonly emit natively (YUY2,
+  UYVY, and RGB/BGR variants) — so negotiation matches the sensor without
+  forcing an upstream conversion. `SCREENCAST_CAM_SIZE`/`SCREENCAST_CAM_FPS`
+  survive as negotiation *hints*: fps is honored per-client; resolution defers
+  to the shared sensor stream and the actually-negotiated size is read back and
+  scaled locally.
 - The webcam remains **best-effort**: if PipeWire or a camera node is absent,
   recording continues as display+audio only, exactly as before.
 
