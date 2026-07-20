@@ -185,6 +185,22 @@ int mixer_feed(MixerCtx *m, MixSource src, AVFrame *raw,
     return 0;
 }
 
+void mixer_drop_source(MixerCtx *m, MixSource src)
+{
+    if (!m || src < 0 || src >= MIX_SRC_COUNT) return;
+
+    pthread_mutex_lock(&m->lock);
+    if (m->active[src]) {
+        m->active[src] = 0;
+        /* Discard the dead source's leftover samples so they can't be mixed,
+         * then flush what the remaining sources were holding back in lockstep. */
+        if (m->fifo[src])
+            av_audio_fifo_drain(m->fifo[src], av_audio_fifo_size(m->fifo[src]));
+        mixer_drain_locked(m);
+    }
+    pthread_mutex_unlock(&m->lock);
+}
+
 void mixer_destroy(MixerCtx *m)
 {
     if (!m) return;

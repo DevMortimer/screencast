@@ -48,6 +48,7 @@ typedef struct {
     uint8_t *cam_overlay;  /* overlay_size² * 4 */
     int cam_src_w, cam_src_h, cam_crop_size;
     int cam_main_x, cam_main_y, cam_main_w, cam_main_h;
+    enum AVPixelFormat cam_pix_fmt; /* format the cam sws chain was built for */
 
     /* ── Thread safety ────────────────────────────── */
     pthread_mutex_t write_mutex;
@@ -58,17 +59,37 @@ typedef struct {
 } EncoderCtx;
 
 /*
- * Open the output MP4 at `path`.  cam_src_w/h == 0 means no webcam.
- * audio_ch_layout is the layout reported by the ALSA capture context.
+ * Open the output MP4 at `path`.  The output stream set is fixed for the whole
+ * recording: the canvas video stream plus, when audio_sample_rate > 0, one
+ * audio stream.  The webcam is *not* a stream — it is composited onto the
+ * canvas — so it is engaged and released dynamically via encoder_set_webcam()
+ * / encoder_clear_webcam() rather than being wired up here.
+ * audio_ch_layout is the layout reported by the capture context.
  */
 int  encoder_open(EncoderCtx *enc, const char *path,
                   int canvas_w, int canvas_h, int fps,
                   enum AVPixelFormat screen_pix_fmt,
-                  int cam_src_w, int cam_src_h,
-                  enum AVPixelFormat cam_pix_fmt,
                   int audio_sample_rate,
                   const AVChannelLayout *audio_ch_layout,
                   enum AVSampleFormat audio_sample_fmt);
+
+/*
+ * Engage the webcam compositing path for a camera stream of the given geometry
+ * and pixel format, (re)building the cam scaling chain lazily.  Idempotent: a
+ * repeat call with unchanged geometry/format is a no-op, so the record loop can
+ * call it every frame while the webcam is active.  A call with different
+ * geometry rebuilds the chain (a re-acquired camera may negotiate a new size).
+ * Returns 0 on success, negative on failure (compositing stays off).
+ */
+int  encoder_set_webcam(EncoderCtx *enc, int cam_src_w, int cam_src_h,
+                        enum AVPixelFormat cam_pix_fmt);
+
+/*
+ * Tear down the webcam compositing path.  After this, encoder_write_video
+ * composites the display/canvas only, until encoder_set_webcam() re-engages.
+ * Safe to call when no webcam is engaged.
+ */
+void encoder_clear_webcam(EncoderCtx *enc);
 
 /*
  * Composite + encode one video frame.

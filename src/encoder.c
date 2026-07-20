@@ -175,19 +175,14 @@ static int setup_audio(EncoderCtx *enc, int sample_rate,
 
 /* ── SwsContext setup ─────────────────────────────────────── */
 
-static int setup_sws(EncoderCtx *enc,
-                      enum AVPixelFormat screen_fmt,
-                      int cam_w, int cam_h,
-                      enum AVPixelFormat cam_fmt)
+/* Build the canvas scaling chain (screen → RGBA, RGBA → YUV420P).  The webcam
+ * chain is built separately and lazily by encoder_set_webcam(). */
+static int setup_sws(EncoderCtx *enc, enum AVPixelFormat screen_fmt)
 {
     int cw = enc->canvas_w, ch = enc->canvas_h;
     int screen_flags = SWS_BILINEAR | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
     int yuv_flags = SWS_BICUBIC | SWS_ACCURATE_RND |
                     SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
-    int cam_full_flags = SWS_LANCZOS | SWS_ACCURATE_RND |
-                         SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
-    int cam_overlay_flags = SWS_BICUBIC | SWS_ACCURATE_RND |
-                            SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
 
     enc->sws_screen = sws_getContext(
         cw, ch, screen_fmt,
@@ -203,30 +198,94 @@ static int setup_sws(EncoderCtx *enc,
         fprintf(stderr, "encoder: sws_getContext failed\n");
         return -1;
     }
+    return 0;
+}
 
-    if (cam_w > 0 && cam_h > 0) {
-        enc->sws_cam_raw = sws_getContext(
-            cam_w, cam_h, cam_fmt,
-            cam_w, cam_h, AV_PIX_FMT_RGBA,
-            screen_flags, NULL, NULL, NULL);
+/* ── dynamic webcam compositing chain ─────────────────────── */
 
-        enc->sws_cam_main = sws_getContext(
-            enc->cam_main_w, enc->cam_main_h, AV_PIX_FMT_RGBA,
-            cw, ch, AV_PIX_FMT_RGBA,
-            cam_full_flags, NULL, NULL, NULL);
+/* Drop the webcam scaling chain, leaving the overlay buffer/mask (which depend
+ * only on the canvas) intact for a later re-engage. */
+static void free_cam_sws(EncoderCtx *enc)
+{
+    sws_freeContext(enc->sws_cam_raw);   enc->sws_cam_raw   = NULL;
+    sws_freeContext(enc->sws_cam_main);  enc->sws_cam_main  = NULL;
+    sws_freeContext(enc->sws_cam_scale); enc->sws_cam_scale = NULL;
+    free(enc->cam_rgba);                 enc->cam_rgba      = NULL;
+    enc->cam_src_w = enc->cam_src_h = 0;
+    enc->cam_crop_size   = 0;
+    enc->cam_pix_fmt     = AV_PIX_FMT_NONE;
+    enc->cam_overlay_seq = -1;
+}
 
-        int cs = enc->cam_crop_size;
-        enc->sws_cam_scale = sws_getContext(
-            cs, cs, AV_PIX_FMT_RGBA,
-            enc->overlay_size, enc->overlay_size, AV_PIX_FMT_RGBA,
-            cam_overlay_flags, NULL, NULL, NULL);
+int encoder_set_webcam(EncoderCtx *enc, int cam_src_w, int cam_src_h,
+                       enum AVPixelFormat cam_pix_fmt)
+{
+    if (cam_src_w <= 0 || cam_src_h <= 0) return -1;
 
-        if (!enc->sws_cam_raw || !enc->sws_cam_main || !enc->sws_cam_scale) {
-            fprintf(stderr, "encoder: sws_getContext (cam) failed\n");
-            return -1;
-        }
+    /* Idempotent for an unchanged camera: keep the existing chain so the record
+     * loop can call this every frame while the webcam is active. */
+    if (enc->sws_cam_raw &&
+        enc->cam_src_w == cam_src_w && enc->cam_src_h == cam_src_h &&
+        enc->cam_pix_fmt == cam_pix_fmt)
+        return 0;
+
+    free_cam_sws(enc);   /* a re-acquired camera may negotiate a new geometry */
+
+    int cw = enc->canvas_w, ch = enc->canvas_h;
+    enc->cam_src_w     = cam_src_w;
+    enc->cam_src_h     = cam_src_h;
+    enc->cam_pix_fmt   = cam_pix_fmt;
+    /* Largest centre-crop square that fits inside the webcam frame */
+    enc->cam_crop_size = (cam_src_w < cam_src_h) ? cam_src_w : cam_src_h;
+
+    if ((int64_t)cam_src_w * ch > (int64_t)cw * cam_src_h) {
+        enc->cam_main_h = cam_src_h;
+        enc->cam_main_w = (int)(((int64_t)cam_src_h * cw) / ch);
+    } else {
+        enc->cam_main_w = cam_src_w;
+        enc->cam_main_h = (int)(((int64_t)cam_src_w * ch) / cw);
+    }
+    if (enc->cam_main_w < 1) enc->cam_main_w = 1;
+    if (enc->cam_main_h < 1) enc->cam_main_h = 1;
+    enc->cam_main_x = (cam_src_w - enc->cam_main_w) / 2;
+    enc->cam_main_y = (cam_src_h - enc->cam_main_h) / 2;
+
+    int screen_flags = SWS_BILINEAR | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
+    int cam_full_flags = SWS_LANCZOS | SWS_ACCURATE_RND |
+                         SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
+    int cam_overlay_flags = SWS_BICUBIC | SWS_ACCURATE_RND |
+                            SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
+
+    enc->sws_cam_raw = sws_getContext(
+        cam_src_w, cam_src_h, cam_pix_fmt,
+        cam_src_w, cam_src_h, AV_PIX_FMT_RGBA,
+        screen_flags, NULL, NULL, NULL);
+
+    enc->sws_cam_main = sws_getContext(
+        enc->cam_main_w, enc->cam_main_h, AV_PIX_FMT_RGBA,
+        cw, ch, AV_PIX_FMT_RGBA,
+        cam_full_flags, NULL, NULL, NULL);
+
+    int cs = enc->cam_crop_size;
+    enc->sws_cam_scale = sws_getContext(
+        cs, cs, AV_PIX_FMT_RGBA,
+        enc->overlay_size, enc->overlay_size, AV_PIX_FMT_RGBA,
+        cam_overlay_flags, NULL, NULL, NULL);
+
+    enc->cam_rgba = malloc((size_t)cam_src_w * cam_src_h * 4);
+
+    if (!enc->sws_cam_raw || !enc->sws_cam_main || !enc->sws_cam_scale ||
+        !enc->cam_rgba) {
+        fprintf(stderr, "encoder: webcam sws setup failed\n");
+        free_cam_sws(enc);
+        return -1;
     }
     return 0;
+}
+
+void encoder_clear_webcam(EncoderCtx *enc)
+{
+    free_cam_sws(enc);
 }
 
 /* ── public: encoder_open ─────────────────────────────────── */
@@ -234,8 +293,6 @@ static int setup_sws(EncoderCtx *enc,
 int encoder_open(EncoderCtx *enc, const char *path,
                   int canvas_w, int canvas_h, int fps,
                   enum AVPixelFormat screen_pix_fmt,
-                  int cam_src_w, int cam_src_h,
-                  enum AVPixelFormat cam_pix_fmt,
                   int audio_sample_rate,
                   const AVChannelLayout *audio_ch_layout,
                   enum AVSampleFormat audio_sample_fmt)
@@ -250,24 +307,7 @@ int encoder_open(EncoderCtx *enc, const char *path,
     enc->overlay_x = canvas_w  - enc->overlay_size - 20;
     enc->overlay_y = canvas_h - enc->overlay_size - 20;
     enc->cam_overlay_seq = -1;
-
-    enc->cam_src_w     = cam_src_w;
-    enc->cam_src_h     = cam_src_h;
-    /* Largest centre-crop square that fits inside the webcam frame */
-    enc->cam_crop_size = (cam_src_w < cam_src_h) ? cam_src_w : cam_src_h;
-    if (cam_src_w > 0 && cam_src_h > 0) {
-        if ((int64_t)cam_src_w * canvas_h > (int64_t)canvas_w * cam_src_h) {
-            enc->cam_main_h = cam_src_h;
-            enc->cam_main_w = (int)(((int64_t)cam_src_h * canvas_w) / canvas_h);
-        } else {
-            enc->cam_main_w = cam_src_w;
-            enc->cam_main_h = (int)(((int64_t)cam_src_w * canvas_h) / canvas_w);
-        }
-        if (enc->cam_main_w < 1) enc->cam_main_w = 1;
-        if (enc->cam_main_h < 1) enc->cam_main_h = 1;
-        enc->cam_main_x = (cam_src_w - enc->cam_main_w) / 2;
-        enc->cam_main_y = (cam_src_h - enc->cam_main_h) / 2;
-    }
+    enc->cam_pix_fmt = AV_PIX_FMT_NONE; /* no webcam engaged yet */
 
     int ret = avformat_alloc_output_context2(&enc->fmt_ctx, NULL, NULL, path);
     if (ret < 0) { log_err("avformat_alloc_output_context2", ret); return ret; }
@@ -277,8 +317,7 @@ int encoder_open(EncoderCtx *enc, const char *path,
         if ((ret = setup_audio(enc, audio_sample_rate, audio_ch_layout, audio_sample_fmt)) < 0) return ret;
         av_channel_layout_copy(&enc->aud_in_layout, audio_ch_layout);
     }
-    if ((ret = setup_sws(enc, screen_pix_fmt,
-                          cam_src_w, cam_src_h, cam_pix_fmt)) < 0) return ret;
+    if ((ret = setup_sws(enc, screen_pix_fmt)) < 0) return ret;
 
     if (!(enc->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open(&enc->fmt_ctx->pb, path, AVIO_FLAG_WRITE);
@@ -293,19 +332,20 @@ int encoder_open(EncoderCtx *enc, const char *path,
     enc->canvas_rgba = malloc((size_t)canvas_w * canvas_h * 4);
     if (!enc->canvas_rgba) return AVERROR(ENOMEM);
 
-    if (cam_src_w > 0) {
-        enc->cam_rgba    = malloc((size_t)cam_src_w * cam_src_h * 4);
-        enc->cam_overlay = malloc((size_t)enc->overlay_size * enc->overlay_size * 4);
-        enc->corner_mask = malloc(sizeof(float) *
-                                   (size_t)enc->overlay_size * enc->overlay_size);
-        if (!enc->cam_rgba || !enc->cam_overlay || !enc->corner_mask)
-            return AVERROR(ENOMEM);
+    /* The overlay buffer and rounded-corner mask depend only on the canvas, so
+     * build them up front; they are reused whenever the webcam engages.  The
+     * cam_rgba scratch depends on the camera geometry and is allocated lazily
+     * by encoder_set_webcam(). */
+    enc->cam_overlay = malloc((size_t)enc->overlay_size * enc->overlay_size * 4);
+    enc->corner_mask = malloc(sizeof(float) *
+                               (size_t)enc->overlay_size * enc->overlay_size);
+    if (!enc->cam_overlay || !enc->corner_mask)
+        return AVERROR(ENOMEM);
 
-        /* Pre-build the rounded-corner mask (radius = 1/8 of overlay size) */
-        composite_build_mask(enc->corner_mask,
-                             enc->overlay_size, enc->overlay_size,
-                             enc->overlay_size / 8);
-    }
+    /* Pre-build the rounded-corner mask (radius = 1/8 of overlay size) */
+    composite_build_mask(enc->corner_mask,
+                         enc->overlay_size, enc->overlay_size,
+                         enc->overlay_size / 8);
 
     pthread_mutex_init(&enc->write_mutex, NULL);
     enc->t0 = av_gettime_relative();

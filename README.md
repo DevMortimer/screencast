@@ -11,12 +11,18 @@ implement `wlr-screencopy-unstable-v1`.
 
 - Records a Wayland output via `wlr-screencopy` (shm buffers).
 - Supports display-only, webcam-only, and display-plus-webcam modes.
-- Captures the webcam as a **PipeWire** client, so the camera can be recorded
-  *while* another app (e.g. a meeting) is using it. The webcam path is
+- Captures the webcam as a **PipeWire** client. The webcam path is
   display-server-agnostic and works under both Xorg and Wayland.
+- **Cooperative camera capture.** `display` recording never touches the webcam
+  or the camera node, so it can never disrupt a meeting that is using the
+  camera. `webcam`/`both` engage the webcam only when the camera node is free;
+  if another app already holds it, screencast declines gracefully — it keeps
+  recording the display and notifies you — and engages the webcam automatically
+  once the camera frees. Switching back to `display` hands the camera back.
 - Captures microphone audio (PulseAudio/PipeWire `default`, ALSA fallback) and
-  desktop audio (the default sink's monitor), mixed into a single track. Either
-  source is best-effort: whatever is available is recorded.
+  desktop audio (the default sink's monitor), mixed into a single track. Every
+  source is best-effort: whatever is available is recorded, and a source that
+  goes away mid-recording is dropped cleanly so the recording continues.
 - Burns a small red recording indicator into the top-right of the video.
 - Writes a high-quality intermediate MP4 and transcodes it to a final
   `h264_nvenc` MP4.
@@ -133,9 +139,12 @@ SCREENCAST_OUTPUT=DP-1 SCREENCAST_KEEP_CAPTURE=1 screencast display
 ## Notes
 
 Screen capture uses `wlr-screencopy-unstable-v1` with `wl_shm` buffers. The
-webcam is captured as a PipeWire client (`libpipewire`), which lets the camera
-be shared with another app that is also on PipeWire — see
-`docs/adr/0002-webcam-capture-via-pipewire.md`. The audio paths use FFmpeg's
+webcam is captured as a PipeWire client (`libpipewire`) — see
+`docs/adr/0002-webcam-capture-via-pipewire.md`. Because true fan-out (one camera
+serving several consumers) is not available on all hardware, screencast is a
+*cooperative* consumer of the camera node rather than a grabber: it acquires the
+node only for `webcam`/`both`, declines instead of fighting when the node is
+busy, and releases it when it returns to `display`. The audio paths use FFmpeg's
 libavdevice.
 
 Microphone and desktop audio are captured as two independent sources, each

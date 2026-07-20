@@ -46,4 +46,11 @@ int  mixer_feed(MixerCtx *m, MixSource src, AVFrame *raw,
                 int in_sample_rate, const AVChannelLayout *in_layout,
                 enum AVSampleFormat in_fmt);
 
+/*
+ * Drop `src` from the mix (e.g. its capture device died mid-recording).  The
+ * source stops counting toward the min()-lockstep, so the mixed track keeps
+ * flowing over whatever sources remain.  Idempotent and thread-safe.
+ */
+void mixer_drop_source(MixerCtx *m, MixSource src);
+
 void mixer_destroy(MixerCtx *m);

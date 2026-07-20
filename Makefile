@@ -47,6 +47,18 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf $(OBJDIR) $(TARGET)
+	rm -rf $(OBJDIR) $(TARGET) $(TEST_BIN)
 
-.PHONY: all clean
+# ── tests ───────────────────────────────────────────────────
+# The capture arbiter is a pure, I/O-free unit — the one testing seam.  Build a
+# standalone test binary (no framework, plain-C asserts) and run it.  It links
+# only src/arbiter.c, so it needs no camera, PipeWire, or libav.
+TEST_BIN  := $(OBJDIR)/test_arbiter
+TEST_SRCS := tests/test_arbiter.c src/arbiter.c
+
+test: | $(OBJDIR)
+	$(CC) -Isrc -pthread -O2 -Wall -Wextra -std=c11 \
+	    -o $(TEST_BIN) $(TEST_SRCS)
+	$(TEST_BIN)
+
+.PHONY: all clean test
