@@ -280,6 +280,27 @@ int capture_webcam_open(CaptureCtx *ctx, const char *device,
     return -1;
 }
 
+/*
+ * Open a named PulseAudio/PipeWire source (e.g. "default" for the mic, or
+ * "@DEFAULT_MONITOR@" for desktop audio) and its decoder.  Stamps the decoded
+ * audio properties into ctx on success.  Leaves cleanup to the caller.
+ */
+static int open_audio_pulse(CaptureCtx *ctx, const char *source)
+{
+    AVDictionary *opts = NULL;
+    if (open_input(ctx, "pulse", source, &opts) != 0) {
+        av_dict_free(&opts);
+        return -1;
+    }
+    if (open_decoder(ctx, AVMEDIA_TYPE_AUDIO) != 0)
+        return -1;
+
+    ctx->sample_rate = ctx->dec_ctx->sample_rate;
+    ctx->sample_fmt  = ctx->dec_ctx->sample_fmt;
+    av_channel_layout_copy(&ctx->ch_layout, &ctx->dec_ctx->ch_layout);
+    return 0;
+}
+
 int capture_audio_open(CaptureCtx *ctx, const char *device)
 {
     avdevice_register_all();
@@ -290,28 +311,42 @@ int capture_audio_open(CaptureCtx *ctx, const char *device)
     restore_interrupt(ctx, fn, opaque);
 
     /* Try PulseAudio/PipeWire first — honours the user's default source (mic). */
+    if (open_audio_pulse(ctx, "default") == 0)
+        return 0;
+
+    /* ALSA fallback (no monitor/desktop-audio concept on this path). */
+    capture_free(ctx);
     AVDictionary *opts = NULL;
-    int ok = (open_input(ctx, "pulse", "default", &opts) == 0 &&
-              open_decoder(ctx, AVMEDIA_TYPE_AUDIO) == 0);
-
-    if (!ok) {
+    av_dict_set(&opts, "sample_rate", "44100", 0);
+    av_dict_set(&opts, "channels",    "2",     0);
+    if (open_input(ctx, "alsa", device, &opts) < 0) {
         av_dict_free(&opts);
-        capture_free(ctx);
-
-        opts = NULL;
-        av_dict_set(&opts, "sample_rate", "44100", 0);
-        av_dict_set(&opts, "channels",    "2",     0);
-        if (open_input(ctx, "alsa", device, &opts) < 0) {
-            av_dict_free(&opts);
-            return -1;
-        }
-        if (open_decoder(ctx, AVMEDIA_TYPE_AUDIO) < 0) return -1;
+        return -1;
     }
+    if (open_decoder(ctx, AVMEDIA_TYPE_AUDIO) < 0) return -1;
 
     ctx->sample_rate = ctx->dec_ctx->sample_rate;
     ctx->sample_fmt  = ctx->dec_ctx->sample_fmt;
     av_channel_layout_copy(&ctx->ch_layout, &ctx->dec_ctx->ch_layout);
     return 0;
+}
+
+int capture_audio_open_monitor(CaptureCtx *ctx, const char *source)
+{
+    avdevice_register_all();
+    CaptureInterruptFn fn;
+    void *opaque;
+    preserve_interrupt(ctx, &fn, &opaque);
+    memset(ctx, 0, sizeof(*ctx));
+    restore_interrupt(ctx, fn, opaque);
+
+    /* Desktop audio is only available via PulseAudio/PipeWire monitor sources.
+     * No ALSA fallback: pure ALSA has no monitor concept. */
+    if (open_audio_pulse(ctx, source) == 0)
+        return 0;
+
+    capture_free(ctx);
+    return -1;
 }
 
 int capture_read(CaptureCtx *ctx)

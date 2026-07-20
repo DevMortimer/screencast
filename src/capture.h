@@ -38,8 +38,17 @@ int  capture_screen_open(CaptureCtx *ctx, const char *output_name, int fps);
 int  capture_webcam_open(CaptureCtx *ctx, const char *device,
                           int *out_w, int *out_h);
 
-/* Opens ALSA audio device. */
+/*
+ * Opens the default microphone source (PulseAudio/PipeWire "default", with an
+ * ALSA fallback on `device`).
+ */
 int  capture_audio_open(CaptureCtx *ctx, const char *device);
+
+/*
+ * Opens a named PulseAudio/PipeWire source for desktop audio, e.g.
+ * "@DEFAULT_MONITOR@" (the default sink's monitor).  PulseAudio/PipeWire only.
+ */
+int  capture_audio_open_monitor(CaptureCtx *ctx, const char *source);
 
 /* Read + decode one frame into ctx->frame. Returns 0 on success. */
 int  capture_read(CaptureCtx *ctx);

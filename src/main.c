@@ -18,12 +18,15 @@
 #include "capture.h"
 #include "encoder.h"
 #include "composite.h"
+#include "mixer.h"
 
 /* ── configuration ─────────────────────────────────────────── */
 
 #define FPS         30
 #define WEBCAM_DEV  "auto"
 #define AUDIO_DEV   "default"
+/* Default sink's monitor — desktop audio, resolved server-side by Pulse/PipeWire. */
+#define DESKTOP_DEV "@DEFAULT_MONITOR@"
 
 /*
  * Which output to capture.  SCREENCAST_OUTPUT wins; otherwise ask niri for the
@@ -87,12 +90,16 @@ static int recording_interrupted(void *opaque)
 typedef struct {
     CaptureCtx screen_cap;
     CaptureCtx cam_cap;
-    CaptureCtx aud_cap;
+    CaptureCtx mic_cap;    /* microphone (default source) */
+    CaptureCtx desk_cap;   /* desktop audio (default sink's monitor) */
     EncoderCtx enc;
+    MixerCtx  *mixer;      /* mixes mic + desktop into one track */
     int canvas_w, canvas_h; /* captured output size */
     int cam_w, cam_h;
     int has_cam;
-    int has_aud;
+    int has_mic;
+    int has_desktop;
+    int has_aud;           /* has_mic || has_desktop */
     char capture_path[512];
     char final_path[512];
 } RecCtx;
@@ -325,16 +332,23 @@ static void *webcam_thread(void *arg)
     return NULL;
 }
 
-/* ── audio thread ──────────────────────────────────────────── */
+/* ── audio threads ─────────────────────────────────────────── */
 
-typedef struct { CaptureCtx *cap; EncoderCtx *enc; } AudioArg;
+/* Mixed audio is delivered here and handed to the encoder's audio path. */
+static void mixer_sink_encode(void *user, AVFrame *mixed)
+{
+    encoder_feed_audio((EncoderCtx *)user, mixed);
+}
+
+typedef struct { CaptureCtx *cap; MixerCtx *mixer; MixSource src; } AudioArg;
 
 static void *audio_thread(void *arg)
 {
     AudioArg *a = (AudioArg *)arg;
     while (atomic_load(&g_running) && atomic_load(&s_rec_open)) {
         if (capture_read(a->cap) < 0) continue;
-        encoder_feed_audio(a->enc, a->cap->frame);
+        mixer_feed(a->mixer, a->src, a->cap->frame,
+                   a->cap->sample_rate, &a->cap->ch_layout, a->cap->sample_fmt);
     }
     return NULL;
 }
@@ -351,7 +365,8 @@ static int recording_open(void)
 
     capture_set_interrupt(&s_rec.screen_cap, recording_interrupted, NULL);
     capture_set_interrupt(&s_rec.cam_cap, recording_interrupted, NULL);
-    capture_set_interrupt(&s_rec.aud_cap, recording_interrupted, NULL);
+    capture_set_interrupt(&s_rec.mic_cap, recording_interrupted, NULL);
+    capture_set_interrupt(&s_rec.desk_cap, recording_interrupted, NULL);
 
     if (capture_screen_open(&s_rec.screen_cap, screen_output(), FPS) < 0) {
         fprintf(stderr, "main: screen capture failed\n");
@@ -376,35 +391,96 @@ static int recording_open(void)
         capture_free(&s_rec.cam_cap);
     }
 
-    s_rec.has_aud = 0;
-    if (capture_audio_open(&s_rec.aud_cap, AUDIO_DEV) == 0) {
-        s_rec.has_aud = 1;
-        printf("[REC] Audio source: %d Hz, %d channel%s, %s\n",
-               s_rec.aud_cap.sample_rate,
-               s_rec.aud_cap.ch_layout.nb_channels,
-               s_rec.aud_cap.ch_layout.nb_channels == 1 ? "" : "s",
-               av_get_sample_fmt_name(s_rec.aud_cap.sample_fmt));
+    /* Microphone — the default source. Best-effort. */
+    s_rec.has_mic = 0;
+    if (capture_audio_open(&s_rec.mic_cap, AUDIO_DEV) == 0) {
+        s_rec.has_mic = 1;
+        printf("[REC] Microphone: %d Hz, %d channel%s, %s\n",
+               s_rec.mic_cap.sample_rate,
+               s_rec.mic_cap.ch_layout.nb_channels,
+               s_rec.mic_cap.ch_layout.nb_channels == 1 ? "" : "s",
+               av_get_sample_fmt_name(s_rec.mic_cap.sample_fmt));
     } else {
-        fprintf(stderr, "main: audio not available — video only\n");
-        capture_free(&s_rec.aud_cap);
+        fprintf(stderr, "main: microphone not available\n");
+        capture_free(&s_rec.mic_cap);
     }
+
+    /* Desktop audio — the default sink's monitor. On by default; best-effort. */
+    s_rec.has_desktop = 0;
+    const char *desktop_env = getenv("SCREENCAST_DESKTOP_AUDIO");
+    int want_desktop = !(desktop_env && desktop_env[0] == '0');
+    if (want_desktop) {
+        const char *desktop_dev = env_default("SCREENCAST_DESKTOP_DEV", DESKTOP_DEV);
+        if (capture_audio_open_monitor(&s_rec.desk_cap, desktop_dev) == 0) {
+            s_rec.has_desktop = 1;
+            printf("[REC] Desktop audio: %d Hz, %d channel%s, %s (%s)\n",
+                   s_rec.desk_cap.sample_rate,
+                   s_rec.desk_cap.ch_layout.nb_channels,
+                   s_rec.desk_cap.ch_layout.nb_channels == 1 ? "" : "s",
+                   av_get_sample_fmt_name(s_rec.desk_cap.sample_fmt),
+                   desktop_dev);
+        } else {
+            fprintf(stderr, "main: desktop audio not available (%s)\n", desktop_dev);
+            capture_free(&s_rec.desk_cap);
+        }
+    }
+
+    s_rec.has_aud = s_rec.has_mic || s_rec.has_desktop;
+
+    /* Build the mixer over whichever sources opened. */
+    s_rec.mixer = NULL;
+    if (s_rec.has_aud) {
+        int active[MIX_SRC_COUNT] = {
+            [MIX_SRC_MIC]     = s_rec.has_mic,
+            [MIX_SRC_DESKTOP] = s_rec.has_desktop,
+        };
+        s_rec.mixer = mixer_create(active, mixer_sink_encode, &s_rec.enc);
+        if (!s_rec.mixer) {
+            fprintf(stderr, "main: mixer init failed — recording video only\n");
+            if (s_rec.has_mic)     capture_free(&s_rec.mic_cap);
+            if (s_rec.has_desktop) capture_free(&s_rec.desk_cap);
+            s_rec.has_mic = s_rec.has_desktop = s_rec.has_aud = 0;
+        }
+    }
+
+    if (!s_rec.has_aud)
+        fprintf(stderr, "main: no audio sources — video only\n");
+    else
+        printf("[REC] Audio: %s\n",
+               s_rec.has_mic && s_rec.has_desktop ? "mic + desktop (mixed)"
+               : s_rec.has_mic                    ? "mic only"
+                                                  : "desktop only");
 
     enum AVPixelFormat cam_fmt = s_rec.has_cam
                                  ? s_rec.cam_cap.pix_fmt
                                  : AV_PIX_FMT_NONE;
-    int audio_sr = s_rec.has_aud ? s_rec.aud_cap.sample_rate : 0;
-    const AVChannelLayout *audio_ch = s_rec.has_aud ? &s_rec.aud_cap.ch_layout : NULL;
-    enum AVSampleFormat audio_fmt = s_rec.has_aud ? s_rec.aud_cap.sample_fmt : AV_SAMPLE_FMT_NONE;
 
-    if (encoder_open(&s_rec.enc, s_rec.capture_path,
+    /* The encoder is fed the mixer's canonical format, not any raw source. */
+    AVChannelLayout mix_ch;
+    int audio_sr = 0;
+    const AVChannelLayout *audio_ch = NULL;
+    enum AVSampleFormat audio_fmt = AV_SAMPLE_FMT_NONE;
+    if (s_rec.has_aud) {
+        audio_sr = MIX_SAMPLE_RATE;
+        av_channel_layout_default(&mix_ch, MIX_CHANNELS);
+        audio_ch = &mix_ch;
+        audio_fmt = AV_SAMPLE_FMT_FLTP;
+    }
+
+    int enc_ret = encoder_open(&s_rec.enc, s_rec.capture_path,
                      s_rec.canvas_w, s_rec.canvas_h, FPS,
                      s_rec.screen_cap.pix_fmt,
                      s_rec.cam_w, s_rec.cam_h, cam_fmt,
-                     audio_sr, audio_ch, audio_fmt) < 0) {
+                     audio_sr, audio_ch, audio_fmt);
+    if (s_rec.has_aud) av_channel_layout_uninit(&mix_ch);
+
+    if (enc_ret < 0) {
         fprintf(stderr, "main: encoder open failed\n");
         capture_free(&s_rec.screen_cap);
-        if (s_rec.has_cam) capture_free(&s_rec.cam_cap);
-        if (s_rec.has_aud) capture_free(&s_rec.aud_cap);
+        if (s_rec.has_cam)     capture_free(&s_rec.cam_cap);
+        if (s_rec.has_mic)     capture_free(&s_rec.mic_cap);
+        if (s_rec.has_desktop) capture_free(&s_rec.desk_cap);
+        if (s_rec.mixer) { mixer_destroy(s_rec.mixer); s_rec.mixer = NULL; }
         return -1;
     }
 
@@ -416,15 +492,18 @@ static int recording_open(void)
 
 static void recording_loop(void)
 {
-    pthread_t cam_tid = 0, aud_tid = 0;
-    AudioArg aud_arg  = { &s_rec.aud_cap, &s_rec.enc };
+    pthread_t cam_tid = 0, mic_tid = 0, desk_tid = 0;
+    AudioArg mic_arg  = { &s_rec.mic_cap,  s_rec.mixer, MIX_SRC_MIC };
+    AudioArg desk_arg = { &s_rec.desk_cap, s_rec.mixer, MIX_SRC_DESKTOP };
     int64_t last_webcam_seq = -1;
     struct timespec cam_poll = { .tv_nsec = 1000000L };
 
     if (s_rec.has_cam)
         pthread_create(&cam_tid, NULL, webcam_thread, &s_rec.cam_cap);
-    if (s_rec.has_aud)
-        pthread_create(&aud_tid, NULL, audio_thread, &aud_arg);
+    if (s_rec.has_mic)
+        pthread_create(&mic_tid, NULL, audio_thread, &mic_arg);
+    if (s_rec.has_desktop)
+        pthread_create(&desk_tid, NULL, audio_thread, &desk_arg);
 
     while (atomic_load(&g_running) && atomic_load(&g_recording)) {
         int mode = atomic_load(&g_mode);
@@ -477,8 +556,9 @@ static void recording_loop(void)
     }
 
     atomic_store(&s_rec_open, 0);
-    if (cam_tid) pthread_join(cam_tid, NULL);
-    if (aud_tid) pthread_join(aud_tid, NULL);
+    if (cam_tid)  pthread_join(cam_tid, NULL);
+    if (mic_tid)  pthread_join(mic_tid, NULL);
+    if (desk_tid) pthread_join(desk_tid, NULL);
 }
 
 /* ── close / flush one recording session ───────────────────── */
@@ -495,9 +575,11 @@ static void recording_close(void)
 
     encoder_flush(&s_rec.enc);
     encoder_free(&s_rec.enc);
+    if (s_rec.mixer) { mixer_destroy(s_rec.mixer); s_rec.mixer = NULL; }
     capture_free(&s_rec.screen_cap);
-    if (s_rec.has_cam) capture_free(&s_rec.cam_cap);
-    if (s_rec.has_aud) capture_free(&s_rec.aud_cap);
+    if (s_rec.has_cam)     capture_free(&s_rec.cam_cap);
+    if (s_rec.has_mic)     capture_free(&s_rec.mic_cap);
+    if (s_rec.has_desktop) capture_free(&s_rec.desk_cap);
 
     pthread_mutex_lock(&s_cam_mutex);
     if (s_cam_latest) { av_frame_free(&s_cam_latest); s_cam_latest = NULL; }
@@ -522,9 +604,9 @@ static void usage(const char *argv0)
     fprintf(stderr,
         "usage: %s <display|webcam|both|stop>\n"
         "\n"
-        "  display   record the screen + microphone\n"
-        "  webcam    record the webcam + microphone\n"
-        "  both      record screen + webcam overlay + microphone\n"
+        "  display   record the screen + audio (mic + desktop)\n"
+        "  webcam    record the webcam + audio (mic + desktop)\n"
+        "  both      record screen + webcam overlay + audio (mic + desktop)\n"
         "  stop      stop the running recorder and render the final file\n"
         "\n"
         "The first record command starts a background daemon; later commands\n"
