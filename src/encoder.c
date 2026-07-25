@@ -68,6 +68,7 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     enc->vid_enc->gop_size     = fps * 2;
     enc->vid_enc->max_b_frames = 0;
     enc->vid_enc->profile      = AV_PROFILE_H264_HIGH;
+    enc->vid_enc->level        = 40;  /* Level 4.0: sufficient for 1440p@30 */
     enc->vid_enc->color_primaries = AVCOL_PRI_BT709;
     enc->vid_enc->color_trc       = AVCOL_TRC_BT709;
     enc->vid_enc->colorspace      = AVCOL_SPC_BT709;
@@ -98,6 +99,8 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     av_opt_set(enc->vid_enc->priv_data, "preset",    "ultrafast", 0);
     av_opt_set(enc->vid_enc->priv_data, "crf",       "18",        0);
     av_opt_set(enc->vid_enc->priv_data, "tune",      "zerolatency", 0);
+    av_opt_set(enc->vid_enc->priv_data, "profile",   "high",      0);
+    av_opt_set(enc->vid_enc->priv_data, "level",     "4.0",        0);
 #endif
 
     int ret = avcodec_open2(enc->vid_enc, codec, NULL);
