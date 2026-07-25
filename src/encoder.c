@@ -62,9 +62,12 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     enc->vid_enc->codec_id     = AV_CODEC_ID_H264;
     enc->vid_enc->width        = w;
     enc->vid_enc->height       = h;
-    /* PTS is in microseconds; rescaled to stream time_base before muxing */
     enc->vid_enc->time_base    = (AVRational){1, 1000000};
+#ifdef __APPLE__
+    enc->vid_enc->pix_fmt      = AV_PIX_FMT_NV12;  /* VideoToolbox native */
+#else
     enc->vid_enc->pix_fmt      = AV_PIX_FMT_YUV420P;
+#endif
     enc->vid_enc->gop_size     = fps * 2;
     enc->vid_enc->max_b_frames = 0;
     enc->vid_enc->profile      = AV_PROFILE_H264_HIGH;
@@ -106,7 +109,11 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     enc->vid_stream->time_base = enc->vid_enc->time_base;
 
     enc->vid_frame         = av_frame_alloc();
+#ifdef __APPLE__
+    enc->vid_frame->format = AV_PIX_FMT_NV12;
+#else
     enc->vid_frame->format = AV_PIX_FMT_YUV420P;
+#endif
     enc->vid_frame->width  = w;
     enc->vid_frame->height = h;
     av_frame_get_buffer(enc->vid_frame, 0);
@@ -203,7 +210,11 @@ static int setup_sws(EncoderCtx *enc, enum AVPixelFormat screen_fmt)
 
     enc->sws_to_yuv = sws_getContext(
         cw, ch, AV_PIX_FMT_RGBA,
+#ifdef __APPLE__
+        cw, ch, AV_PIX_FMT_NV12,
+#else
         cw, ch, AV_PIX_FMT_YUV420P,
+#endif
         yuv_flags, NULL, NULL, NULL);
 
     if (!enc->sws_screen || !enc->sws_to_yuv) {
@@ -486,6 +497,12 @@ int encoder_write_video(EncoderCtx *enc, int mode,
     enc->vid_frame->pts = av_gettime_relative() - enc->t0;
 
     int ret = avcodec_send_frame(enc->vid_enc, enc->vid_frame);
+    while (ret == AVERROR(EAGAIN)) {
+        /* Encoder queue full — drain pending packets and retry. */
+        int dr = drain_encoder(enc, enc->vid_enc, enc->vid_stream);
+        if (dr < 0) return dr;
+        ret = avcodec_send_frame(enc->vid_enc, enc->vid_frame);
+    }
     if (ret < 0) { log_err("avcodec_send_frame (video)", ret); return ret; }
     return drain_encoder(enc, enc->vid_enc, enc->vid_stream);
 }
