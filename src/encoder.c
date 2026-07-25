@@ -43,7 +43,8 @@ static int drain_encoder(EncoderCtx *enc, AVCodecContext *ctx, AVStream *st)
 static int setup_video(EncoderCtx *enc, int w, int h, int fps)
 {
 #ifdef __APPLE__
-    const char *codec_name = "h264_videotoolbox";
+    /* libx264 is the reliable fallback while debugging VideoToolbox integration */
+    const char *codec_name = "libx264";
 #else
     const char *codec_name = "h264_nvenc";
 #endif
@@ -63,11 +64,7 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     enc->vid_enc->width        = w;
     enc->vid_enc->height       = h;
     enc->vid_enc->time_base    = (AVRational){1, 1000000};
-#ifdef __APPLE__
-    enc->vid_enc->pix_fmt      = AV_PIX_FMT_NV12;  /* VideoToolbox native */
-#else
     enc->vid_enc->pix_fmt      = AV_PIX_FMT_YUV420P;
-#endif
     enc->vid_enc->gop_size     = fps * 2;
     enc->vid_enc->max_b_frames = 0;
     enc->vid_enc->profile      = AV_PROFILE_H264_HIGH;
@@ -97,9 +94,10 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     av_opt_set(enc->vid_enc->priv_data, "qp",      qp,       0);
     av_opt_set(enc->vid_enc->priv_data, "surfaces","16",     0);
 #else
-    /* VideoToolbox: real-time encoding, allow software fallback */
-    av_opt_set(enc->vid_enc->priv_data, "allow_sw",  "1", 0);
-    av_opt_set(enc->vid_enc->priv_data, "realtime",  "1", 0);
+    /* x264: ultrafast preset for real-time capture, CRF 18 for quality */
+    av_opt_set(enc->vid_enc->priv_data, "preset",    "ultrafast", 0);
+    av_opt_set(enc->vid_enc->priv_data, "crf",       "18",        0);
+    av_opt_set(enc->vid_enc->priv_data, "tune",      "zerolatency", 0);
 #endif
 
     int ret = avcodec_open2(enc->vid_enc, codec, NULL);
@@ -109,11 +107,7 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     enc->vid_stream->time_base = enc->vid_enc->time_base;
 
     enc->vid_frame         = av_frame_alloc();
-#ifdef __APPLE__
-    enc->vid_frame->format = AV_PIX_FMT_NV12;
-#else
     enc->vid_frame->format = AV_PIX_FMT_YUV420P;
-#endif
     enc->vid_frame->width  = w;
     enc->vid_frame->height = h;
     av_frame_get_buffer(enc->vid_frame, 0);
@@ -210,11 +204,7 @@ static int setup_sws(EncoderCtx *enc, enum AVPixelFormat screen_fmt)
 
     enc->sws_to_yuv = sws_getContext(
         cw, ch, AV_PIX_FMT_RGBA,
-#ifdef __APPLE__
-        cw, ch, AV_PIX_FMT_NV12,
-#else
         cw, ch, AV_PIX_FMT_YUV420P,
-#endif
         yuv_flags, NULL, NULL, NULL);
 
     if (!enc->sws_screen || !enc->sws_to_yuv) {
