@@ -45,6 +45,12 @@ struct SckCapture {
     pthread_mutex_t         lock;
     SckCaptureInfo          info;
     int                     stopped;
+
+    /* diagnostics (SCREENCAST_DEBUG=1) — touched only on the serial sample
+       queue, so plain increments are safe */
+    int                     debug;
+    long                    video_cb;
+    long                    audio_cb;
 };
 
 /* ── helpers ───────────────────────────────────────────────── */
@@ -165,6 +171,10 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
     if (!c || c->stopped) return;
 
     if (type == SCStreamOutputTypeScreen) {
+        c->video_cb++;
+        if (c->debug && (c->video_cb == 1 || c->video_cb % 100 == 0))
+            fprintf(stderr, "sck: video callback #%ld\n", c->video_cb);
+
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (!pb) return;
 
@@ -205,6 +215,10 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
         dispatch_semaphore_signal(c->video_sem);
 
     } else if (type == SCStreamOutputTypeAudio) {
+        c->audio_cb++;
+        if (c->debug && (c->audio_cb == 1 || c->audio_cb % 100 == 0))
+            fprintf(stderr, "sck: audio callback #%ld\n", c->audio_cb);
+
         if (c->audio_sample_rate == 0) {
             CMAudioFormatDescriptionRef fmtDesc =
                 CMSampleBufferGetFormatDescription(sampleBuffer);
@@ -326,6 +340,7 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
     SckCapture *c = (SckCapture *)calloc(1, sizeof(*c));
     if (!c) return NULL;
 
+    c->debug = (getenv("SCREENCAST_DEBUG") != NULL);
     pthread_mutex_init(&c->lock, NULL);
     c->video_sem = dispatch_semaphore_create(0);
     if (!c->video_sem) { free(c); return NULL; }
@@ -353,18 +368,33 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
             break;
         }
 
-        /* ── pick display: prefer one containing mouse, else largest ── */
+        /* ── pick the display the cursor is currently on ──
+         *
+         * CGEventGetLocation reports the cursor in the same global,
+         * top-left-origin space that SCDisplay.frame uses.  The previous
+         * implementation hit-tested [NSEvent mouseLocation], which is Cocoa
+         * bottom-left-origin — mismatched spaces, so the test almost always
+         * missed and silently fell through to a "largest display" heuristic.
+         * There is no size-based fallback any more: main display, then first. */
         SCDisplay *display = nil;
-        CGPoint mouse = [NSEvent mouseLocation];
-        CGFloat bestArea = 0;
-        for (SCDisplay *d in content.displays) {
-            CGFloat area = d.frame.size.width * d.frame.size.height;
-            if (area > bestArea) { bestArea = area; display = d; }
-            if (CGRectContainsPoint(d.frame, mouse)) {
-                display = d;
-                break;
-            }
+        CGDirectDisplayID want = kCGNullDirectDisplay;
+
+        CGEventRef ev = CGEventCreate(NULL);
+        if (ev) {
+            CGPoint cursor = CGEventGetLocation(ev);
+            CFRelease(ev);
+            CGDirectDisplayID hit[8];
+            uint32_t nhit = 0;
+            if (CGGetDisplaysWithPoint(cursor, 8, hit, &nhit) == kCGErrorSuccess
+                && nhit > 0)
+                want = hit[0];
         }
+        if (want == kCGNullDirectDisplay)
+            want = CGMainDisplayID();
+
+        for (SCDisplay *d in content.displays)
+            if (d.displayID == want) { display = d; break; }
+
         if (!display)
             display = [content.displays firstObject];
         if (!display) {
@@ -375,6 +405,9 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
         CGRect db = display.frame;
         c->width  = (int)CGRectGetWidth(db);
         c->height = (int)CGRectGetHeight(db);
+        fprintf(stderr, "[REC] Display: id %u, %dx%d at (%d,%d)\n",
+                (unsigned)display.displayID, c->width, c->height,
+                (int)CGRectGetMinX(db), (int)CGRectGetMinY(db));
         if (c->width <= 0 || c->height <= 0) {
             fprintf(stderr, "sck_capture: invalid display dimensions\n");
             break;
@@ -556,6 +589,10 @@ AVFrame *sck_capture_grab_audio(SckCapture *c)
 void sck_capture_close(SckCapture *c)
 {
     if (!c) return;
+
+    if (c->debug)
+        fprintf(stderr, "sck: totals — video callbacks %ld, audio callbacks %ld\n",
+                c->video_cb, c->audio_cb);
 
     pthread_mutex_lock(&c->lock);
     c->stopped = 1;

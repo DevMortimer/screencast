@@ -55,6 +55,8 @@ typedef struct {
     int has_mic;
     int has_desktop;
     int has_aud;               /* has_mic || has_desktop */
+    long mic_frames;           /* diagnostics: frames handed to the mixer */
+    long desk_frames;
     char output_path[512];     /* ~/Movies/screencast_YYYYMMDD_HHMMSS.mp4 */
 } RecCtx;
 
@@ -122,6 +124,7 @@ static void *mic_thread(void *arg)
             continue;
         }
         fails = 0;
+        rec->mic_frames++;
         mixer_feed(rec->mixer, MIX_SRC_MIC, f,
                    MIX_SAMPLE_RATE,
                    &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO,
@@ -289,6 +292,7 @@ static void recording_loop(void)
         if (s_rec.has_desktop && s_rec.mixer) {
             AVFrame *desk_audio = sck_capture_grab_audio(s_rec.sck);
             if (desk_audio) {
+                s_rec.desk_frames++;
                 mixer_feed(s_rec.mixer, MIX_SRC_DESKTOP, desk_audio,
                            MIX_SAMPLE_RATE,
                            &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO,
@@ -327,6 +331,22 @@ static void recording_close(void)
     /* Brief drain for threads */
     struct timespec ts = { .tv_nsec = 50000000L };
     nanosleep(&ts, NULL);
+
+    /* Report what actually reached the mix, not what we hoped for at open. */
+    if (s_rec.mixer) {
+        int mic_live  = mixer_source_live(s_rec.mixer, MIX_SRC_MIC);
+        int desk_live = mixer_source_live(s_rec.mixer, MIX_SRC_DESKTOP);
+        fprintf(stderr, "[REC] Audio delivered: mic %s (%ld frames), "
+                        "desktop %s (%ld frames)\n",
+                mic_live  ? "yes" : "NO", s_rec.mic_frames,
+                desk_live ? "yes" : "NO", s_rec.desk_frames);
+        if (s_rec.has_mic && !mic_live)
+            fprintf(stderr, "[REC] Hint: microphone produced no samples — check "
+                            "System Settings > Privacy & Security > Microphone\n");
+        if (s_rec.has_desktop && !desk_live)
+            fprintf(stderr, "[REC] Hint: system audio produced no samples — the "
+                            "recording keeps the remaining sources\n");
+    }
 
     encoder_flush(&s_rec.enc);
     encoder_free(&s_rec.enc);

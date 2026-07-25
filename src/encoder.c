@@ -299,6 +299,11 @@ void encoder_clear_webcam(EncoderCtx *enc)
     free_cam_sws(enc);
 }
 
+/* Diagnostic: AAC frames handed to the audio encoder this session.  An empty
+ * audio track is silently dropped by the mov muxer, so a zero here is the
+ * difference between "no audio captured" and "audio captured but not muxed". */
+static long s_aud_frames_encoded = 0;
+
 /* ── public: encoder_open ─────────────────────────────────── */
 
 int encoder_open(EncoderCtx *enc, const char *path,
@@ -309,6 +314,7 @@ int encoder_open(EncoderCtx *enc, const char *path,
                   enum AVSampleFormat audio_sample_fmt)
 {
     memset(enc, 0, sizeof(*enc));
+    s_aud_frames_encoded = 0;
     enc->canvas_w = canvas_w;
     enc->canvas_h = canvas_h;
 
@@ -559,6 +565,7 @@ int encoder_feed_audio(EncoderCtx *enc, AVFrame *raw_frame)
 
         ret = avcodec_send_frame(enc->aud_enc, enc->aud_frame);
         if (ret < 0) { log_err("avcodec_send_frame (audio)", ret); return ret; }
+        s_aud_frames_encoded++;
         drain_encoder(enc, enc->aud_enc, enc->aud_stream);
     }
     return 0;
@@ -569,6 +576,10 @@ int encoder_feed_audio(EncoderCtx *enc, AVFrame *raw_frame)
 int encoder_flush(EncoderCtx *enc)
 {
     if (!enc->fmt_ctx || !enc->header_written) return 0;
+
+    if (getenv("SCREENCAST_DEBUG"))
+        fprintf(stderr, "encoder: AAC frames encoded this session: %ld\n",
+                s_aud_frames_encoded);
 
     /* Signal end-of-stream to both encoders */
     avcodec_send_frame(enc->vid_enc, NULL);

@@ -3,6 +3,7 @@
 #include <libavutil/audio_fifo.h>
 #include <libavutil/error.h>
 #include <libavutil/mem.h>
+#include <libavutil/time.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,8 +19,14 @@ static void log_err(const char *label, int ret)
 /* ~200 ms per source: absorbs jitter, bounds drift and memory. */
 #define MIX_FIFO_CAP_MS 200
 
+/* A primed source that goes this long without delivering is presumed dead and
+ * dropped, so it cannot hold the remaining sources hostage in the min(). */
+#define MIX_STALL_TIMEOUT_US (2 * 1000000LL)
+
 struct MixerCtx {
     int             active[MIX_SRC_COUNT];
+    int             primed[MIX_SRC_COUNT];/* has delivered ≥1 sample */
+    int64_t         last_feed_us[MIX_SRC_COUNT];
     SwrContext     *swr[MIX_SRC_COUNT];   /* source → canonical, lazily built */
     AVAudioFifo    *fifo[MIX_SRC_COUNT];  /* canonical stereo FLTP, bounded */
     int             fifo_cap;             /* samples */
@@ -27,6 +34,7 @@ struct MixerCtx {
     AVFrame        *mixed;                /* reused canonical output frame */
     MixSinkFn       sink;
     void           *user;
+    int             debug;
     pthread_mutex_t lock;
 };
 
@@ -42,12 +50,26 @@ static float clampf(float v)
  * and clamped. Called with m->lock held. The min() keeps the two streams in
  * lockstep; the bounded FIFOs (enforced in mixer_feed) keep the faster source
  * from running away.
+ *
+ * Only *primed* sources — those that have delivered at least one sample —
+ * participate in the min().  A source that is declared active at create time
+ * but never actually delivers (e.g. a system-audio backend that silently fails
+ * to start) would otherwise pin min() at zero forever and suppress the entire
+ * mixed track.  A source that primes and then stalls is dropped outright.
  */
 static void mixer_drain_locked(MixerCtx *m)
 {
+    int64_t now = av_gettime_relative();
     int n_ready = -1;
+
     for (int i = 0; i < MIX_SRC_COUNT; i++) {
-        if (!m->active[i]) continue;
+        if (!m->active[i] || !m->primed[i]) continue;
+        if (now - m->last_feed_us[i] > MIX_STALL_TIMEOUT_US) {
+            fprintf(stderr, "mixer: source %d stalled — dropping from mix\n", i);
+            m->active[i] = 0;
+            av_audio_fifo_drain(m->fifo[i], av_audio_fifo_size(m->fifo[i]));
+            continue;
+        }
         int sz = av_audio_fifo_size(m->fifo[i]);
         if (n_ready < 0 || sz < n_ready) n_ready = sz;
     }
@@ -60,7 +82,7 @@ static void mixer_drain_locked(MixerCtx *m)
     memset(acc1, 0, (size_t)n_ready * sizeof(float));
 
     for (int i = 0; i < MIX_SRC_COUNT; i++) {
-        if (!m->active[i]) continue;
+        if (!m->active[i] || !m->primed[i]) continue;
         void *dst[MIX_CHANNELS] = { m->scratch[0], m->scratch[1] };
         if (av_audio_fifo_read(m->fifo[i], dst, n_ready) < n_ready) continue;
         const float *s0 = m->scratch[0];
@@ -87,6 +109,7 @@ MixerCtx *mixer_create(const int active[MIX_SRC_COUNT],
 
     m->sink     = sink;
     m->user     = user;
+    m->debug    = getenv("SCREENCAST_DEBUG") != NULL;
     m->fifo_cap = MIX_SAMPLE_RATE * MIX_FIFO_CAP_MS / 1000;
     pthread_mutex_init(&m->lock, NULL);
 
@@ -174,6 +197,12 @@ int mixer_feed(MixerCtx *m, MixSource src, AVFrame *raw,
 
     if (res->nb_samples > 0) {
         av_audio_fifo_write(m->fifo[src], (void **)res->data, res->nb_samples);
+        if (!m->primed[src]) {
+            m->primed[src] = 1;
+            if (m->debug)
+                fprintf(stderr, "mixer: source %d primed (first samples)\n", src);
+        }
+        m->last_feed_us[src] = av_gettime_relative();
         /* Bound the FIFO: drop the oldest samples of the faster source. */
         int overflow = av_audio_fifo_size(m->fifo[src]) - m->fifo_cap;
         if (overflow > 0) av_audio_fifo_drain(m->fifo[src], overflow);
@@ -199,6 +228,15 @@ void mixer_drop_source(MixerCtx *m, MixSource src)
         mixer_drain_locked(m);
     }
     pthread_mutex_unlock(&m->lock);
+}
+
+int mixer_source_live(MixerCtx *m, MixSource src)
+{
+    if (!m || src < 0 || src >= MIX_SRC_COUNT) return 0;
+    pthread_mutex_lock(&m->lock);
+    int live = m->active[src] && m->primed[src];
+    pthread_mutex_unlock(&m->lock);
+    return live;
 }
 
 void mixer_destroy(MixerCtx *m)

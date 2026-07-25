@@ -87,7 +87,11 @@ $(TARGET): $(TARGET_DEPS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 # Pattern rule for .c -> .o
+# The order-only $(OBJDIR) prerequisite only fires when build/ is missing
+# entirely, so a tree built before the linux/ + macos/ split has build/ but no
+# subdirectories.  mkdir here rather than relying on that.
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
+	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Pattern rule for .m -> .o (Objective-C on macOS, ARC only where needed)
