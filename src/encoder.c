@@ -42,9 +42,14 @@ static int drain_encoder(EncoderCtx *enc, AVCodecContext *ctx, AVStream *st)
 
 static int setup_video(EncoderCtx *enc, int w, int h, int fps)
 {
-    const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
+#ifdef __APPLE__
+    const char *codec_name = "h264_videotoolbox";
+#else
+    const char *codec_name = "h264_nvenc";
+#endif
+    const AVCodec *codec = avcodec_find_encoder_by_name(codec_name);
     if (!codec) {
-        fprintf(stderr, "encoder: h264_nvenc not found; NVIDIA GPU encoding is required\n");
+        fprintf(stderr, "encoder: %s not found\n", codec_name);
         return -1;
     }
 
@@ -72,9 +77,11 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
         enc->vid_enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
     /*
-     * Real-time capture writes a high-quality intermediate with cheap GPU
-     * rate control. The final file is rendered after recording stops.
+     * NVENC real-time capture: high-quality intermediate with cheap GPU
+     * rate control.  The final file is rendered after recording stops.
+     * VideoToolbox (macOS) uses its own defaults — none of these apply.
      */
+#ifndef __APPLE__
     const char *preset = getenv("SCREENCAST_NVENC_CAPTURE_PRESET");
     const char *qp     = getenv("SCREENCAST_NVENC_CAPTURE_QP");
     if (!preset || !preset[0]) preset = "p3";
@@ -86,6 +93,11 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     av_opt_set(enc->vid_enc->priv_data, "rc",      "constqp",0);
     av_opt_set(enc->vid_enc->priv_data, "qp",      qp,       0);
     av_opt_set(enc->vid_enc->priv_data, "surfaces","16",     0);
+#else
+    /* VideoToolbox: real-time encoding, allow software fallback */
+    av_opt_set(enc->vid_enc->priv_data, "allow_sw",  "1", 0);
+    av_opt_set(enc->vid_enc->priv_data, "realtime",  "1", 0);
+#endif
 
     int ret = avcodec_open2(enc->vid_enc, codec, NULL);
     if (ret < 0) { log_err("avcodec_open2 (video)", ret); return ret; }
@@ -352,8 +364,9 @@ int encoder_open(EncoderCtx *enc, const char *path,
     return 0;
 }
 
-/* ── recording-indicator dot ──────────────────────────────── */
+/* ── recording-indicator dot (Linux only) ─────────────────── */
 
+#ifndef __APPLE__
 static void draw_rec_dot(uint8_t *rgba, int canvas_w, int canvas_h,
                           int cx, int cy, int r)
 {
@@ -367,6 +380,7 @@ static void draw_rec_dot(uint8_t *rgba, int canvas_w, int canvas_h,
         }
     }
 }
+#endif
 
 /* ── public: encoder_write_video ──────────────────────────── */
 
@@ -454,7 +468,9 @@ int encoder_write_video(EncoderCtx *enc, int mode,
     }
 
     /* ── 2.5. Recording indicator: red dot top-right ── */
+#ifndef __APPLE__
     draw_rec_dot(enc->canvas_rgba, cw, ch, cw - 24, 24, 10);
+#endif
 
     /* ── 3. RGBA → YUV420P ── */
     {

@@ -29,12 +29,25 @@ static const char *sock_path(void)
 {
     if (s_sock_path[0]) return s_sock_path;
 
+#ifdef __APPLE__
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        char dir[256];
+        snprintf(dir, sizeof(dir), "%s/Library/Caches/screencast", home);
+        mkdir(dir, 0700);
+        snprintf(s_sock_path, sizeof(s_sock_path), "%s/screencast.sock", dir);
+    } else {
+        snprintf(s_sock_path, sizeof(s_sock_path), "/tmp/screencast-%u.sock",
+                 (unsigned)getuid());
+    }
+#else
     const char *dir = getenv("XDG_RUNTIME_DIR");
     if (dir && dir[0])
         snprintf(s_sock_path, sizeof(s_sock_path), "%s/screencast.sock", dir);
     else
         snprintf(s_sock_path, sizeof(s_sock_path), "/tmp/screencast-%u.sock",
                  (unsigned)getuid());
+#endif
     return s_sock_path;
 }
 
@@ -42,6 +55,19 @@ static const char *sock_path(void)
 
 void control_notify(const char *summary, const char *body)
 {
+#ifdef __APPLE__
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd),
+                 "display notification \"%s\" with title \"screencast\"",
+                 body ? body : summary);
+        execlp("/usr/bin/osascript", "osascript", "-e", cmd, (char *)NULL);
+        _exit(127);
+    }
+    waitpid(pid, NULL, 0);
+#else
     pid_t pid = fork();
     if (pid < 0) return;
     if (pid == 0) {
@@ -51,6 +77,7 @@ void control_notify(const char *summary, const char *body)
         _exit(127);
     }
     waitpid(pid, NULL, 0);
+#endif
 }
 
 /* ── mode helpers ──────────────────────────────────────────── */

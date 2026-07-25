@@ -1,8 +1,9 @@
 # Screencast
 
-A Wayland screencast recorder that captures a display output (plus optional
-webcam and audio) and renders an MP4. This glossary pins down the audio and
-capture vocabulary so the code and docs agree.
+A cross-platform screencast recorder that captures a display output (plus
+optional webcam and audio) and renders an MP4. Runs on Linux (wlroots Wayland
+compositors) and macOS. This glossary pins down the audio and capture
+vocabulary so the code and docs agree.
 
 ## Language
 

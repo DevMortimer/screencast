@@ -7,6 +7,8 @@ desktop audio, mixed), then renders a final MP4 with NVIDIA NVENC.
 It targets wlroots-based compositors (niri, Sway, Hyprland, river, …) that
 implement `wlr-screencopy-unstable-v1`.
 
+**Platforms:** Linux (wlroots Wayland) | macOS 13+
+
 ## Features
 
 - Records a Wayland output via `wlr-screencopy` (shm buffers).
@@ -71,6 +73,63 @@ To remove build artifacts:
 make clean
 ```
 
+## macOS
+
+On macOS, screencast uses native frameworks:
+- **ScreenCaptureKit** for display capture and system audio
+- **AVFoundation** for webcam and microphone
+- **VideoToolbox** for hardware-accelerated H.264 encoding
+
+### Requirements (macOS)
+
+- macOS 13 (Ventura) or later
+- Xcode Command Line Tools (`xcode-select --install`)
+- FFmpeg development libraries:
+  - `libavformat`, `libavcodec`, `libavdevice`, `libswscale`, `libswresample`, `libavutil`
+- FFmpeg CLI available as `ffmpeg` (for the shared encoder)
+
+Install FFmpeg via Homebrew:
+
+```sh
+brew install ffmpeg
+```
+
+### Build (macOS)
+
+```sh
+make
+```
+
+The compiled binary is written to `./screencast`.
+
+### macOS usage
+
+Same CLI as Linux, but bind the commands to **skhd** (or any macOS hotkey tool):
+
+```cfg
+shift + cmd - d : screencast display
+shift + cmd - w : screencast webcam
+shift + cmd - b : screencast both
+shift + cmd - escape : screencast stop
+```
+
+### macOS paths
+
+| Item | Path |
+|---|---|
+| Output recordings | `~/Movies/screencast_YYYYMMDD_HHMMSS.mp4` |
+| Control socket | `~/Library/Caches/screencast/screencast.sock` |
+
+### macOS limitations vs Linux
+
+- **Single-pass encode.** No two-pass NVENC render; VideoToolbox encodes directly to the final file.
+- **No recording indicator.** macOS enforces its own system recording indicator in the menu bar.
+- **No camera arbitration.** AVFoundation handles multiple camera consumers natively.
+- **No display override.** The daemon locks to the display it was invoked from.
+- **No NVENC tuning.** `SCREENCAST_NVENC_*` environment variables are silently ignored.
+- **No `SCREENCAST_OUTPUT`.** The display cannot be overridden.
+- **No `SCREENCAST_KEEP_CAPTURE`.** There is no intermediate capture file.
+
 ## Usage
 
 Wayland compositors own global keybindings, so — unlike the old X11 version —
@@ -129,6 +188,20 @@ The recorder can be tuned with environment variables:
 | `SCREENCAST_NVENC_FINAL_LOOKAHEAD` | `32` | NVENC final render lookahead. |
 | `SCREENCAST_NVENC_FINAL_AQ` | `10` | NVENC adaptive quantization strength. |
 | `SCREENCAST_KEEP_CAPTURE` | unset | Keep the intermediate capture file when set to any non-empty value. |
+
+> **Note:** The `SCREENCAST_OUTPUT`, `SCREENCAST_DESKTOP_DEV`, `SCREENCAST_NVENC_*`, and `SCREENCAST_KEEP_CAPTURE` variables are Linux-only and silently ignored on macOS.
+
+### macOS configuration
+
+Only these environment variables apply on macOS:
+
+| Variable | Default | Description |
+|---|---|---|
+| `SCREENCAST_DRAW_MOUSE` | `1` | Composite the cursor into the recording; set to `0` to hide it. |
+| `SCREENCAST_DESKTOP_AUDIO` | `1` | Mix desktop audio into the track; set to `0` to record microphone only. |
+| `SCREENCAST_WEBCAM_DEV` | `auto` | Camera target (device UID or name), or `auto` for the system default. |
+| `SCREENCAST_CAM_FPS` | `30` | Preferred webcam frame rate. |
+| `SCREENCAST_CAM_SIZE` | `1280x720` | Preferred webcam capture size. |
 
 Example:
 
