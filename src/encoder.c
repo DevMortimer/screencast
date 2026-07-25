@@ -101,6 +101,10 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     av_opt_set(enc->vid_enc->priv_data, "tune",      "zerolatency", 0);
     av_opt_set(enc->vid_enc->priv_data, "profile",   "high",      0);
     av_opt_set(enc->vid_enc->priv_data, "level",     "4.0",        0);
+    /* Force immediate output: no lookahead, no scene-cut delay */
+    av_opt_set(enc->vid_enc->priv_data, "rc-lookahead", "0",  0);
+    av_opt_set(enc->vid_enc->priv_data, "sc_threshold", "0",  0);
+    av_opt_set(enc->vid_enc->priv_data, "x264-params",  "stitchable=1", 0);
 #endif
 
     int ret = avcodec_open2(enc->vid_enc, codec, NULL);

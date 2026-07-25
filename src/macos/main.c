@@ -287,6 +287,11 @@ static void recording_loop(void)
             continue;  /* timeout — retry */
         }
 
+        static int frame_nr = 0;
+        frame_nr++;
+        if (frame_nr % 30 == 0)
+            fprintf(stderr, "[REC] frame %d (mode %d)\n", frame_nr, (int)mode);
+
         /* Grab desktop audio (non-blocking) */
         if (s_rec.has_desktop && s_rec.mixer) {
             AVFrame *desk_audio = sck_capture_grab_audio(s_rec.sck);
