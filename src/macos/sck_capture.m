@@ -39,6 +39,8 @@ struct SckCapture {
 
     void                   *stream;       /* CFBridgingRetain of SCStream */
     dispatch_queue_t        sample_queue;  /* retained — must outlive local scope */
+    dispatch_queue_t        audio_queue;   /* separate: video memcpy must not
+                                              back up audio delivery */
     void                   *helper;        /* _SckStreamHelper — retained (stream may hold weak ref) */
     int                     width;
     int                     height;
@@ -46,8 +48,8 @@ struct SckCapture {
     SckCaptureInfo          info;
     int                     stopped;
 
-    /* diagnostics (SCREENCAST_DEBUG=1) — touched only on the serial sample
-       queue, so plain increments are safe */
+    /* diagnostics (SCREENCAST_DEBUG=1) — each counter is touched by exactly
+       one serial queue, so plain increments are safe */
     int                     debug;
     long                    video_cb;
     long                    audio_cb;
@@ -250,22 +252,27 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
         CMBlockBufferRef blockBuf = NULL;
         AudioBufferList *bufList  = NULL;
 
-        size_t bufListSize;
-        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        /* Sizing call.  Passing NULL for bufferListOut asks only for the
+         * required size — no block buffer is retained, so blockBufferOut stays
+         * NULL.  Testing it here would discard every audio buffer, which is
+         * precisely what used to happen. */
+        size_t bufListSize = 0;
+        OSStatus err = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
             sampleBuffer, &bufListSize, NULL, 0,
             kCFAllocatorSystemDefault, kCFAllocatorSystemDefault,
             kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-            &blockBuf);
+            NULL);
+        if (err != noErr || bufListSize == 0) {
+            if (c->debug)
+                fprintf(stderr, "sck: audio buffer list sizing failed (%d, %zu)\n",
+                        (int)err, bufListSize);
+            return;
+        }
 
-        if (!bufListSize || !blockBuf) return;
-
-        size_t allocSize = offsetof(AudioBufferList, mBuffers) +
-            sizeof(AudioBuffer) * (size_t)(c->audio_channels > 0 ? c->audio_channels : 2);
-        bufList = (AudioBufferList *)alloca(bufListSize > 0 ? bufListSize : allocSize);
+        bufList = (AudioBufferList *)alloca(bufListSize);
         memset(bufList, 0, bufListSize);
-        bufList->mNumberBuffers = (UInt32)c->audio_channels;
 
-        OSStatus err = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        err = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
             sampleBuffer, NULL, bufList, bufListSize,
             kCFAllocatorSystemDefault, kCFAllocatorSystemDefault,
             kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
@@ -275,11 +282,21 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
             log_error("CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer", err);
             return;
         }
+        if (!blockBuf) return;
 
+        /* nSamples counts frames *per channel*.  For interleaved input a single
+         * buffer holds every channel, so the byte count must be divided by the
+         * channel count as well. */
         size_t nSamples = 0;
-        for (UInt32 i = 0; i < bufList->mNumberBuffers; i++) {
-            AudioBuffer *ab = &bufList->mBuffers[i];
-            if (ab->mData && ab->mDataByteSize > 0) {
+        if (c->audio_fmt == AV_SAMPLE_FMT_FLT) {
+            AudioBuffer *ab = &bufList->mBuffers[0];
+            if (ab->mData && c->audio_channels > 0)
+                nSamples = ab->mDataByteSize /
+                           (sizeof(float) * (size_t)c->audio_channels);
+        } else {
+            for (UInt32 i = 0; i < bufList->mNumberBuffers; i++) {
+                AudioBuffer *ab = &bufList->mBuffers[i];
+                if (!ab->mData || ab->mDataByteSize == 0) continue;
                 size_t s = ab->mDataByteSize / sizeof(float);
                 if (nSamples == 0 || s < nSamples) nSamples = s;
             }
@@ -295,9 +312,13 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
         }
 
         int new_total = c->audio_nb_samples + (int)nSamples;
-        if (new_total * (int)sizeof(float) > c->audio_plane_cap) {
+        /* Interleaved input packs every channel into plane 0, so it needs
+         * channels× the bytes a planar frame count implies. */
+        int bytes_per_frame = (int)sizeof(float) *
+            (c->audio_fmt == AV_SAMPLE_FMT_FLT ? c->audio_channels : 1);
+        if (new_total * bytes_per_frame > c->audio_plane_cap) {
             int new_cap = c->audio_plane_cap * 2;
-            while (new_total * (int)sizeof(float) > new_cap) new_cap *= 2;
+            while (new_total * bytes_per_frame > new_cap) new_cap *= 2;
             for (int i = 0; i < c->audio_channels; i++) {
                 uint8_t *p = (uint8_t *)realloc(c->audio_planes[i], (size_t)new_cap);
                 if (!p) {
@@ -428,6 +449,8 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
         config.pixelFormat = kCVPixelFormatType_32BGRA;
         config.capturesAudio = YES;
         config.excludesCurrentProcessAudio = YES;
+        config.sampleRate    = 48000;
+        config.channelCount  = 2;
         config.queueDepth = 4;
         config.showsCursor = YES;
 
@@ -454,6 +477,16 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
         }
         c->sample_queue = sq;   /* prevent ARC release after scope exit */
 
+        /* Audio gets its own queue: a shared serial queue would serialise
+         * every audio buffer behind a full-frame BGRA memcpy at 30 fps. */
+        dispatch_queue_t aq = dispatch_queue_create(
+            "screencast.sck.audio", DISPATCH_QUEUE_SERIAL);
+        if (!aq) {
+            fprintf(stderr, "sck_capture: could not create audio queue\n");
+            break;
+        }
+        c->audio_queue = aq;
+
         NSError *addErr = nil;
         if (![stream addStreamOutput:helper
                                 type:SCStreamOutputTypeScreen
@@ -465,7 +498,7 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
         addErr = nil;
         if (![stream addStreamOutput:helper
                                 type:SCStreamOutputTypeAudio
-                  sampleHandlerQueue:sq error:&addErr]) {
+                  sampleHandlerQueue:aq error:&addErr]) {
             fprintf(stderr, "sck_capture: addStreamOutput(audio) failed: %s\n",
                     addErr ? [[addErr localizedDescription] UTF8String] : "unknown");
             break;
@@ -625,6 +658,7 @@ void sck_capture_close(SckCapture *c)
         free(c->audio_planes[i]);
 
     pthread_mutex_destroy(&c->lock);
-    c->sample_queue = nil;  /* release dispatch queue before freeing struct */
+    c->sample_queue = nil;  /* release dispatch queues before freeing struct */
+    c->audio_queue  = nil;
     free(c);
 }
