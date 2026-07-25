@@ -161,6 +161,11 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
     SckCapture *c = _capture;
     if (!c || c->stopped) return;
 
+    static int dbg_frame = 0;
+    dbg_frame++;
+    if (dbg_frame <= 3 || dbg_frame % 60 == 0)
+        fprintf(stderr, "sck: callback #%d type=%ld\n", dbg_frame, (long)type);
+
     if (type == SCStreamOutputTypeScreen) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (!pb) return;
