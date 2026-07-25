@@ -10,6 +10,7 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <AppKit/AppKit.h>
 #import <Accelerate/Accelerate.h>
 #import <pthread.h>
 #import <stdio.h>
@@ -37,6 +38,8 @@ struct SckCapture {
     enum AVSampleFormat     audio_fmt;
 
     void                   *stream;       /* CFBridgingRetain of SCStream */
+    dispatch_queue_t        sample_queue;  /* retained — must outlive local scope */
+    void                   *helper;        /* _SckStreamHelper — retained (stream may hold weak ref) */
     int                     width;
     int                     height;
     pthread_mutex_t         lock;
@@ -160,11 +163,6 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
     (void)stream;
     SckCapture *c = _capture;
     if (!c || c->stopped) return;
-
-    static int dbg_frame = 0;
-    dbg_frame++;
-    if (dbg_frame <= 3 || dbg_frame % 60 == 0)
-        fprintf(stderr, "sck: callback #%d type=%ld\n", dbg_frame, (long)type);
 
     if (type == SCStreamOutputTypeScreen) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
@@ -355,8 +353,20 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
             break;
         }
 
-        /* ── pick first display ── */
-        SCDisplay *display = [content.displays firstObject];
+        /* ── pick display: prefer one containing mouse, else largest ── */
+        SCDisplay *display = nil;
+        CGPoint mouse = [NSEvent mouseLocation];
+        CGFloat bestArea = 0;
+        for (SCDisplay *d in content.displays) {
+            CGFloat area = d.frame.size.width * d.frame.size.height;
+            if (area > bestArea) { bestArea = area; display = d; }
+            if (CGRectContainsPoint(d.frame, mouse)) {
+                display = d;
+                break;
+            }
+        }
+        if (!display)
+            display = [content.displays firstObject];
         if (!display) {
             fprintf(stderr, "sck_capture: no display found\n");
             break;
@@ -401,6 +411,7 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
         /* ── stream output delegate ── */
         _SckStreamHelper *helper = [[_SckStreamHelper alloc] init];
         helper.capture = c;
+        c->helper = (void *)CFBridgingRetain(helper); /* retain for struct lifetime */
 
         dispatch_queue_t sq = dispatch_queue_create(
             "screencast.sck.samples", DISPATCH_QUEUE_SERIAL);
@@ -408,6 +419,7 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
             fprintf(stderr, "sck_capture: could not create sample queue\n");
             break;
         }
+        c->sample_queue = sq;   /* prevent ARC release after scope exit */
 
         NSError *addErr = nil;
         if (![stream addStreamOutput:helper
@@ -564,6 +576,11 @@ void sck_capture_close(SckCapture *c)
         c->stream = NULL;
     }
 
+    if (c->helper) {
+        CFBridgingRelease(c->helper);
+        c->helper = NULL;
+    }
+
     for (int i = 0; i < VIDEO_QUEUE_DEPTH; i++)
         av_frame_free(&c->video_queue[i]);
 
@@ -571,5 +588,6 @@ void sck_capture_close(SckCapture *c)
         free(c->audio_planes[i]);
 
     pthread_mutex_destroy(&c->lock);
+    c->sample_queue = nil;  /* release dispatch queue before freeing struct */
     free(c);
 }

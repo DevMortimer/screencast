@@ -280,17 +280,10 @@ static void recording_loop(void)
            the stop condition is checked promptly). */
         AVFrame *screen = sck_capture_grab_video(s_rec.sck);
         if (!screen) {
-            /* NULL can mean timeout (still recording) or actual stop.
-               Re-check the stop condition before breaking. */
             if (!atomic_load(&g_running) || !atomic_load(&g_recording))
                 break;
-            continue;  /* timeout — retry */
+            continue;
         }
-
-        static int frame_nr = 0;
-        frame_nr++;
-        if (frame_nr % 30 == 0)
-            fprintf(stderr, "[REC] frame %d (mode %d)\n", frame_nr, (int)mode);
 
         /* Grab desktop audio (non-blocking) */
         if (s_rec.has_desktop && s_rec.mixer) {

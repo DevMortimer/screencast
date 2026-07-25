@@ -32,7 +32,7 @@ static int drain_encoder(EncoderCtx *enc, AVCodecContext *ctx, AVStream *st)
         pthread_mutex_unlock(&enc->write_mutex);
 
         av_packet_unref(pkt);
-        if (wr < 0) { av_packet_free(&pkt); return wr; }
+        if (wr < 0) { av_packet_free(&pkt); fprintf(stderr, "encoder: write error %d\n", wr); return wr; }
     }
     av_packet_free(&pkt);
     return (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) ? 0 : ret;
@@ -43,8 +43,7 @@ static int drain_encoder(EncoderCtx *enc, AVCodecContext *ctx, AVStream *st)
 static int setup_video(EncoderCtx *enc, int w, int h, int fps)
 {
 #ifdef __APPLE__
-    /* libx264 is the reliable fallback while debugging VideoToolbox integration */
-    const char *codec_name = "libx264";
+    const char *codec_name = "h264_videotoolbox";
 #else
     const char *codec_name = "h264_nvenc";
 #endif
@@ -95,16 +94,8 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     av_opt_set(enc->vid_enc->priv_data, "qp",      qp,       0);
     av_opt_set(enc->vid_enc->priv_data, "surfaces","16",     0);
 #else
-    /* x264: ultrafast preset for real-time capture, CRF 18 for quality */
-    av_opt_set(enc->vid_enc->priv_data, "preset",    "ultrafast", 0);
-    av_opt_set(enc->vid_enc->priv_data, "crf",       "18",        0);
-    av_opt_set(enc->vid_enc->priv_data, "tune",      "zerolatency", 0);
-    av_opt_set(enc->vid_enc->priv_data, "profile",   "high",      0);
-    av_opt_set(enc->vid_enc->priv_data, "level",     "4.0",        0);
-    /* Force immediate output: no lookahead, no scene-cut delay */
-    av_opt_set(enc->vid_enc->priv_data, "rc-lookahead", "0",  0);
-    av_opt_set(enc->vid_enc->priv_data, "sc_threshold", "0",  0);
-    av_opt_set(enc->vid_enc->priv_data, "x264-params",  "stitchable=1", 0);
+    /* VideoToolbox: real-time hardware encoding */
+    av_opt_set(enc->vid_enc->priv_data, "realtime",  "1", 0);
 #endif
 
     int ret = avcodec_open2(enc->vid_enc, codec, NULL);
@@ -495,7 +486,6 @@ int encoder_write_video(EncoderCtx *enc, int mode,
 
     int ret = avcodec_send_frame(enc->vid_enc, enc->vid_frame);
     while (ret == AVERROR(EAGAIN)) {
-        /* Encoder queue full — drain pending packets and retry. */
         int dr = drain_encoder(enc, enc->vid_enc, enc->vid_stream);
         if (dr < 0) return dr;
         ret = avcodec_send_frame(enc->vid_enc, enc->vid_frame);
