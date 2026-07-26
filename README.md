@@ -199,9 +199,13 @@ Only these environment variables apply on macOS:
 |---|---|---|
 | `SCREENCAST_DRAW_MOUSE` | `1` | Composite the cursor into the recording; set to `0` to hide it. |
 | `SCREENCAST_DESKTOP_AUDIO` | `1` | Mix desktop audio into the track; set to `0` to record microphone only. |
-| `SCREENCAST_WEBCAM_DEV` | `auto` | Camera target (device UID or name), or `auto` for the system default. |
+| `SCREENCAST_SCALE` | display's native scale | Pixels captured per point of display geometry. Defaults to the panel's own backing-store ratio, which on a scaled HiDPI mode is often not a round `2` — 1440x900 points on a 2560x1600 panel is 1.78. Set `1` to capture at point size, as before. Clamped to the native scale: asking for more cannot add detail. |
 | `SCREENCAST_CAM_FPS` | `30` | Preferred webcam frame rate. |
-| `SCREENCAST_CAM_SIZE` | `640x360` | Preferred webcam capture size. Low default keeps encoding fast and audio in sync. |
+| `SCREENCAST_CAM_SIZE` | `1920x1080` | Preferred webcam capture size. 1080p is the largest most USB-C cameras deliver as raw NV12; above it they switch to MJPEG and cost a JPEG decode on every frame. |
+| `SCREENCAST_CAM_OFFSET_MS` | `0` | Shift webcam frames against the screen, in milliseconds, if your camera's timestamps are biased. Normally unnecessary — frames are matched to the screen frame they were captured with. |
+
+`SCREENCAST_WEBCAM_DEV` is ignored on macOS: AVFoundation fans the camera out
+natively, so there is nothing to select between.
 
 Example:
 
