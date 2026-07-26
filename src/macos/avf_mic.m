@@ -285,7 +285,7 @@ static int asbd_to_avfmt(const AudioStreamBasicDescription *asbd,
     }
 
     /* ---- enqueue ---- */
-    CMTime cmpts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    CMTime cmpts = CMSampleBufferGetPresentationTimeStamp(sbuf);
     int64_t pts = CMTIME_IS_VALID(cmpts)
         ? CMTimeConvertScale(cmpts, 1000000,
                              kCMTimeRoundingMethod_Default).value
