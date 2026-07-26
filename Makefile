@@ -114,6 +114,20 @@ clean:
 TEST_BIN  := $(OBJDIR)/test_arbiter
 TEST_SRCS := tests/test_arbiter.c src/linux/arbiter.c
 
+# VideoToolbox hardware-frame probe (macOS only).  Standalone: verifies that
+# h264_videotoolbox accepts CVPixelBuffers by reference, both from libav's own
+# hardware pool and wrapped from an external source.  Links nothing from src/.
+PROBE_BIN := $(OBJDIR)/vt_hwframe_probe
+
+probe: | $(OBJDIR)
+ifeq ($(PLATFORM),macos)
+	$(CC) $(CFLAGS) -fobjc-arc -o $(PROBE_BIN) tests/vt_hwframe_probe.m \
+	    $(LDFLAGS) -framework CoreVideo
+	@echo "built $(PROBE_BIN)"
+else
+	@echo "probe is macOS only"
+endif
+
 ifneq ($(PLATFORM),macos)
 test: | $(OBJDIR)
 	$(CC) -Isrc -Isrc/linux -pthread -O2 -Wall -Wextra -std=c11 \
@@ -124,4 +138,4 @@ test:
 	@echo "No tests on macOS yet"
 endif
 
-.PHONY: all clean test
+.PHONY: all clean test probe
