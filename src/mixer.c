@@ -45,11 +45,15 @@ static void log_err(const char *label, int ret)
 #define MIX_SILENCE_GRACE_US (120 * 1000LL)
 
 /*
- * How much a source may buffer before samples are discarded.  With the grace
- * above keeping the mix moving this should never be reached; it is a backstop,
- * not a policy.  Costs ~384 kB per source.
+ * How much a source may buffer before samples are discarded.
+ *
+ * A backstop, not a policy: the covering above is what keeps the mix level with
+ * real time, and while it works nothing accumulates this far.  It is kept small
+ * anyway because this value *is* the worst-case freeze — whatever a source is
+ * allowed to buffer is how far the mixed track can fall behind, and the muxer
+ * turns that into exactly that much frozen video.
  */
-#define MIX_BOUND_MS 1000
+#define MIX_BOUND_MS 500
 
 struct MixerCtx {
     int             active[MIX_SRC_COUNT];
@@ -58,8 +62,9 @@ struct MixerCtx {
     int64_t         anchor_us[MIX_SRC_COUNT]; /* pts of the source's sample 0 */
     int64_t         written[MIX_SRC_COUNT];   /* canonical samples since anchor,
                                                  inserted silence included */
-    int64_t         covered_us[MIX_SRC_COUNT];/* clock instant this source's
-                                                 content accounts up to */
+    int64_t         start_us[MIX_SRC_COUNT];  /* clock instant this source
+                                                 primed; written[] is measured
+                                                 against time elapsed since */
     int64_t       (*now_us)(void);         /* clock; swapped out by tests */
     SwrContext     *swr[MIX_SRC_COUNT];   /* source → canonical, lazily built */
     AVAudioFifo    *fifo[MIX_SRC_COUNT];  /* canonical stereo FLTP, bounded */
@@ -153,33 +158,41 @@ static void mixer_drain_locked(MixerCtx *m)
     /*
      * Cover for a source that is not delivering *now*.
      *
-     * A source that has gone quiet for longer than the grace is, as far as the
-     * recording is concerned, silent — so write that silence and let the mix
-     * keep moving.  Without this the min() below sits at zero for as long as
-     * the source is away, the mixed track stops, and because the muxer holds
-     * video until audio covers the same span, the picture freezes with it.
+     * The test is whether a source's *content* has kept up with real time, not
+     * whether it has gone quiet.  That distinction is the bug this was rewritten
+     * for: desktop audio never goes silent, it delivers steadily but with less
+     * than a second of audio per second of recording.  min() then tracks the
+     * short source, the other backs up to its bound, and the whole mixed track
+     * drifts behind real time by that much.
+     *
+     * Audio that is merely *late* still plays back perfectly — every sample is
+     * there — so nothing is audible.  The damage lands on video: the muxer holds
+     * video packets until audio covers the same span, so a mix running a second
+     * behind freezes the picture for a second.  Bounding this bounds that.
      *
      * The measure is elapsed time on the clock, never how deep a buffer looks.
      * That distinction is the whole correctness of this function.  Silence
      * inserted for a timestamp gap makes a buffer deeper without any time
      * having passed, so a depth-based rule reads a *healthy* source as lagging
      * and injects a gap it never had — turning one source's loss into a shift
-     * of the entire mix.  Elapsed time cannot be forged that way: a source that
-     * is still delivering is never behind here, whatever its buffer looks like.
+     * of the entire mix.  Elapsed time cannot be forged that way: padding moves
+     * a source's content forward, so a source that jumped is ahead here, never
+     * behind, and its peers are left alone.
      *
      * Padding advances written[], so a source that comes back with timestamps
      * finds the hole already filled and does not fill it twice.
      */
     for (int i = 0; i < MIX_SRC_COUNT; i++) {
         if (!m->active[i] || !m->primed[i]) continue;
-        int64_t behind_us = now - m->covered_us[i];
-        if (behind_us < MIX_SILENCE_GRACE_US) continue;
+        int64_t elapsed_us = now - m->start_us[i];
+        int64_t content_us = av_rescale(m->written[i], 1000000, MIX_SAMPLE_RATE);
+        int64_t short_us   = elapsed_us - content_us;
+        if (short_us < MIX_SILENCE_GRACE_US) continue;
         if (m->debug)
-            fprintf(stderr, "mixer: source %d quiet for %lldms — covering\n",
-                    i, (long long)(behind_us / 1000));
+            fprintf(stderr, "mixer: source %d is %lldms short of real time — "
+                            "covering\n", i, (long long)(short_us / 1000));
         mixer_pad_silence_locked(m, (MixSource)i,
-                                 av_rescale(behind_us, MIX_SAMPLE_RATE, 1000000));
-        m->covered_us[i] = now;
+                                 av_rescale(short_us, MIX_SAMPLE_RATE, 1000000));
     }
 
     /* Loop: a large run of inserted silence can exceed one output frame, and
@@ -360,14 +373,12 @@ int mixer_feed(MixerCtx *m, MixSource src, AVFrame *raw,
                                       res->nb_samples);
         if (put > 0) m->written[src] += put;
         if (!m->primed[src]) {
-            m->primed[src] = 1;
+            m->primed[src]  = 1;
+            m->start_us[src] = m->now_us();
             if (m->debug)
                 fprintf(stderr, "mixer: source %d primed (first samples)\n", src);
         }
-        /* Delivered, so this source accounts for the timeline up to now and
-           owes no silence. */
         m->last_feed_us[src] = m->now_us();
-        m->covered_us[src]   = m->last_feed_us[src];
     }
     av_frame_free(&res);
 
@@ -424,7 +435,7 @@ void mixer_set_clock(MixerCtx *m, int64_t (*now_us)(void))
     if (!m || !now_us) return;
     pthread_mutex_lock(&m->lock);
     m->now_us = now_us;
-    for (int i = 0; i < MIX_SRC_COUNT; i++) m->covered_us[i] = now_us();
+    for (int i = 0; i < MIX_SRC_COUNT; i++) m->start_us[i] = now_us();
     pthread_mutex_unlock(&m->lock);
 }
 

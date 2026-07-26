@@ -313,6 +313,49 @@ static void test_one_sources_gap_is_not_the_mixs_shift(void)
     mixer_destroy(m);
 }
 
+/*
+ * The freeze regression, in the shape that actually occurred.
+ *
+ * A source that delivers steadily but short of real time — desktop audio, which
+ * only has samples while something is playing — drags min() down with it.  The
+ * other source then backs up against its bound and the whole mix falls behind
+ * real time.  Nothing is audible, because late audio still plays back intact;
+ * the cost lands on video, which the muxer holds back to match.
+ */
+static void test_short_source_does_not_drag_the_mix_late(void)
+{
+    fprintf(stderr, "test_short_source_does_not_drag_the_mix_late\n");
+    sink_reset();
+
+    int active[MIX_SRC_COUNT] = { [MIX_SRC_MIC] = 1, [MIX_SRC_DESKTOP] = 1 };
+    MixerCtx *m = mixer_create(active, sink_fn, NULL);
+    assert(m);
+    g_now_us = 0;
+    mixer_set_clock(m, test_now_us);
+
+    feed(m, MIX_SRC_MIC,     MS(10), 0.5f,  0);
+    feed(m, MIX_SRC_DESKTOP, MS(10), 0.25f, 0);
+
+    /* Two seconds of recording.  The mic keeps up; desktop delivers on every
+       tick but only half a tick's worth of audio each time. */
+    for (int i = 1; i <= 200; i++) {
+        advance(10);
+        feed(m, MIX_SRC_MIC,     MS(10), 0.5f,  US(10 * i));
+        feed(m, MIX_SRC_DESKTOP, MS(5),  0.25f, AV_NOPTS_VALUE);
+    }
+
+    /*
+     * The mix must track real time to within the grace.  Unbounded, it ends up
+     * a full second behind — and a second of audio lag is a second of frozen
+     * video once the muxer interleaves it.
+     */
+    int64_t behind = MS(2010) - g_sink.n;
+    CHECK(behind <= MS(120), "mix fell %lldms behind real time",
+          (long long)(behind * 1000 / SR));
+
+    mixer_destroy(m);
+}
+
 int main(void)
 {
     test_gap_becomes_silence();
@@ -320,6 +363,7 @@ int main(void)
     test_no_pts_never_pads();
     test_quiet_source_does_not_freeze_the_mix();
     test_one_sources_gap_is_not_the_mixs_shift();
+    test_short_source_does_not_drag_the_mix_late();
 
     for (int c = 0; c < MIX_CHANNELS; c++) free(g_sink.ch[c]);
 
