@@ -19,7 +19,9 @@
 
 /* ── constants ─────────────────────────────────────────────── */
 
-#define VIDEO_QUEUE_DEPTH   8
+/* ~1 s at 30 fps.  Deep enough to absorb the record loop briefly holding a
+   frame back while it waits for the matching webcam frame to arrive. */
+#define VIDEO_QUEUE_DEPTH   32
 #define AUDIO_INIT_SAMPLES  (1024 * 8)
 #define SCK_TARGET_FPS      30
 

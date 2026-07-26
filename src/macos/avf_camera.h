@@ -29,8 +29,12 @@ typedef struct {
  * Called from the capture queue with each newly captured frame.
  * The AVFrame is heap-allocated and ownership passes to the callback, which
  * must eventually av_frame_free() it.
+ *
+ * pts_us is the frame's timestamp on the session timeline, so callers can
+ * match a camera frame against the screen frame it belongs beside rather than
+ * assuming the most recent one is contemporaneous with it.
  */
-typedef void (*AvfCameraFrameFn)(void *user, AVFrame *frame);
+typedef void (*AvfCameraFrameFn)(void *user, AVFrame *frame, int64_t pts_us);
 
 /*
  * Open the default (or specified) camera and start capture.
@@ -47,6 +51,13 @@ typedef void (*AvfCameraFrameFn)(void *user, AVFrame *frame);
 AvfCamera *avf_camera_open(const char *target, int want_w, int want_h,
                            int want_fps, AvfCameraInfo *info,
                            AvfCameraFrameFn on_frame, void *user);
+
+/*
+ * Anchor the session timeline and discard everything captured before it.
+ * Cameras take several hundred milliseconds to start delivering, so frames
+ * from that window belong to setup rather than to the recording.
+ */
+void avf_camera_start_session(AvfCamera *cam, int64_t t0_us);
 
 /*
  * Stop capture and release all resources.  Blocks until the capture queue

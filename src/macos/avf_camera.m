@@ -42,6 +42,10 @@ struct AvfCamera {
     volatile int       firstFrameReceived;
     volatile int       captureError;
 
+    /* Session timeline — see avf_camera_start_session(). */
+    volatile int64_t   t0_us;
+    volatile int       session_started;
+
     /* User-facing callback. */
     AvfCameraFrameFn   on_frame;
     void              *user;
@@ -205,8 +209,19 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
 
     /* Deliver the frame (ownership passes to the callback). */
+    CMTime cmpts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    int64_t pts = CMTIME_IS_VALID(cmpts)
+        ? CMTimeConvertScale(cmpts, 1000000,
+                             kCMTimeRoundingMethod_Default).value
+        : 0;
+
+    if (!cam->session_started || pts < cam->t0_us) {
+        av_frame_free(&avf);
+        return;
+    }
+
     if (cam->on_frame)
-        cam->on_frame(cam->user, avf);
+        cam->on_frame(cam->user, avf, pts - cam->t0_us);
     else
         av_frame_free(&avf);
 }
@@ -214,6 +229,13 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 @end
 
 #pragma mark - Camera device selection
+
+void avf_camera_start_session(AvfCamera *cam, int64_t t0_us)
+{
+    if (!cam) return;
+    cam->t0_us           = t0_us;
+    cam->session_started = 1;
+}
 
 /* Find an AVCaptureDevice matching `target`.
    - NULL / "" / "auto"  → default video camera

@@ -30,12 +30,34 @@
 /* ── shared state ──────────────────────────────────────────── */
 
 /*
- * Latest decoded webcam frame.  Updated by the AVFoundation capture callback,
- * read by the record thread.  Protected by s_cam_mutex.
+ * Recent webcam frames, kept with their timestamps so the record loop can pick
+ * the one that belongs beside a given screen frame.
+ *
+ * Taking "the most recent frame" instead — which is what this used to do —
+ * pairs the screen with whatever the camera happened to have delivered by
+ * then.  Camera pipelines run tens of milliseconds behind the display, and by
+ * a margin that moves with exposure time, so the face ends up consistently
+ * behind the voice by a wobbling amount.
  */
-static pthread_mutex_t s_cam_mutex  = PTHREAD_MUTEX_INITIALIZER;
-static AVFrame        *s_cam_latest = NULL;
-static atomic_llong    s_cam_seq    = 0;
+#define CAM_RING_DEPTH   24              /* ~800 ms at 30 fps */
+#define CAM_MATCH_LAG_US (250 * 1000LL)  /* how long to wait for a later frame */
+
+static pthread_mutex_t s_cam_mutex = PTHREAD_MUTEX_INITIALIZER;
+static AVFrame        *s_cam_ring[CAM_RING_DEPTH];
+static int64_t         s_cam_ring_pts[CAM_RING_DEPTH];
+static int             s_cam_ring_head;
+static int             s_cam_ring_count;
+
+/*
+ * Correction for cameras that timestamp on arrival rather than on exposure.
+ *
+ * USB cameras generally stamp a buffer when the host receives it, by which
+ * point the image is already however old the sensor readout and transport
+ * made it.  There is no way to interrogate a UVC device for that figure, so
+ * it is a manual constant: record a hand clap, find the offset between the
+ * sound and the picture, and set it once for that camera.
+ */
+static int64_t s_cam_offset_us;
 
 /* Signal between main and capture threads: 1 while file is open. */
 static atomic_int s_rec_open = 0;
@@ -91,14 +113,82 @@ static void make_output_path(char *buf, size_t n)
 
 /* ── webcam frame callback (AVFoundation delivery queue) ───── */
 
-static void cam_frame_cb(void *user, AVFrame *frame)
+static void cam_frame_cb(void *user, AVFrame *frame, int64_t pts_us)
 {
     (void)user;
     pthread_mutex_lock(&s_cam_mutex);
-    if (s_cam_latest) av_frame_free(&s_cam_latest);
-    s_cam_latest = frame;
-    atomic_fetch_add(&s_cam_seq, 1);
+
+    if (s_cam_ring_count >= CAM_RING_DEPTH) {
+        av_frame_free(&s_cam_ring[s_cam_ring_head]);
+        s_cam_ring_head = (s_cam_ring_head + 1) % CAM_RING_DEPTH;
+        s_cam_ring_count--;
+    }
+
+    int tail = (s_cam_ring_head + s_cam_ring_count) % CAM_RING_DEPTH;
+    s_cam_ring[tail]     = frame;
+    s_cam_ring_pts[tail] = pts_us - s_cam_offset_us;
+    s_cam_ring_count++;
+
     pthread_mutex_unlock(&s_cam_mutex);
+}
+
+static void cam_ring_clear(void)
+{
+    pthread_mutex_lock(&s_cam_mutex);
+    for (int i = 0; i < CAM_RING_DEPTH; i++)
+        av_frame_free(&s_cam_ring[i]);
+    s_cam_ring_head = s_cam_ring_count = 0;
+    pthread_mutex_unlock(&s_cam_mutex);
+}
+
+/*
+ * Pick the webcam frame closest in time to `target_us`, returning a new
+ * reference and reporting the chosen frame's timestamp in *out_pts (which
+ * doubles as its identity, so the encoder can tell when the same frame is
+ * being composited again).
+ *
+ * Briefly waits for a frame *later* than the target to show up before
+ * choosing.  Without that the ring only ever holds frames older than the
+ * target and the nearest match is always the newest one — which is the
+ * behaviour this is meant to replace.  The wait costs a quarter second of
+ * latency between capture and encode; for a recorder that is invisible.
+ */
+static AVFrame *cam_pick_nearest(int64_t target_us, int64_t *out_pts)
+{
+    int64_t deadline = sck_host_time_us() + CAM_MATCH_LAG_US;
+
+    for (;;) {
+        pthread_mutex_lock(&s_cam_mutex);
+
+        int best = -1;
+        int64_t best_dist = INT64_MAX;
+        int have_later = 0;
+
+        for (int i = 0; i < s_cam_ring_count; i++) {
+            int idx = (s_cam_ring_head + i) % CAM_RING_DEPTH;
+            int64_t d = s_cam_ring_pts[idx] - target_us;
+            if (d >= 0) have_later = 1;
+            if (d < 0) d = -d;
+            if (d < best_dist) { best_dist = d; best = idx; }
+        }
+
+        if (best >= 0 && (have_later || sck_host_time_us() >= deadline)) {
+            AVFrame *out = av_frame_alloc();
+            if (out && av_frame_ref(out, s_cam_ring[best]) < 0)
+                av_frame_free(&out);
+            if (out && out_pts) *out_pts = s_cam_ring_pts[best];
+            pthread_mutex_unlock(&s_cam_mutex);
+            return out;
+        }
+
+        pthread_mutex_unlock(&s_cam_mutex);
+
+        if (sck_host_time_us() >= deadline) return NULL;
+        if (!atomic_load(&g_running) || !atomic_load(&s_rec_open)) return NULL;
+
+        struct timespec nap = { .tv_nsec = 2000000L }; /* 2 ms */
+        nanosleep(&nap, NULL);
+    }
 }
 
 /* ── mixed audio delivered to the encoder ──────────────────── */
@@ -327,10 +417,18 @@ static int recording_open(void)
      * Fixing t0 once, after the last source is live, is what stops any one
      * track from entering with a head start on the others.
      */
+    const char *cam_off = getenv("SCREENCAST_CAM_OFFSET_MS");
+    s_cam_offset_us = (cam_off && cam_off[0]) ? atoll(cam_off) * 1000LL : 0;
+    if (s_cam_offset_us)
+        fprintf(stderr, "[REC] Webcam offset: %lldms\n",
+                (long long)(s_cam_offset_us / 1000));
+
+    cam_ring_clear();
     s_rec.t0_us = sck_host_time_us();
     atomic_store(&s_rec.audio_anchor_us, -1);
     sck_capture_start_session(s_rec.sck, s_rec.t0_us);
     if (s_rec.avf_mic) avf_mic_start_session(s_rec.avf_mic, s_rec.t0_us);
+    if (s_rec.avf_cam) avf_camera_start_session(s_rec.avf_cam, s_rec.t0_us);
 
     atomic_store(&s_rec_open, 1);
     return 0;
@@ -375,18 +473,11 @@ static void recording_loop(void)
             continue;
         }
 
-        /* Get latest webcam frame */
+        /* Pair this screen frame with the webcam frame captured alongside it */
         AVFrame *cam = NULL;
         int64_t cam_seq = -1;
-        if (want_cam) {
-            pthread_mutex_lock(&s_cam_mutex);
-            if (s_cam_latest) {
-                cam = av_frame_alloc();
-                av_frame_ref(cam, s_cam_latest);
-                cam_seq = atomic_load(&s_cam_seq);
-            }
-            pthread_mutex_unlock(&s_cam_mutex);
-        }
+        if (want_cam)
+            cam = cam_pick_nearest(screen_pts, &cam_seq);
 
         encoder_write_video(&s_rec.enc, mode, screen, cam, cam_seq, screen_pts);
         frames_encoded++;
@@ -457,10 +548,8 @@ static void recording_close(void)
     sck_capture_close(s_rec.sck);
     s_rec.sck = NULL;
 
-    /* Clear any remaining webcam frame */
-    pthread_mutex_lock(&s_cam_mutex);
-    if (s_cam_latest) { av_frame_free(&s_cam_latest); s_cam_latest = NULL; }
-    pthread_mutex_unlock(&s_cam_mutex);
+    /* Clear any remaining webcam frames */
+    cam_ring_clear();
 
     printf("[REC] Capture stopped.\n");
     printf("[REC] Output: %s\n", s_rec.output_path);
