@@ -257,19 +257,23 @@ static AVCaptureDevice *find_device(const char *target)
 }
 
 /* Try to match a device format for the given dimensions and frame rate.
-   Returns the first exact match, or nil. */
+   Returns the closest match by area (not just exact), or nil if no formats
+   at all.  When want_w/want_h are 0 the device default is left alone. */
 static AVCaptureDeviceFormat *match_format(AVCaptureDevice *dev,
                                             int want_w, int want_h,
                                             int want_fps)
 {
     if (want_w <= 0 || want_h <= 0) return nil;
 
+    int64_t want_area = (int64_t)want_w * want_h;
+    AVCaptureDeviceFormat *best = nil;
+    int64_t best_diff = INT64_MAX;
+
     for (AVCaptureDeviceFormat *fmt in dev.formats) {
         CMVideoDimensions dims =
             CMVideoFormatDescriptionGetDimensions(
                 fmt.formatDescription);
-        if ((int)dims.width != want_w || (int)dims.height != want_h)
-            continue;
+        if (dims.width < 320 || dims.height < 240) continue;
         if (want_fps > 0) {
             BOOL supported = NO;
             for (AVFrameRateRange *r in
@@ -282,9 +286,24 @@ static AVCaptureDeviceFormat *match_format(AVCaptureDevice *dev,
             }
             if (!supported) continue;
         }
-        return fmt;
+
+        /* Prefer exact match; otherwise closest area (smaller is better
+           for screencast overlays — we scale down anyway). */
+        if ((int)dims.width == want_w && (int)dims.height == want_h) {
+            best = fmt;
+            break; /* exact match wins immediately */
+        }
+        int64_t area = (int64_t)dims.width * dims.height;
+        int64_t diff = llabs(area - want_area);
+        /* Slight bias toward smaller-than-requested: add 5% penalty when
+           the format is larger, so we prefer to scale down rather than up. */
+        if (area > want_area) diff = diff * 105 / 100;
+        if (diff < best_diff) {
+            best_diff = diff;
+            best = fmt;
+        }
     }
-    return nil;
+    return best;
 }
 
 /* Lock the device for configuration, set the format and/or frame rate. */
@@ -298,19 +317,34 @@ static int configure_device(AVCaptureDevice *dev,
         return -1;
     }
 
-    AVCaptureDeviceFormat *match = match_format(dev, want_w, want_h, want_fps);
-    if (match) {
-        dev.activeFormat = match;
-        if (want_fps > 0) {
-            /* Set the minimum and maximum to the same value to pin it. */
-            dev.activeVideoMinFrameDuration =
-                CMTimeMake(1, want_fps);
-            dev.activeVideoMaxFrameDuration =
-                CMTimeMake(1, want_fps);
+    if (want_w > 0 && want_h > 0) {
+        AVCaptureDeviceFormat *match = match_format(dev, want_w, want_h, want_fps);
+        if (match) {
+            CMVideoDimensions dims =
+                CMVideoFormatDescriptionGetDimensions(match.formatDescription);
+            fprintf(stderr, "avf_camera: matched format %dx%d (requested %dx%d)\n",
+                    dims.width, dims.height, want_w, want_h);
+            dev.activeFormat = match;
+        } else {
+            fprintf(stderr, "avf_camera: no matching format for %dx%d, "
+                    "keeping device default\n", want_w, want_h);
         }
     }
-    /* If no exact match, leave the default format (will be reported
-       from the first received frame). */
+
+    if (want_fps > 0) {
+        /* Find the frame-rate range that contains want_fps and pin to its
+           exact CMTime values — AVFoundation compares rational times exactly
+           and will throw if we supply a slightly different 1/fps value. */
+        AVCaptureDeviceFormat *active = dev.activeFormat;
+        for (AVFrameRateRange *r in active.videoSupportedFrameRateRanges) {
+            if (want_fps >= (int)r.minFrameRate &&
+                want_fps <= (int)r.maxFrameRate) {
+                dev.activeVideoMinFrameDuration = r.minFrameDuration;
+                dev.activeVideoMaxFrameDuration = r.minFrameDuration;
+                break;
+            }
+        }
+    }
 
     [dev unlockForConfiguration];
     return 0;

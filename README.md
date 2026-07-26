@@ -180,7 +180,7 @@ The recorder can be tuned with environment variables:
 | `SCREENCAST_DESKTOP_DEV` | `@DEFAULT_MONITOR@` | PulseAudio/PipeWire source for desktop audio. Override with a concrete monitor name from `pactl list sources` (e.g. `alsa_output.<…>.monitor`). |
 | `SCREENCAST_WEBCAM_DEV` | `auto` | PipeWire camera target (node name or serial), or `auto` for the system default camera. Not a `/dev/video*` path. |
 | `SCREENCAST_CAM_FPS` | `30` | Preferred webcam frame rate (a PipeWire negotiation hint). |
-| `SCREENCAST_CAM_SIZE` | `1280x720` | Preferred webcam capture size (a PipeWire negotiation hint; resolution defers to the shared camera stream when another app is also using the camera). |
+| `SCREENCAST_CAM_SIZE` | `640x360` | Preferred webcam capture size. Kept intentionally low by default — the corner overlay is ≤480 px and higher resolutions burn CPU/GPU on frames that get scaled down, which can push audio out of sync. Raise it if you need more webcam detail. |
 | `SCREENCAST_NVENC_CAPTURE_PRESET` | `p3` | NVENC preset for the real-time intermediate capture. |
 | `SCREENCAST_NVENC_CAPTURE_QP` | `12` | Constant QP for the intermediate capture. |
 | `SCREENCAST_NVENC_FINAL_PRESET` | `p7` | NVENC preset for the final render. |
@@ -201,7 +201,7 @@ Only these environment variables apply on macOS:
 | `SCREENCAST_DESKTOP_AUDIO` | `1` | Mix desktop audio into the track; set to `0` to record microphone only. |
 | `SCREENCAST_WEBCAM_DEV` | `auto` | Camera target (device UID or name), or `auto` for the system default. |
 | `SCREENCAST_CAM_FPS` | `30` | Preferred webcam frame rate. |
-| `SCREENCAST_CAM_SIZE` | `1280x720` | Preferred webcam capture size. |
+| `SCREENCAST_CAM_SIZE` | `640x360` | Preferred webcam capture size. Low default keeps encoding fast and audio in sync. |
 
 Example:
 

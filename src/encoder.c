@@ -262,9 +262,11 @@ int encoder_set_webcam(EncoderCtx *enc, int cam_src_w, int cam_src_h,
     enc->cam_main_y = (cam_src_h - enc->cam_main_h) / 2;
 
     int screen_flags = SWS_BILINEAR | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
-    int cam_full_flags = SWS_LANCZOS | SWS_ACCURATE_RND |
+    /* Webcam is secondary quality — use fast bilinear scaling (not Lanczos)
+       to keep the encode pipeline tight and audio in sync. */
+    int cam_full_flags = SWS_BILINEAR | SWS_ACCURATE_RND |
                          SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
-    int cam_overlay_flags = SWS_BICUBIC | SWS_ACCURATE_RND |
+    int cam_overlay_flags = SWS_BILINEAR | SWS_ACCURATE_RND |
                             SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP;
 
     enc->sws_cam_raw = sws_getContext(
@@ -488,6 +490,13 @@ int encoder_write_video(EncoderCtx *enc, int mode,
     }
 
     /* ── 4. Stamp PTS (microseconds since t0) and encode ── */
+    /* On the very first frame, reset t0 so the video PTS starts near 0.
+       Audio PTS is sample-count-based and also starts at 0, so this keeps
+       the two tracks aligned even when camera/screen init takes a while. */
+    if (!enc->vid_pts) {
+        enc->t0 = av_gettime_relative();
+        enc->vid_pts = 1;  /* mark first-frame handled */
+    }
     enc->vid_frame->pts = av_gettime_relative() - enc->t0;
 
     int ret = avcodec_send_frame(enc->vid_enc, enc->vid_frame);

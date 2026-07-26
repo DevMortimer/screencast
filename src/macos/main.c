@@ -166,7 +166,12 @@ static int recording_open(void)
     s_rec.cam_h = 0;
     s_rec.cam_fmt = AV_PIX_FMT_NONE;
 
-    int cam_w_hint = 0, cam_h_hint = 0, cam_fps_hint = 0;
+    /* Default webcam: 640x360 — the overlay is ≤480px and the webcam is
+       secondary.  A low default avoids burning CPU/GPU on high-res frames
+       that get scaled down anyway, and keeps the video PTS close to the
+       audio PTS (sample-count-based, drift-free).  Override with
+       SCREENCAST_CAM_SIZE=WxH if you need higher webcam quality. */
+    int cam_w_hint = 640, cam_h_hint = 360, cam_fps_hint = 30;
     const char *size = getenv("SCREENCAST_CAM_SIZE");
     if (size && size[0]) sscanf(size, "%dx%d", &cam_w_hint, &cam_h_hint);
     const char *fps = getenv("SCREENCAST_CAM_FPS");
