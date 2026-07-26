@@ -19,8 +19,15 @@
 typedef struct SckCapture SckCapture; // opaque
 
 typedef struct {
-    int                width;
-    int                height;
+    int                width;          // pixels
+    int                height;         // pixels
+    /*
+     * Pixels captured per point of display geometry (see SCREENCAST_SCALE).
+     * width/height are already in pixels; this is here so that callers placing
+     * overlays can size them in points and have them occupy the same fraction
+     * of the frame whatever scale the capture ended up at.
+     */
+    double             scale;
     enum AVPixelFormat pix_fmt;       // BGRA expected
     int                sample_rate;   // audio sample rate, 0 if no audio
     int                channels;      // audio channels, 0 if no audio

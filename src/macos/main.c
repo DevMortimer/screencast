@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -421,14 +422,25 @@ static int recording_open(void)
      * Fixing t0 once, after the last source is live, is what stops any one
      * track from entering with a head start on the others.
      */
-    /* Overlay geometry mirrors the encoder's: a quarter of the canvas width,
-       capped at 480 px, inset 20 px from the bottom-right corner. */
+    /*
+     * Overlay geometry: a quarter of the canvas width, capped at 480 points,
+     * inset 20 points from the bottom-right corner.
+     *
+     * The cap and the inset are defined in points and scaled with the capture,
+     * so the camera keeps the same apparent size and margin however many pixels
+     * per point the display turned out to have.  Left in raw pixels they would
+     * halve on a Retina panel, which is the whole difference between an overlay
+     * that reads and one that does not.
+     */
+    double scale = sck_info.scale > 0.0 ? sck_info.scale : 1.0;
+    int overlay_cap = (int)lround(480.0 * scale);
+    int inset       = (int)lround(20.0 * scale);
     int overlay = s_rec.canvas_w / 4;
-    if (overlay > 480) overlay = 480;
+    if (overlay > overlay_cap) overlay = overlay_cap;
     s_rec.comp = metal_compositor_create(s_rec.canvas_w, s_rec.canvas_h,
                                          overlay,
-                                         s_rec.canvas_w - overlay - 20,
-                                         s_rec.canvas_h - overlay - 20);
+                                         s_rec.canvas_w - overlay - inset,
+                                         s_rec.canvas_h - overlay - inset);
     if (!s_rec.comp)
         fprintf(stderr, "main: compositor unavailable — "
                         "webcam overlay disabled\n");

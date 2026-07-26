@@ -12,6 +12,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <AppKit/AppKit.h>
 #import <Accelerate/Accelerate.h>
+#import <math.h>
 #import <pthread.h>
 #import <stdio.h>
 #import <stdlib.h>
@@ -60,8 +61,9 @@ struct SckCapture {
     dispatch_queue_t        audio_queue;   /* separate: video memcpy must not
                                               back up audio delivery */
     void                   *helper;        /* _SckStreamHelper — retained (stream may hold weak ref) */
-    int                     width;
-    int                     height;
+    int                     width;         /* pixels */
+    int                     height;        /* pixels */
+    double                  scale;         /* pixels per point actually captured */
     pthread_mutex_t         lock;
     SckCaptureInfo          info;
     int                     stopped;
@@ -97,6 +99,63 @@ static int64_t sample_pts_us(CMSampleBufferRef sb)
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
     if (!CMTIME_IS_VALID(pts)) return sck_host_time_us();
     return CMTimeConvertScale(pts, 1000000, kCMTimeRoundingMethod_Default).value;
+}
+
+/*
+ * How many pixels to capture per point of display geometry.
+ *
+ * SCDisplay.frame is in *points*; SCStreamConfiguration.width/height are in
+ * pixels.  Configuring the stream straight from the frame therefore asks a
+ * Retina panel for a downscaled capture — a 2560x1600 display reporting
+ * 1440x900 points was recorded at 56% of its linear resolution, and text is the
+ * first thing that costs.
+ *
+ * The default is the display's real backing store: the ratio between the
+ * current mode's pixel width and its point width.  On the scaled HiDPI modes
+ * people actually run this is not 2 — 1440x900 points on a 2560x1600 panel is
+ * 1.78 — and taking the measured value rather than assuming 2 captures the
+ * panel's own pixels instead of a larger framebuffer the display would only
+ * resample back down again.
+ *
+ * SCREENCAST_SCALE overrides it; 1 restores the old point-sized capture.
+ * Values above the native scale are clamped, because upscaling costs encode
+ * bandwidth and memory without adding any detail.
+ */
+static double display_capture_scale(CGDirectDisplayID did)
+{
+    double native = 1.0;
+
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(did);
+    if (mode) {
+        size_t px = CGDisplayModeGetPixelWidth(mode);
+        size_t pt = CGDisplayModeGetWidth(mode);
+        if (px > 0 && pt > 0) native = (double)px / (double)pt;
+        CGDisplayModeRelease(mode);
+    }
+    if (native < 1.0) native = 1.0;
+
+    double scale = native;
+    const char *env = getenv("SCREENCAST_SCALE");
+    if (env && env[0]) {
+        double v = atof(env);
+        if (v > 0.0) {
+            scale = v;
+        } else {
+            fprintf(stderr, "sck_capture: ignoring SCREENCAST_SCALE=%s "
+                            "(not a positive number)\n", env);
+        }
+    }
+    if (scale > native) scale = native;
+    return scale;
+}
+
+/* Points → pixels, rounded to an even count.  NV12 subsamples chroma 2x2, so
+   an odd dimension has no valid chroma plane. */
+static int scaled_even(int points, double scale)
+{
+    long v = lround((double)points * scale);
+    if (v < 2) v = 2;
+    return (int)(v & ~1L);
 }
 
 /* Did anything on screen actually change?  SCK re-delivers the previous surface
@@ -403,15 +462,21 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
         }
 
         CGRect db = display.frame;
-        c->width  = (int)CGRectGetWidth(db);
-        c->height = (int)CGRectGetHeight(db);
-        fprintf(stderr, "[REC] Display: id %u, %dx%d at (%d,%d)\n",
-                (unsigned)display.displayID, c->width, c->height,
-                (int)CGRectGetMinX(db), (int)CGRectGetMinY(db));
-        if (c->width <= 0 || c->height <= 0) {
+        int pt_w = (int)CGRectGetWidth(db);
+        int pt_h = (int)CGRectGetHeight(db);
+        if (pt_w <= 0 || pt_h <= 0) {
             fprintf(stderr, "sck_capture: invalid display dimensions\n");
             break;
         }
+
+        c->scale  = display_capture_scale(display.displayID);
+        c->width  = scaled_even(pt_w, c->scale);
+        c->height = scaled_even(pt_h, c->scale);
+        fprintf(stderr, "[REC] Display: id %u, %dx%d px "
+                        "(%dx%d pt, scale %.2f) at (%d,%d)\n",
+                (unsigned)display.displayID, c->width, c->height,
+                pt_w, pt_h, c->scale,
+                (int)CGRectGetMinX(db), (int)CGRectGetMinY(db));
 
         /* ── content filter ── */
         SCContentFilter *filter =
@@ -520,6 +585,7 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
         if (info) {
             info->width   = c->width;
             info->height  = c->height;
+            info->scale   = c->scale;
             info->pix_fmt = AV_PIX_FMT_BGRA;
             if (c->audio_sample_rate > 0) {
                 info->sample_rate = c->audio_sample_rate;
