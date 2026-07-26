@@ -21,6 +21,8 @@
 #include "sck_capture.h"
 #include "avf_camera.h"
 #include "avf_mic.h"
+#include "metal_compositor.h"
+#include <CoreVideo/CoreVideo.h>
 
 /* ── configuration ─────────────────────────────────────────── */
 
@@ -43,7 +45,7 @@
 #define CAM_MATCH_LAG_US (250 * 1000LL)  /* how long to wait for a later frame */
 
 static pthread_mutex_t s_cam_mutex = PTHREAD_MUTEX_INITIALIZER;
-static AVFrame        *s_cam_ring[CAM_RING_DEPTH];
+static void           *s_cam_ring[CAM_RING_DEPTH];   /* CVPixelBufferRef */
 static int64_t         s_cam_ring_pts[CAM_RING_DEPTH];
 static int             s_cam_ring_head;
 static int             s_cam_ring_count;
@@ -70,6 +72,7 @@ typedef struct {
     AvfMic     *avf_mic;       /* microphone */
     EncoderCtx enc;
     MixerCtx  *mixer;          /* mixes mic + desktop into one track */
+    MetalCompositor *comp;     /* GPU compositing; NULL in display-only mode */
     int canvas_w, canvas_h;
     int cam_w, cam_h;
     enum AVPixelFormat cam_fmt;
@@ -113,19 +116,20 @@ static void make_output_path(char *buf, size_t n)
 
 /* ── webcam frame callback (AVFoundation delivery queue) ───── */
 
-static void cam_frame_cb(void *user, AVFrame *frame, int64_t pts_us)
+static void cam_frame_cb(void *user, void *pixbuf, int64_t pts_us)
 {
     (void)user;
     pthread_mutex_lock(&s_cam_mutex);
 
     if (s_cam_ring_count >= CAM_RING_DEPTH) {
-        av_frame_free(&s_cam_ring[s_cam_ring_head]);
+        avf_camera_release_frame(s_cam_ring[s_cam_ring_head]);
+        s_cam_ring[s_cam_ring_head] = NULL;
         s_cam_ring_head = (s_cam_ring_head + 1) % CAM_RING_DEPTH;
         s_cam_ring_count--;
     }
 
     int tail = (s_cam_ring_head + s_cam_ring_count) % CAM_RING_DEPTH;
-    s_cam_ring[tail]     = frame;
+    s_cam_ring[tail]     = pixbuf;   /* ownership taken */
     s_cam_ring_pts[tail] = pts_us - s_cam_offset_us;
     s_cam_ring_count++;
 
@@ -135,8 +139,10 @@ static void cam_frame_cb(void *user, AVFrame *frame, int64_t pts_us)
 static void cam_ring_clear(void)
 {
     pthread_mutex_lock(&s_cam_mutex);
-    for (int i = 0; i < CAM_RING_DEPTH; i++)
-        av_frame_free(&s_cam_ring[i]);
+    for (int i = 0; i < CAM_RING_DEPTH; i++) {
+        avf_camera_release_frame(s_cam_ring[i]);
+        s_cam_ring[i] = NULL;
+    }
     s_cam_ring_head = s_cam_ring_count = 0;
     pthread_mutex_unlock(&s_cam_mutex);
 }
@@ -153,7 +159,7 @@ static void cam_ring_clear(void)
  * behaviour this is meant to replace.  The wait costs a quarter second of
  * latency between capture and encode; for a recorder that is invisible.
  */
-static AVFrame *cam_pick_nearest(int64_t target_us, int64_t *out_pts)
+static void *cam_pick_nearest(int64_t target_us, int64_t *out_pts)
 {
     int64_t deadline = sck_host_time_us() + CAM_MATCH_LAG_US;
 
@@ -173,10 +179,8 @@ static AVFrame *cam_pick_nearest(int64_t target_us, int64_t *out_pts)
         }
 
         if (best >= 0 && (have_later || sck_host_time_us() >= deadline)) {
-            AVFrame *out = av_frame_alloc();
-            if (out && av_frame_ref(out, s_cam_ring[best]) < 0)
-                av_frame_free(&out);
-            if (out && out_pts) *out_pts = s_cam_ring_pts[best];
+            void *out = (void *)CFRetain(s_cam_ring[best]);
+            if (out_pts) *out_pts = s_cam_ring_pts[best];
             pthread_mutex_unlock(&s_cam_mutex);
             return out;
         }
@@ -417,6 +421,18 @@ static int recording_open(void)
      * Fixing t0 once, after the last source is live, is what stops any one
      * track from entering with a head start on the others.
      */
+    /* Overlay geometry mirrors the encoder's: a quarter of the canvas width,
+       capped at 480 px, inset 20 px from the bottom-right corner. */
+    int overlay = s_rec.canvas_w / 4;
+    if (overlay > 480) overlay = 480;
+    s_rec.comp = metal_compositor_create(s_rec.canvas_w, s_rec.canvas_h,
+                                         overlay,
+                                         s_rec.canvas_w - overlay - 20,
+                                         s_rec.canvas_h - overlay - 20);
+    if (!s_rec.comp)
+        fprintf(stderr, "main: compositor unavailable — "
+                        "webcam overlay disabled\n");
+
     const char *cam_off = getenv("SCREENCAST_CAM_OFFSET_MS");
     s_cam_offset_us = (cam_off && cam_off[0]) ? atoll(cam_off) * 1000LL : 0;
     if (s_cam_offset_us)
@@ -452,21 +468,14 @@ static void recording_loop(void)
     while (atomic_load(&g_running) && atomic_load(&g_recording)) {
         RecordMode mode = atomic_load(&g_mode);
 
-        /* Toggle webcam compositing based on mode */
+        /* The compositor is built once for the session, so switching modes is
+           just a different draw — nothing to set up or tear down. */
         int want_cam = (mode == MODE_WEBCAM || mode == MODE_BOTH) && s_rec.avf_cam;
-        if (want_cam && !s_rec.cam_active) {
-            encoder_set_webcam(&s_rec.enc, s_rec.cam_w, s_rec.cam_h,
-                               s_rec.cam_fmt);
-            s_rec.cam_active = 1;
-        } else if (!want_cam && s_rec.cam_active) {
-            encoder_clear_webcam(&s_rec.enc);
-            s_rec.cam_active = 0;
-        }
 
         /* Grab screen frame (blocking with timeout — unblocks ~500ms so
            the stop condition is checked promptly). */
         int64_t screen_pts = -1;
-        AVFrame *screen = sck_capture_grab_video(s_rec.sck, &screen_pts);
+        void *screen = sck_capture_grab_video(s_rec.sck, &screen_pts);
         if (!screen) {
             if (!atomic_load(&g_running) || !atomic_load(&g_recording))
                 break;
@@ -474,16 +483,29 @@ static void recording_loop(void)
         }
 
         /* Pair this screen frame with the webcam frame captured alongside it */
-        AVFrame *cam = NULL;
-        int64_t cam_seq = -1;
+        void *cam = NULL;
+        int64_t cam_pts = -1;
         if (want_cam)
-            cam = cam_pick_nearest(screen_pts, &cam_seq);
+            cam = cam_pick_nearest(screen_pts, &cam_pts);
 
-        encoder_write_video(&s_rec.enc, mode, screen, cam, cam_seq, screen_pts);
+        /*
+         * Display mode composites nothing, so the capture buffer goes to the
+         * encoder untouched — no GPU pass, no CPU pass, no copy at all.  The
+         * other modes need one Metal pass to draw the webcam in.
+         */
+        void *encode_buf = screen;
+        void *composited = NULL;
+        if (mode != 1 && s_rec.comp) {
+            composited = metal_compositor_render(s_rec.comp, mode, screen, cam);
+            if (composited) encode_buf = composited;
+        }
+
+        encoder_write_pixbuf(&s_rec.enc, encode_buf, screen_pts);
         frames_encoded++;
 
-        av_frame_free(&screen);
-        if (cam) av_frame_free(&cam);
+        if (composited) metal_compositor_release_frame(composited);
+        if (cam) avf_camera_release_frame(cam);
+        sck_capture_release_frame(screen);
 
         /*
          * Sync telemetry.  Both tracks are stamped from the same session clock,
@@ -542,6 +564,7 @@ static void recording_close(void)
     encoder_free(&s_rec.enc);
 
     if (s_rec.mixer) { mixer_destroy(s_rec.mixer); s_rec.mixer = NULL; }
+    if (s_rec.comp)  { metal_compositor_destroy(s_rec.comp); s_rec.comp = NULL; }
 
     if (s_rec.avf_mic) { avf_mic_close(s_rec.avf_mic); s_rec.avf_mic = NULL; }
     if (s_rec.avf_cam) { avf_camera_close(s_rec.avf_cam); s_rec.avf_cam = NULL; }

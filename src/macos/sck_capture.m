@@ -28,7 +28,7 @@
 /* ── opaque struct ─────────────────────────────────────────── */
 
 struct SckCapture {
-    AVFrame                *video_queue[VIDEO_QUEUE_DEPTH];
+    CVPixelBufferRef        video_queue[VIDEO_QUEUE_DEPTH];
     int64_t                 video_pts[VIDEO_QUEUE_DEPTH];  /* host-clock µs */
     int                     video_head;
     int                     video_count;
@@ -120,101 +120,6 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
     return status == SCFrameStatusComplete;
 }
 
-static AVFrame *copy_bgra_pixel_buffer(CVPixelBufferRef pb)
-{
-    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-
-    int       w      = (int)CVPixelBufferGetWidth(pb);
-    int       h      = (int)CVPixelBufferGetHeight(pb);
-    int       stride = (int)CVPixelBufferGetBytesPerRow(pb);
-    uint8_t  *src    = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
-
-    AVFrame *frame = av_frame_alloc();
-    if (!frame) { CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly); return NULL; }
-
-    frame->format       = AV_PIX_FMT_BGRA;
-    frame->width        = w;
-    frame->height       = h;
-    frame->linesize[0]  = stride;
-
-    if (av_frame_get_buffer(frame, 0) < 0) {
-        av_frame_free(&frame);
-        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-        return NULL;
-    }
-
-    for (int y = 0; y < h; y++)
-        memcpy(frame->data[0] + y * (size_t)stride,
-               src           + y * (size_t)stride, (size_t)stride);
-
-    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    return frame;
-}
-
-static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
-{
-    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-
-    int       w        = (int)CVPixelBufferGetWidth(pb);
-    int       h        = (int)CVPixelBufferGetHeight(pb);
-    uint8_t  *y_plane  = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    int       y_stride = (int)CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-    uint8_t  *uv_plane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-    int       uv_stride= (int)CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-
-    uint8_t *bgra_buf = (uint8_t *)malloc((size_t)w * (size_t)h * 4);
-    if (!bgra_buf) {
-        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-        return NULL;
-    }
-
-    vImage_YpCbCrToARGB conv;
-    vImage_YpCbCrPixelRange range = {
-        .Yp_bias = 16, .CbCr_bias = 128,
-        .YpRangeMax = 235, .CbCrRangeMax = 240,
-        .YpMax = 235, .YpMin = 16,
-        .CbCrMax = 240, .CbCrMin = 16
-    };
-    vImageConvert_YpCbCrToARGB_GenerateConversion(
-        kvImage_YpCbCrToARGBMatrix_ITU_R_601_4,
-        &range, &conv,
-        kvImage420Yp8_Cb8_Cr8,
-        kvImageARGB8888, kvImageNoFlags);
-
-    vImage_Buffer srcY  = { y_plane,  (vImagePixelCount)h, (vImagePixelCount)w, (size_t)y_stride };
-    vImage_Buffer srcUV = { uv_plane, (vImagePixelCount)h, (vImagePixelCount)w, (size_t)uv_stride };
-    vImage_Buffer dst   = { bgra_buf, (vImagePixelCount)h, (vImagePixelCount)w, (size_t)w * 4 };
-
-    vImage_Error err = vImageConvert_420Yp8_CbCr8ToARGB8888(
-        &srcY, &srcUV, &dst, &conv, NULL, 0, kvImageNoFlags);
-
-    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-
-    if (err != kvImageNoError) {
-        fprintf(stderr, "sck_capture: vImage NV12->BGRA failed (%zd)\n", err);
-        free(bgra_buf);
-        return NULL;
-    }
-
-    AVFrame *frame = av_frame_alloc();
-    if (!frame) { free(bgra_buf); return NULL; }
-
-    frame->format       = AV_PIX_FMT_BGRA;
-    frame->width        = w;
-    frame->height       = h;
-    frame->linesize[0]  = w * 4;
-
-    if (av_frame_get_buffer(frame, 0) < 0) {
-        av_frame_free(&frame);
-        free(bgra_buf);
-        return NULL;
-    }
-
-    memcpy(frame->data[0], bgra_buf, (size_t)w * (size_t)h * 4);
-    free(bgra_buf);
-    return frame;
-}
-
 /* ── SCStreamOutput delegate (SDK 27+) ─────────────────────── */
 
 @interface _SckStreamHelper : NSObject <SCStreamOutput>
@@ -252,28 +157,13 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (!pb) return;
 
-        AVFrame *frame = NULL;
-        OSType fmt = CVPixelBufferGetPixelFormatType(pb);
-
-        if (fmt == kCVPixelFormatType_32BGRA)
-            frame = copy_bgra_pixel_buffer(pb);
-        else if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
-                 fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
-            frame = convert_nv12_to_bgra(pb);
-        else {
-            fprintf(stderr, "sck_capture: unexpected pixel format %c%c%c%c\n",
-                    (char)(fmt >> 24), (char)(fmt >> 16),
-                    (char)(fmt >> 8),  (char)fmt);
-            return;
-        }
-
-        if (!frame) return;
-
+        /* The buffer is retained and queued as-is.  It is IOSurface-backed and
+           already in the format the encoder wants, so there is nothing to
+           convert and no reason to copy it out of GPU memory. */
         pthread_mutex_lock(&c->lock);
         /* Before the session is anchored the recording has not begun; and a
            frame captured ahead of t0 belongs to the startup window. */
         if (c->stopped || !c->session_started || pts < c->t0_us) {
-            av_frame_free(&frame);
             pthread_mutex_unlock(&c->lock);
             return;
         }
@@ -281,14 +171,15 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
         if (c->video_count >= VIDEO_QUEUE_DEPTH) {
             /* Encoder is behind.  Video is the elastic resource: drop the
                oldest frame rather than stall capture or delay a timestamp. */
-            av_frame_free(&c->video_queue[c->video_head]);
+            CVPixelBufferRelease(c->video_queue[c->video_head]);
+            c->video_queue[c->video_head] = NULL;
             c->video_head = (c->video_head + 1) % VIDEO_QUEUE_DEPTH;
             c->video_count--;
             c->video_dropped++;
         }
 
         int tail = (c->video_head + c->video_count) % VIDEO_QUEUE_DEPTH;
-        c->video_queue[tail] = frame;
+        c->video_queue[tail] = (CVPixelBufferRef)CFRetain(pb);
         c->video_pts[tail]   = pts - c->t0_us;
         c->video_count++;
         pthread_mutex_unlock(&c->lock);
@@ -534,7 +425,11 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
         SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
         config.width       = c->width;
         config.height      = c->height;
-        config.pixelFormat = kCVPixelFormatType_32BGRA;
+        /* NV12 is what VideoToolbox encodes natively and what the compositor's
+           shader reads, so the capture buffer needs no conversion at any point
+           between ScreenCaptureKit and the encoder. */
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+        config.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
         config.capturesAudio = YES;
         config.excludesCurrentProcessAudio = YES;
         config.sampleRate    = 48000;
@@ -654,14 +549,21 @@ void sck_capture_start_session(SckCapture *c, int64_t t0_us)
     c->t0_us           = t0_us;
     c->session_started = 1;
     /* Anything queued during startup predates the session — discard it. */
-    for (int i = 0; i < VIDEO_QUEUE_DEPTH; i++)
-        av_frame_free(&c->video_queue[i]);
+    for (int i = 0; i < VIDEO_QUEUE_DEPTH; i++) {
+        if (c->video_queue[i]) CVPixelBufferRelease(c->video_queue[i]);
+        c->video_queue[i] = NULL;
+    }
     c->video_head = c->video_count = 0;
     c->audio_nb_samples = 0;
     pthread_mutex_unlock(&c->lock);
 }
 
-AVFrame *sck_capture_grab_video(SckCapture *c, int64_t *pts_us)
+void sck_capture_release_frame(void *pixbuf)
+{
+    if (pixbuf) CVPixelBufferRelease((CVPixelBufferRef)pixbuf);
+}
+
+void *sck_capture_grab_video(SckCapture *c, int64_t *pts_us)
 {
     if (!c) return NULL;
 
@@ -677,13 +579,13 @@ AVFrame *sck_capture_grab_video(SckCapture *c, int64_t *pts_us)
         return NULL;
     }
 
-    AVFrame *frame = c->video_queue[c->video_head];
+    CVPixelBufferRef pb = c->video_queue[c->video_head];
     if (pts_us) *pts_us = c->video_pts[c->video_head];
     c->video_queue[c->video_head] = NULL;
     c->video_head = (c->video_head + 1) % VIDEO_QUEUE_DEPTH;
     c->video_count--;
     pthread_mutex_unlock(&c->lock);
-    return frame;
+    return pb;   /* ownership passes to the caller */
 }
 
 AVFrame *sck_capture_grab_audio(SckCapture *c, int64_t *pts_us)
@@ -763,7 +665,7 @@ void sck_capture_close(SckCapture *c)
     }
 
     for (int i = 0; i < VIDEO_QUEUE_DEPTH; i++)
-        av_frame_free(&c->video_queue[i]);
+        if (c->video_queue[i]) CVPixelBufferRelease(c->video_queue[i]);
 
     for (int i = 0; i < 2; i++)
         free(c->audio_planes[i]);

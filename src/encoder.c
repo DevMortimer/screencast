@@ -2,6 +2,10 @@
 #include "composite.h"
 #include <libavutil/opt.h>
 #include <libavutil/time.h>
+#ifdef __APPLE__
+#include <libavutil/hwcontext.h>
+#include <CoreVideo/CoreVideo.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +47,46 @@ static int drain_encoder(EncoderCtx *enc, AVCodecContext *ctx, AVStream *st)
 
 /* ── video encoder setup ──────────────────────────────────── */
 
+#ifdef __APPLE__
+/*
+ * Build a VideoToolbox hardware frame context so the encoder can take
+ * CVPixelBuffers by reference.  Capture, compositing and encoding then all
+ * operate on the same GPU memory and nothing is copied through the CPU.
+ *
+ * Returns 0 on success.  A failure here is not fatal to the recording — the
+ * caller falls back to the software path — so it only warns.
+ */
+static int setup_hw_frames(EncoderCtx *enc, int w, int h)
+{
+    int ret = av_hwdevice_ctx_create(&enc->hw_device,
+                                     AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+                                     NULL, NULL, 0);
+    if (ret < 0) { log_err("av_hwdevice_ctx_create", ret); return ret; }
+
+    enc->hw_frames = av_hwframe_ctx_alloc(enc->hw_device);
+    if (!enc->hw_frames) return AVERROR(ENOMEM);
+
+    AVHWFramesContext *fc = (AVHWFramesContext *)enc->hw_frames->data;
+    fc->format    = AV_PIX_FMT_VIDEOTOOLBOX;
+    fc->sw_format = AV_PIX_FMT_NV12;
+    fc->width     = w;
+    fc->height    = h;
+
+    ret = av_hwframe_ctx_init(enc->hw_frames);
+    if (ret < 0) {
+        log_err("av_hwframe_ctx_init", ret);
+        av_buffer_unref(&enc->hw_frames);
+        return ret;
+    }
+    return 0;
+}
+#endif
+
+int encoder_is_hardware(const EncoderCtx *enc)
+{
+    return enc && enc->hw_frames != NULL;
+}
+
 static int setup_video(EncoderCtx *enc, int w, int h, int fps)
 {
 #ifdef __APPLE__
@@ -67,6 +111,16 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     enc->vid_enc->height       = h;
     enc->vid_enc->time_base    = (AVRational){1, 1000000};
     enc->vid_enc->pix_fmt      = AV_PIX_FMT_YUV420P;
+
+#ifdef __APPLE__
+    if (setup_hw_frames(enc, w, h) == 0) {
+        enc->vid_enc->pix_fmt       = AV_PIX_FMT_VIDEOTOOLBOX;
+        enc->vid_enc->hw_frames_ctx = av_buffer_ref(enc->hw_frames);
+    } else {
+        fprintf(stderr, "encoder: hardware frames unavailable — "
+                        "falling back to software frames\n");
+    }
+#endif
     enc->vid_enc->gop_size     = fps * 2;
     enc->vid_enc->max_b_frames = 0;
     enc->vid_enc->profile      = AV_PROFILE_H264_HIGH;
@@ -117,6 +171,10 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
 
     avcodec_parameters_from_context(enc->vid_stream->codecpar, enc->vid_enc);
     enc->vid_stream->time_base = enc->vid_enc->time_base;
+
+    /* The hardware path composites into CVPixelBuffers, so the software
+       scratch frame and the whole swscale chain are never used. */
+    if (encoder_is_hardware(enc)) return 0;
 
     enc->vid_frame         = av_frame_alloc();
     enc->vid_frame->format = AV_PIX_FMT_YUV420P;
@@ -351,7 +409,8 @@ int encoder_open(EncoderCtx *enc, const char *path,
         if ((ret = setup_audio(enc, audio_sample_rate, audio_ch_layout, audio_sample_fmt)) < 0) return ret;
         av_channel_layout_copy(&enc->aud_in_layout, audio_ch_layout);
     }
-    if ((ret = setup_sws(enc, screen_pix_fmt)) < 0) return ret;
+    if (!encoder_is_hardware(enc) &&
+        (ret = setup_sws(enc, screen_pix_fmt)) < 0) return ret;
 
     if (!(enc->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open(&enc->fmt_ctx->pb, path, AVIO_FLAG_WRITE);
@@ -362,7 +421,13 @@ int encoder_open(EncoderCtx *enc, const char *path,
     if (ret < 0) { log_err("avformat_write_header", ret); return ret; }
     enc->header_written = 1;
 
-    /* Scratch RGBA buffers */
+    /* Scratch RGBA buffers — software compositing only. */
+    if (encoder_is_hardware(enc)) {
+        pthread_mutex_init(&enc->write_mutex, NULL);
+        enc->t0 = av_gettime_relative();
+        return 0;
+    }
+
     enc->canvas_rgba = malloc((size_t)canvas_w * canvas_h * 4);
     if (!enc->canvas_rgba) return AVERROR(ENOMEM);
 
@@ -543,6 +608,65 @@ int encoder_write_video(EncoderCtx *enc, int mode,
     return drain_encoder(enc, enc->vid_enc, enc->vid_stream);
 }
 
+/* ── public: encoder_write_pixbuf ─────────────────────────── */
+
+#ifdef __APPLE__
+/* Balances the CFRetain taken when the buffer was wrapped. */
+static void unref_pixbuf(void *opaque, uint8_t *data)
+{
+    (void)data;
+    CFRelease((CFTypeRef)opaque);
+}
+#endif
+
+int encoder_write_pixbuf(EncoderCtx *enc, void *pixbuf, int64_t pts_us)
+{
+#ifndef __APPLE__
+    (void)enc; (void)pixbuf; (void)pts_us;
+    return AVERROR(ENOSYS);
+#else
+    if (!enc || !pixbuf || !encoder_is_hardware(enc)) return AVERROR(EINVAL);
+
+    AVFrame *frame = av_frame_alloc();
+    if (!frame) return AVERROR(ENOMEM);
+
+    /* Wrap rather than copy: data[3] is where libav expects the
+       CVPixelBufferRef, and buf[0] owns the reference that keeps it alive
+       until the encoder is finished with it. */
+    frame->format        = AV_PIX_FMT_VIDEOTOOLBOX;
+    frame->width         = enc->canvas_w;
+    frame->height        = enc->canvas_h;
+    frame->data[3]       = (uint8_t *)pixbuf;
+    frame->hw_frames_ctx = av_buffer_ref(enc->hw_frames);
+    frame->buf[0]        = av_buffer_create((uint8_t *)pixbuf, sizeof(void *),
+                                            unref_pixbuf,
+                                            (void *)CFRetain(pixbuf), 0);
+    if (!frame->hw_frames_ctx || !frame->buf[0]) {
+        av_frame_free(&frame);
+        return AVERROR(ENOMEM);
+    }
+
+    frame->pts = pts_us;
+
+    if (enc->last_key_pts < 0 ||
+        pts_us - enc->last_key_pts >= KEYFRAME_INTERVAL_US) {
+        frame->pict_type = AV_PICTURE_TYPE_I;
+        enc->last_key_pts = pts_us;
+    }
+
+    int ret = avcodec_send_frame(enc->vid_enc, frame);
+    while (ret == AVERROR(EAGAIN)) {
+        int dr = drain_encoder(enc, enc->vid_enc, enc->vid_stream);
+        if (dr < 0) { av_frame_free(&frame); return dr; }
+        ret = avcodec_send_frame(enc->vid_enc, frame);
+    }
+    av_frame_free(&frame);
+
+    if (ret < 0) { log_err("avcodec_send_frame (hw video)", ret); return ret; }
+    return drain_encoder(enc, enc->vid_enc, enc->vid_stream);
+#endif
+}
+
 /* ── public: encoder_feed_audio ───────────────────────────── */
 
 /*
@@ -689,6 +813,9 @@ void encoder_free(EncoderCtx *enc)
     sws_freeContext(enc->sws_cam_main);
     sws_freeContext(enc->sws_cam_scale);
     sws_freeContext(enc->sws_to_yuv);
+
+    av_buffer_unref(&enc->hw_frames);
+    av_buffer_unref(&enc->hw_device);
 
     free(enc->canvas_rgba);
     free(enc->cam_rgba);

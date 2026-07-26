@@ -20,7 +20,8 @@ SHARED_SRCS := $(SRCDIR)/control.c $(SRCDIR)/encoder.c $(SRCDIR)/composite.c $(S
 # Platform-specific sources
 ifeq ($(PLATFORM),macos)
     PLATFORM_SRCS := $(SRCDIR)/macos/main.c
-    OBJC_SRCS     := $(SRCDIR)/macos/sck_capture.m $(SRCDIR)/macos/avf_camera.m $(SRCDIR)/macos/avf_mic.m
+    OBJC_SRCS     := $(SRCDIR)/macos/sck_capture.m $(SRCDIR)/macos/avf_camera.m \
+                     $(SRCDIR)/macos/avf_mic.m $(SRCDIR)/macos/metal_compositor.m
     SRCS          := $(SHARED_SRCS) $(PLATFORM_SRCS) $(OBJC_SRCS)
 else
     PLATFORM_SRCS := $(SRCDIR)/linux/main.c $(SRCDIR)/linux/wlcap.c \
@@ -95,8 +96,13 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Pattern rule for .m -> .o (Objective-C on macOS, ARC only where needed)
-# sck_capture uses SCStreamOutput protocol which requires ARC.
+# sck_capture uses SCStreamOutput protocol which requires ARC; the compositor
+# bridges Metal objects into a C struct and needs it too.
 $(OBJDIR)/macos/sck_capture.o: $(SRCDIR)/macos/sck_capture.m | $(OBJDIR)
+	mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
+
+$(OBJDIR)/macos/metal_compositor.o: $(SRCDIR)/macos/metal_compositor.m | $(OBJDIR)
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 

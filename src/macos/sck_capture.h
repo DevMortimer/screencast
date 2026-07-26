@@ -61,9 +61,13 @@ SckCapture *sck_capture_open(SckCaptureInfo *info);
 void sck_capture_start_session(SckCapture *c, int64_t t0_us);
 
 /*
- * Blocks until the next video frame is available.  Returns a heap-allocated
- * AVFrame in BGRA pixel format.  The caller owns the frame and must
- * av_frame_free() it.
+ * Blocks until the next video frame is available.  Returns a retained
+ * CVPixelBufferRef in NV12, as void * to keep this header free of Apple
+ * types.  The caller owns the reference and must hand it to
+ * sck_capture_release_frame().
+ *
+ * The buffer is the one ScreenCaptureKit produced, not a copy of it: it stays
+ * in GPU memory the whole way to the encoder.
  *
  * *pts_us receives the frame's presentation timestamp relative to the session
  * start — taken from the sample buffer, so it reports when the frame was
@@ -72,7 +76,10 @@ void sck_capture_start_session(SckCapture *c, int64_t t0_us);
  *
  * Returns NULL on error or after sck_capture_close() has been called.
  */
-AVFrame *sck_capture_grab_video(SckCapture *c, int64_t *pts_us);
+void *sck_capture_grab_video(SckCapture *c, int64_t *pts_us);
+
+/* Release a buffer returned by sck_capture_grab_video(). */
+void sck_capture_release_frame(void *pixbuf);
 
 /*
  * Non-blocking read of the accumulated audio samples.  Returns a heap-allocated

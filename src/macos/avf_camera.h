@@ -27,14 +27,20 @@ typedef struct {
 
 /*
  * Called from the capture queue with each newly captured frame.
- * The AVFrame is heap-allocated and ownership passes to the callback, which
- * must eventually av_frame_free() it.
+ *
+ * pixbuf is a retained NV12 CVPixelBufferRef, passed as void * to keep this
+ * header free of Apple types.  Ownership passes to the callback, which must
+ * release it with avf_camera_release_frame().  It is the buffer AVFoundation
+ * produced, so it stays in GPU memory for the compositor to sample.
  *
  * pts_us is the frame's timestamp on the session timeline, so callers can
  * match a camera frame against the screen frame it belongs beside rather than
  * assuming the most recent one is contemporaneous with it.
  */
-typedef void (*AvfCameraFrameFn)(void *user, AVFrame *frame, int64_t pts_us);
+typedef void (*AvfCameraFrameFn)(void *user, void *pixbuf, int64_t pts_us);
+
+/* Release a buffer handed to an AvfCameraFrameFn. */
+void avf_camera_release_frame(void *pixbuf);
 
 /*
  * Open the default (or specified) camera and start capture.

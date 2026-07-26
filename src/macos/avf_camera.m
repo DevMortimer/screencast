@@ -51,64 +51,6 @@ struct AvfCamera {
     void              *user;
 };
 
-#pragma mark - vImage helpers
-
-/* Build a YpCbCr->ARGB conversion matrix for video-range NV12. */
-static void nv12_matrix_init(vImage_YpCbCrToARGB *matrix, bool isFullRange)
-{
-    vImage_YpCbCrPixelRange range;
-    if (isFullRange) {
-        range = (vImage_YpCbCrPixelRange){ .Yp_bias = 0, .CbCr_bias = 128,
-            .YpRangeMax = 255, .CbCrRangeMax = 255,
-            .YpMax = 255, .YpMin = 0, .CbCrMax = 255, .CbCrMin = 0 };
-    } else {
-        range = (vImage_YpCbCrPixelRange){ .Yp_bias = 16, .CbCr_bias = 128,
-            .YpRangeMax = 235, .CbCrRangeMax = 240,
-            .YpMax = 235, .YpMin = 16, .CbCrMax = 240, .CbCrMin = 16 };
-    }
-    vImageConvert_YpCbCrToARGB_GenerateConversion(
-        kvImage_YpCbCrToARGBMatrix_ITU_R_601_4, &range, matrix,
-        kvImage420Yp8_CbCr8, kvImageARGB8888, kvImageNoFlags);
-}
-
-/* Convert a single NV12 CVPixelBuffer into an AVFrame (BGRA).
-   Returns 0 on success, non-zero on failure. */
-static int nv12_cvpixelbuffer_to_avframe(CVPixelBufferRef cv,
-                                           AVFrame *avf)
-{
-    size_t w = CVPixelBufferGetWidth(cv);
-    size_t h = CVPixelBufferGetHeight(cv);
-
-    /* NV12 planes */
-    uint8_t *srcY   = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(cv, 0);
-    uint8_t *srcUV  = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(cv, 1);
-    size_t   strideY  = CVPixelBufferGetBytesPerRowOfPlane(cv, 0);
-    size_t   strideUV = CVPixelBufferGetBytesPerRowOfPlane(cv, 1);
-
-    if (!srcY || !srcUV) return -1;
-
-    /* Prepare vImage source buffers.  Y is WxH, UV is Wx(H/2) for 4:2:0. */
-    vImage_Buffer vy  = { srcY,  h,      w,     strideY };
-    vImage_Buffer vuv = { srcUV, h / 2,  w,     strideUV };
-
-    /* Prepare destination (BGRA).  vImageConvert_NV12toBGRA produces BGRA
-     * pixel data and the matrix accounts for the channel order internally. */
-    vImage_Buffer vdst = { avf->data[0], h, w, (size_t)avf->linesize[0] };
-
-    /* Build the matrix once per call (it's small/cheap).  Detect video-
-     * vs full-range from the pixel format type. */
-    OSType fmt = CVPixelBufferGetPixelFormatType(cv);
-    vImage_YpCbCrToARGB matrix;
-    nv12_matrix_init(&matrix,
-        fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
-
-    /* vImageConvert_420Yp8_CbCr8ToARGB8888 with BGRA permute map. */
-    uint8_t bgra_map[4] = { 3, 2, 1, 0 };  /* swap R↔B for BGRA output */
-    vImage_Error err = vImageConvert_420Yp8_CbCr8ToARGB8888(
-        &vy, &vuv, &vdst, &matrix, bgra_map, 255, kvImageNoFlags);
-    return (err == kvImageNoError) ? 0 : -1;
-}
-
 #pragma mark - Delegate implementation
 
 @implementation AvfCameraHelper
@@ -123,83 +65,28 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     struct AvfCamera *cam = self.cam;
     if (!cam) return;
 
-    /* Grab the pixel buffer. */
+    /* Grab the pixel buffer.  It is handed on retained and untouched: the
+       compositor samples it as a Metal texture straight from its IOSurface,
+       so there is nothing to lock, convert or copy here. */
     CVPixelBufferRef cvbuf = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!cvbuf) return;
 
-    /* Lock the pixel buffer for reading. */
-    if (CVPixelBufferLockBaseAddress(cvbuf, kCVPixelBufferLock_ReadOnly) != 0)
-        return;
-
-    size_t w = CVPixelBufferGetWidth(cvbuf);
-    size_t h = CVPixelBufferGetHeight(cvbuf);
     OSType fmt = CVPixelBufferGetPixelFormatType(cvbuf);
+    if (fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+        fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            fprintf(stderr, "avf_camera: expected NV12, got '%.4s' "
+                    "— frames will be dropped\n", (const char *)&fmt);
+        });
+        return;
+    }
 
     /* Populate negotiated info from the first frame. */
     if (!cam->firstFrameReceived) {
-        cam->width  = (int)w;
-        cam->height = (int)h;
-        /* We always deliver BGRA to callers. */
-        cam->av_fmt = AV_PIX_FMT_BGRA;
-    }
-
-    /* Allocate an AVFrame. */
-    AVFrame *avf = av_frame_alloc();
-    if (!avf) {
-        CVPixelBufferUnlockBaseAddress(cvbuf, kCVPixelBufferLock_ReadOnly);
-        return;
-    }
-    avf->width  = (int)w;
-    avf->height = (int)h;
-    avf->format = AV_PIX_FMT_BGRA;
-
-    if (av_frame_get_buffer(avf, 32) < 0) {
-        av_frame_free(&avf);
-        CVPixelBufferUnlockBaseAddress(cvbuf, kCVPixelBufferLock_ReadOnly);
-        return;
-    }
-
-    /* Copy / convert pixel data. */
-    int copy_ok = 0;
-    if (fmt == kCVPixelFormatType_32BGRA ||
-        fmt == kCVPixelFormatType_32ABGR /* rare, handle anyway */) {
-        /* Direct BGRA copy (single plane). */
-        uint8_t *src   = (uint8_t *)CVPixelBufferGetBaseAddress(cvbuf);
-        size_t   stride = CVPixelBufferGetBytesPerRow(cvbuf);
-        uint8_t *dst   = avf->data[0];
-        int      dst_ls = avf->linesize[0];
-        int      row_bytes = (int)(w * 4); /* 4 bytes per pixel for BGRA */
-        if (dst_ls == (int)stride && row_bytes == dst_ls) {
-            /* Fast path: contiguous. */
-            memcpy(dst, src, (size_t)(h * stride));
-        } else {
-            /* Slower row-by-row copy with stride adjustment. */
-            for (size_t y = 0; y < h; y++)
-                memcpy(dst + y * dst_ls, src + y * stride,
-                       (size_t)(row_bytes < dst_ls ? row_bytes : dst_ls));
-        }
-        copy_ok = 1;
-    } else if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
-               fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
-        /* NV12 -> BGRA via vImage. */
-        copy_ok = (nv12_cvpixelbuffer_to_avframe(cvbuf, avf) == 0);
-    } else {
-        /* Unknown format — log a warning and skip the frame.
-         * kCVPixelFormatType_32BGRA (requested via videoSettings) and the
-         * two NV12 variants (most common camera-native formats) are
-         * handled above.  Anything else is unexpected. */
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            fprintf(stderr, "avf_camera: unsupported pixel format '%.4s' "
-                    "— frames will be dropped\n", (const char *)&fmt);
-        });
-    }
-
-    CVPixelBufferUnlockBaseAddress(cvbuf, kCVPixelBufferLock_ReadOnly);
-
-    if (!copy_ok) {
-        av_frame_free(&avf);
-        return;
+        cam->width  = (int)CVPixelBufferGetWidth(cvbuf);
+        cam->height = (int)CVPixelBufferGetHeight(cvbuf);
+        cam->av_fmt = AV_PIX_FMT_NV12;
     }
 
     /* Signal first-frame semaphore. */
@@ -215,15 +102,10 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                              kCMTimeRoundingMethod_Default).value
         : 0;
 
-    if (!cam->session_started || pts < cam->t0_us) {
-        av_frame_free(&avf);
-        return;
-    }
+    if (!cam->session_started || pts < cam->t0_us) return;
 
     if (cam->on_frame)
-        cam->on_frame(cam->user, avf, pts - cam->t0_us);
-    else
-        av_frame_free(&avf);
+        cam->on_frame(cam->user, (void *)CFRetain(cvbuf), pts - cam->t0_us);
 }
 
 @end
@@ -235,6 +117,11 @@ void avf_camera_start_session(AvfCamera *cam, int64_t t0_us)
     if (!cam) return;
     cam->t0_us           = t0_us;
     cam->session_started = 1;
+}
+
+void avf_camera_release_frame(void *pixbuf)
+{
+    if (pixbuf) CVPixelBufferRelease((CVPixelBufferRef)pixbuf);
 }
 
 /* Find an AVCaptureDevice matching `target`.
@@ -486,11 +373,15 @@ AvfCamera *avf_camera_open(const char *target, int want_w, int want_h,
         [[AVCaptureVideoDataOutput alloc] init];
     cam->output = (__bridge_retained void *)output;
 
-    /* Request BGRA (32-bit) pixel format.  AVCaptureVideoDataOutput converts
-       from the sensor's native format when possible. */
+    /* Request NV12, which is what UVC cameras deliver natively and what the
+       compositor's shader samples.  Asking for BGRA instead would make
+       AVFoundation convert every frame for no benefit, since the pixels are
+       going to the GPU either way.  Buffers must be Metal-compatible so they
+       can be bound as textures without a copy. */
     output.videoSettings = @{
         (id)kCVPixelBufferPixelFormatTypeKey:
-            @(kCVPixelFormatType_32BGRA)
+            @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (id)kCVPixelBufferMetalCompatibilityKey: @YES,
     };
     output.alwaysDiscardsLateVideoFrames = YES;
 

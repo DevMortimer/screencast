@@ -51,6 +51,12 @@ typedef struct {
     int cam_main_x, cam_main_y, cam_main_w, cam_main_h;
     enum AVPixelFormat cam_pix_fmt; /* format the cam sws chain was built for */
 
+    /* ── Hardware video path (macOS) ──────────────── */
+    /* When hw_frames is set the encoder takes CVPixelBuffers by reference and
+       none of the swscale chain above is built. */
+    AVBufferRef      *hw_device;
+    AVBufferRef      *hw_frames;
+
     /* ── Thread safety ────────────────────────────── */
     pthread_mutex_t write_mutex;
 
@@ -108,6 +114,22 @@ void encoder_clear_webcam(EncoderCtx *enc);
 int  encoder_write_video(EncoderCtx *enc, int mode,
                           AVFrame *screen_frame, AVFrame *cam_frame,
                           int64_t cam_seq, int64_t pts_us);
+
+/*
+ * Encode one already-composited frame held in a CVPixelBuffer (passed as
+ * void * so this header stays platform-neutral).  Only valid when the encoder
+ * was opened with the hardware path available; the buffer is handed to
+ * VideoToolbox by reference, so its pixels are never read by the CPU.
+ *
+ * The caller retains ownership of the buffer and may release it as soon as
+ * this returns — the encoder takes its own reference.
+ *
+ * pts_us is the frame's capture time on the session timeline.
+ */
+int  encoder_write_pixbuf(EncoderCtx *enc, void *pixbuf, int64_t pts_us);
+
+/* Was the encoder opened on the hardware path? */
+int  encoder_is_hardware(const EncoderCtx *enc);
 
 /*
  * Resample raw audio into FIFO; encodes full 1024-sample chunks.
