@@ -199,7 +199,7 @@ Only these environment variables apply on macOS:
 |---|---|---|
 | `SCREENCAST_DRAW_MOUSE` | `1` | Composite the cursor into the recording; set to `0` to hide it. |
 | `SCREENCAST_DESKTOP_AUDIO` | `1` | Mix desktop audio into the track; set to `0` to record microphone only. |
-| `SCREENCAST_SCALE` | display's native scale | Pixels captured per point of display geometry. Defaults to the panel's own backing-store ratio, which on a scaled HiDPI mode is often not a round `2` — 1440x900 points on a 2560x1600 panel is 1.78. Set `1` to capture at point size, as before. Clamped to the native scale: asking for more cannot add detail. |
+| `SCREENCAST_SCALE` | measured backing-store ratio | Pixels captured per point of display geometry. Defaults to the framebuffer macOS composites into — on a scaled HiDPI mode that is typically `2`, giving a 2880x1800 capture from a 1440x900 desktop. That is ~4x the pixels of a point-sized capture and more than the panel itself shows, so **lower it if frames are dropping**: `1.5` is a good middle, `1` captures at point size. Clamped to the measured ratio, since asking for more cannot add detail. |
 | `SCREENCAST_CAM_FPS` | `30` | Preferred webcam frame rate. |
 | `SCREENCAST_CAM_SIZE` | `1920x1080` | Preferred webcam capture size. 1080p is the largest most USB-C cameras deliver as raw NV12; above it they switch to MJPEG and cost a JPEG decode on every frame. |
 | `SCREENCAST_CAM_OFFSET_MS` | `0` | Shift webcam frames against the screen, in milliseconds, if your camera's timestamps are biased. Normally unnecessary — frames are matched to the screen frame they were captured with. |

@@ -39,11 +39,13 @@ these differ, and confusing them silently records a downscaled capture.
 _Avoid_: logical/physical resolution, size
 
 **Capture scale** (macOS):
-Pixels captured per point. Defaults to the display's measured backing-store
-ratio, which on the scaled HiDPI modes people actually run is not a round 2 —
-1440x900 points on a 2560x1600 panel is 1.78. Overridable with
+Pixels captured per point. Defaults to the measured ratio of the display mode's
+pixel width to its point width — the size of the framebuffer the window server
+composites into. On a scaled HiDPI mode that framebuffer is *larger* than the
+panel (1440x900 points reports 2880x1800, which the display then resamples down
+to 2560x1664), so this is not the panel's resolution. Overridable with
 `SCREENCAST_SCALE`, clamped so it never upscales.
-_Avoid_: retina factor, DPI, zoom
+_Avoid_: retina factor, DPI, zoom, native resolution
 
 **Zero-copy path** (macOS):
 Capture to encode without the pixels leaving GPU memory: ScreenCaptureKit and

@@ -110,12 +110,17 @@ static int64_t sample_pts_us(CMSampleBufferRef sb)
  * 1440x900 points was recorded at 56% of its linear resolution, and text is the
  * first thing that costs.
  *
- * The default is the display's real backing store: the ratio between the
- * current mode's pixel width and its point width.  On the scaled HiDPI modes
- * people actually run this is not 2 — 1440x900 points on a 2560x1600 panel is
- * 1.78 — and taking the measured value rather than assuming 2 captures the
- * panel's own pixels instead of a larger framebuffer the display would only
- * resample back down again.
+ * The default is measured, not assumed: the ratio between the current mode's
+ * pixel width and its point width.
+ *
+ * Be clear about what that measures.  It is the *backing framebuffer* macOS
+ * composites into, which on a scaled HiDPI mode is larger than the panel — a
+ * MacBook Air running 1440x900 points reports 2880x1800 here, and the display
+ * resamples that down to its own 2560x1664.  So this captures everything the
+ * window server drew, at the cost of ~22% more pixels than the screen can
+ * actually show.  Measuring is still right (a display set to an unscaled mode
+ * reports its true 1:1 or 2:1 ratio rather than a guessed one), but it is not
+ * the panel's resolution and should not be described as such.
  *
  * SCREENCAST_SCALE overrides it; 1 restores the old point-sized capture.
  * Values above the native scale are clamped, because upscaling costs encode
