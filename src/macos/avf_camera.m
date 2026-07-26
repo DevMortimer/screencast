@@ -256,6 +256,22 @@ static AVCaptureDevice *find_device(const char *target)
     return nil;
 }
 
+/* Is this format delivered as raw pixels rather than compressed frames?
+   MJPEG is how UVC cameras expose their highest resolutions, but every frame
+   then costs a decode — for a 30-minute recording that is a decode session
+   running the entire time, mostly to produce pixels that get scaled down into
+   a 480px overlay. */
+static BOOL format_is_raw(AVCaptureDeviceFormat *fmt)
+{
+    FourCharCode sub =
+        CMFormatDescriptionGetMediaSubType(fmt.formatDescription);
+    return sub == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+           sub == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange  ||
+           sub == kCVPixelFormatType_422YpCbCr8                   ||
+           sub == kCVPixelFormatType_422YpCbCr8_yuvs              ||
+           sub == kCVPixelFormatType_32BGRA;
+}
+
 /* Try to match a device format for the given dimensions and frame rate.
    Returns the closest match by area (not just exact), or nil if no formats
    at all.  When want_w/want_h are 0 the device default is left alone. */
@@ -290,14 +306,24 @@ static AVCaptureDeviceFormat *match_format(AVCaptureDevice *dev,
         /* Prefer exact match; otherwise closest area (smaller is better
            for screencast overlays — we scale down anyway). */
         if ((int)dims.width == want_w && (int)dims.height == want_h) {
-            best = fmt;
-            break; /* exact match wins immediately */
+            if (format_is_raw(fmt)) {
+                best = fmt;
+                break; /* exact match in a raw format wins immediately */
+            }
+            /* Right size but compressed — hold it as a candidate and keep
+               looking for the same size in a raw format. */
+            if (!best || !format_is_raw(best)) { best = fmt; best_diff = 0; }
+            continue;
         }
         int64_t area = (int64_t)dims.width * dims.height;
         int64_t diff = llabs(area - want_area);
         /* Slight bias toward smaller-than-requested: add 5% penalty when
            the format is larger, so we prefer to scale down rather than up. */
         if (area > want_area) diff = diff * 105 / 100;
+        /* Compressed formats cost a hardware decode on every frame for the
+           whole recording; make one worth a substantial size advantage before
+           it beats a raw format. */
+        if (!format_is_raw(fmt)) diff = diff * 2 + want_area / 2;
         if (diff < best_diff) {
             best_diff = diff;
             best = fmt;

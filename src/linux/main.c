@@ -459,7 +459,9 @@ static void apply_plan(const ArbiterPlan *p)
 /* Mixed audio is delivered here and handed to the encoder's audio path. */
 static void mixer_sink_encode(void *user, AVFrame *mixed)
 {
-    encoder_feed_audio((EncoderCtx *)user, mixed);
+    /* -1: the PipeWire capture path does not carry buffer timestamps yet, so
+       the audio track is anchored at zero and counts samples from there. */
+    encoder_feed_audio((EncoderCtx *)user, mixed, -1);
 }
 
 typedef struct { CaptureCtx *cap; MixerCtx *mixer; MixSource src;
@@ -704,8 +706,10 @@ static void recording_loop(void)
             }
         }
 
+        /* -1: no capture timestamp from wlr-screencopy yet, so the encoder
+           falls back to stamping wall-clock time at encode. */
         encoder_write_video(&s_rec.enc, mode,
-                            s_rec.screen_cap.frame, cam_copy, cam_seq);
+                            s_rec.screen_cap.frame, cam_copy, cam_seq, -1);
 
         if (cam_copy) av_frame_free(&cam_copy);
     }

@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Wall-clock spacing between forced keyframes. */
+#define KEYFRAME_INTERVAL_US (2 * 1000000LL)
+
 /* ── logging ──────────────────────────────────────────────── */
 
 static void log_err(const char *label, int ret)
@@ -67,7 +70,10 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     enc->vid_enc->gop_size     = fps * 2;
     enc->vid_enc->max_b_frames = 0;
     enc->vid_enc->profile      = AV_PROFILE_H264_HIGH;
-    enc->vid_enc->level        = 40;  /* Level 4.0: sufficient for 1440p@30 */
+    /* Level auto.  A hardcoded level has to be revised every time the capture
+       resolution changes — 4.0 caps out around 1080p and a Retina-scale canvas
+       exceeds it outright. */
+    enc->vid_enc->level        = 0;
     enc->vid_enc->color_primaries = AVCOL_PRI_BT709;
     enc->vid_enc->color_trc       = AVCOL_TRC_BT709;
     enc->vid_enc->colorspace      = AVCOL_SPC_BT709;
@@ -94,8 +100,16 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     av_opt_set(enc->vid_enc->priv_data, "qp",      qp,       0);
     av_opt_set(enc->vid_enc->priv_data, "surfaces","16",     0);
 #else
-    /* VideoToolbox: real-time hardware encoding */
-    av_opt_set(enc->vid_enc->priv_data, "realtime",  "1", 0);
+    /*
+     * VideoToolbox: real-time hardware encoding, tuned for a fanless laptop
+     * running for half an hour at a stretch.  power_efficient lets the encoder
+     * pick its low-power path (it defaults to -1, "unset", not to on), and
+     * prio_speed keeps per-frame latency down so the capture queue does not
+     * back up under load.
+     */
+    av_opt_set(enc->vid_enc->priv_data, "realtime",        "1", 0);
+    av_opt_set(enc->vid_enc->priv_data, "power_efficient", "1", 0);
+    av_opt_set(enc->vid_enc->priv_data, "prio_speed",      "1", 0);
 #endif
 
     int ret = avcodec_open2(enc->vid_enc, codec, NULL);
@@ -326,6 +340,7 @@ int encoder_open(EncoderCtx *enc, const char *path,
     enc->overlay_x = canvas_w  - enc->overlay_size - 20;
     enc->overlay_y = canvas_h - enc->overlay_size - 20;
     enc->cam_overlay_seq = -1;
+    enc->last_key_pts = -1;
     enc->cam_pix_fmt = AV_PIX_FMT_NONE; /* no webcam engaged yet */
 
     int ret = avformat_alloc_output_context2(&enc->fmt_ctx, NULL, NULL, path);
@@ -401,7 +416,7 @@ static void draw_rec_dot(uint8_t *rgba, int canvas_w, int canvas_h,
  */
 int encoder_write_video(EncoderCtx *enc, int mode,
                          AVFrame *screen_frame, AVFrame *cam_frame,
-                         int64_t cam_seq)
+                         int64_t cam_seq, int64_t pts_us)
 {
     int cw = enc->canvas_w, ch = enc->canvas_h;
 
@@ -489,15 +504,34 @@ int encoder_write_video(EncoderCtx *enc, int mode,
                   enc->vid_frame->data, enc->vid_frame->linesize);
     }
 
-    /* ── 4. Stamp PTS (microseconds since t0) and encode ── */
-    /* On the very first frame, reset t0 so the video PTS starts near 0.
-       Audio PTS is sample-count-based and also starts at 0, so this keeps
-       the two tracks aligned even when camera/screen init takes a while. */
-    if (!enc->vid_pts) {
-        enc->t0 = av_gettime_relative();
-        enc->vid_pts = 1;  /* mark first-frame handled */
+    /* ── 4. Stamp PTS (microseconds on the session timeline) and encode ── */
+    if (pts_us >= 0) {
+        /* Capture timestamp supplied by the capture layer.  This is the frame's
+           real moment in time, so queueing delay and encoder backlog cannot
+           shift it. */
+        enc->vid_frame->pts = pts_us;
+    } else {
+        /* Legacy path: no capture timestamps available, so stamp now and
+           anchor the first frame at zero. */
+        if (!enc->vid_pts) {
+            enc->t0 = av_gettime_relative();
+            enc->vid_pts = 1;  /* mark first-frame handled */
+        }
+        enc->vid_frame->pts = av_gettime_relative() - enc->t0;
     }
-    enc->vid_frame->pts = av_gettime_relative() - enc->t0;
+
+    /*
+     * Keyframes on a time interval, not a frame count.  Static screen content
+     * is skipped at capture, so a GOP measured in frames can stretch across
+     * minutes of real time and make the file nearly unseekable.
+     */
+    if (enc->last_key_pts < 0 ||
+        enc->vid_frame->pts - enc->last_key_pts >= KEYFRAME_INTERVAL_US) {
+        enc->vid_frame->pict_type = AV_PICTURE_TYPE_I;
+        enc->last_key_pts = enc->vid_frame->pts;
+    } else {
+        enc->vid_frame->pict_type = AV_PICTURE_TYPE_NONE;
+    }
 
     int ret = avcodec_send_frame(enc->vid_enc, enc->vid_frame);
     while (ret == AVERROR(EAGAIN)) {
@@ -525,9 +559,20 @@ int encoder_write_video(EncoderCtx *enc, int mode,
  *  both audio (1/sample_rate) and video (1/1000000) time bases when
  *  interleaving, so they stay locked.
  */
-int encoder_feed_audio(EncoderCtx *enc, AVFrame *raw_frame)
+int encoder_feed_audio(EncoderCtx *enc, AVFrame *raw_frame, int64_t pts_us)
 {
     if (!enc->aud_enc) return 0;
+
+    /* Place the audio track on the session timeline exactly once.  Audio and
+       video are captured by independent subsystems that come up at different
+       times; anchoring both at zero regardless is what makes the audio lead
+       the picture by the whole startup duration. */
+    if (!enc->aud_anchored) {
+        enc->aud_anchored = 1;
+        if (pts_us > 0)
+            enc->aud_pts = av_rescale_q(pts_us, (AVRational){1, 1000000},
+                                        (AVRational){1, enc->aud_enc->sample_rate});
+    }
 
     /* Stamp a native layout with the captured channel count before resampling. */
     int in_channels = enc->aud_in_layout.nb_channels > 0

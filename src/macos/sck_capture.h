@@ -28,6 +28,17 @@ typedef struct {
 } SckCaptureInfo;
 
 /*
+ * Current reading of the session clock, in microseconds.
+ *
+ * This is CMClockGetHostTimeClock() — the same time domain that stamps every
+ * ScreenCaptureKit and AVFoundation sample buffer.  Every subsystem derives its
+ * PTS from this one clock, so screen, webcam, microphone and desktop audio all
+ * land on a single timeline regardless of how long each took to start or how
+ * far behind the encoder falls.
+ */
+int64_t sck_host_time_us(void);
+
+/*
  * Opens capture on the default display.  Populates info with display geometry
  * and audio stream parameters.  Blocks until the SCK stream is running and
  * the first video frame has arrived.
@@ -38,22 +49,42 @@ typedef struct {
 SckCapture *sck_capture_open(SckCaptureInfo *info);
 
 /*
+ * Anchor the session timeline at `t0_us` (a sck_host_time_us() reading).
+ *
+ * Capture starts before the recording does — the stream must already be
+ * running for sck_capture_open() to confirm a first frame, and the webcam and
+ * microphone take a further few hundred milliseconds to come up.  Everything
+ * captured during that window is discarded here, so no source can enter the
+ * recording carrying a head start.  Until this is called, buffers are still
+ * queued but no PTS is meaningful.
+ */
+void sck_capture_start_session(SckCapture *c, int64_t t0_us);
+
+/*
  * Blocks until the next video frame is available.  Returns a heap-allocated
  * AVFrame in BGRA pixel format.  The caller owns the frame and must
  * av_frame_free() it.
  *
+ * *pts_us receives the frame's presentation timestamp relative to the session
+ * start — taken from the sample buffer, so it reports when the frame was
+ * *captured*, not when it was dequeued.  A backlogged queue therefore delays
+ * delivery without corrupting the timeline.
+ *
  * Returns NULL on error or after sck_capture_close() has been called.
  */
-AVFrame *sck_capture_grab_video(SckCapture *c);
+AVFrame *sck_capture_grab_video(SckCapture *c, int64_t *pts_us);
 
 /*
- * Non-blocking read of the latest audio samples.  Returns a heap-allocated
+ * Non-blocking read of the accumulated audio samples.  Returns a heap-allocated
  * AVFrame in the format reported by info (typically FLTP planar float at
  * 48 kHz), or NULL if no audio data is queued.
  *
+ * *pts_us receives the session-relative timestamp of the *first* sample in the
+ * returned frame.
+ *
  * The caller owns the frame and must av_frame_free() it.
  */
-AVFrame *sck_capture_grab_audio(SckCapture *c);
+AVFrame *sck_capture_grab_audio(SckCapture *c, int64_t *pts_us);
 
 /*
  * Stops capture, drains queues, and frees all resources.  Any thread blocked

@@ -61,9 +61,14 @@ struct AvfMic {
 
     /* circular frame queue */
     AVFrame                 *queue[QUEUE_CAP];
+    int64_t                 queue_pts[QUEUE_CAP]; /* session-relative µs */
     int                     head;       /* dequeue position */
     int                     tail;       /* enqueue position */
     int                     count;
+
+    /* Session timeline — see avf_mic_start_session(). */
+    int64_t                 t0_us;
+    int                     session_started;
 
     /* synchronisation */
     pthread_mutex_t         lock;
@@ -280,7 +285,21 @@ static int asbd_to_avfmt(const AudioStreamBasicDescription *asbd,
     }
 
     /* ---- enqueue ---- */
+    CMTime cmpts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    int64_t pts = CMTIME_IS_VALID(cmpts)
+        ? CMTimeConvertScale(cmpts, 1000000,
+                             kCMTimeRoundingMethod_Default).value
+        : 0;
+
     pthread_mutex_lock(&m->lock);
+
+    /* Samples captured while the rest of the recording was still starting up
+       are not part of it. */
+    if (!m->session_started || pts < m->t0_us) {
+        pthread_mutex_unlock(&m->lock);
+        av_frame_free(&dst);
+        return;
+    }
 
     if (m->count >= QUEUE_CAP) {
         /* Queue full — drop oldest frame to stay real-time. */
@@ -289,8 +308,9 @@ static int asbd_to_avfmt(const AudioStreamBasicDescription *asbd,
         m->count--;
     }
 
-    m->queue[m->tail] = dst;
-    m->tail           = (m->tail + 1) % QUEUE_CAP;
+    m->queue[m->tail]     = dst;
+    m->queue_pts[m->tail] = pts - m->t0_us;
+    m->tail               = (m->tail + 1) % QUEUE_CAP;
     m->count++;
 
     pthread_cond_signal(&m->cond);
@@ -391,7 +411,19 @@ fail:
     return NULL;
 }
 
-AVFrame *avf_mic_read(AvfMic *m)
+void avf_mic_start_session(AvfMic *m, int64_t t0_us)
+{
+    if (!m) return;
+    pthread_mutex_lock(&m->lock);
+    m->t0_us           = t0_us;
+    m->session_started = 1;
+    for (int i = 0; i < QUEUE_CAP; i++)
+        av_frame_free(&m->queue[i]);
+    m->head = m->tail = m->count = 0;
+    pthread_mutex_unlock(&m->lock);
+}
+
+AVFrame *avf_mic_read(AvfMic *m, int64_t *pts_us)
 {
     if (!m) return NULL;
 
@@ -420,6 +452,7 @@ AVFrame *avf_mic_read(AvfMic *m)
     }
 
     AVFrame *frame = m->queue[m->head];
+    if (pts_us) *pts_us = m->queue_pts[m->head];
     m->queue[m->head] = NULL;   /* ownership transferred to caller */
     m->head = (m->head + 1) % QUEUE_CAP;
     m->count--;

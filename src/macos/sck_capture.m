@@ -21,11 +21,13 @@
 
 #define VIDEO_QUEUE_DEPTH   8
 #define AUDIO_INIT_SAMPLES  (1024 * 8)
+#define SCK_TARGET_FPS      30
 
 /* ── opaque struct ─────────────────────────────────────────── */
 
 struct SckCapture {
     AVFrame                *video_queue[VIDEO_QUEUE_DEPTH];
+    int64_t                 video_pts[VIDEO_QUEUE_DEPTH];  /* host-clock µs */
     int                     video_head;
     int                     video_count;
     dispatch_semaphore_t    video_sem;
@@ -36,6 +38,13 @@ struct SckCapture {
     int                     audio_channels;
     int                     audio_sample_rate;
     enum AVSampleFormat     audio_fmt;
+    int64_t                 audio_head_pts;   /* host-clock µs of sample 0 */
+
+    /* Session timeline.  t0_us is the host-clock reading that PTS 0 maps to;
+       until session_started is set, arriving buffers are dropped rather than
+       queued, so nothing captured during startup enters the recording. */
+    int64_t                 t0_us;
+    int                     session_started;
 
     void                   *stream;       /* CFBridgingRetain of SCStream */
     dispatch_queue_t        sample_queue;  /* retained — must outlive local scope */
@@ -53,6 +62,8 @@ struct SckCapture {
     int                     debug;
     long                    video_cb;
     long                    audio_cb;
+    long                    video_idle;    /* frames skipped: nothing changed */
+    long                    video_dropped; /* frames evicted: queue overflow */
 };
 
 /* ── helpers ───────────────────────────────────────────────── */
@@ -60,6 +71,44 @@ struct SckCapture {
 static void log_error(const char *msg, OSStatus code)
 {
     fprintf(stderr, "sck_capture: %s (osstatus %d)\n", msg, (int)code);
+}
+
+int64_t sck_host_time_us(void)
+{
+    CMTime now = CMClockGetTime(CMClockGetHostTimeClock());
+    if (!CMTIME_IS_VALID(now)) return 0;
+    return CMTimeConvertScale(now, 1000000, kCMTimeRoundingMethod_Default).value;
+}
+
+/* Presentation timestamp of a sample buffer, in host-clock microseconds.
+   SCK and AVFoundation both stamp against CMClockGetHostTimeClock(), so this
+   is directly comparable with sck_host_time_us(). */
+static int64_t sample_pts_us(CMSampleBufferRef sb)
+{
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
+    if (!CMTIME_IS_VALID(pts)) return sck_host_time_us();
+    return CMTimeConvertScale(pts, 1000000, kCMTimeRoundingMethod_Default).value;
+}
+
+/* Did anything on screen actually change?  SCK re-delivers the previous surface
+   with status Idle when the display is static — encoding those is pure waste,
+   and on a talking-head screencast they are the majority of frames. */
+static BOOL frame_is_complete(CMSampleBufferRef sb)
+{
+    CFArrayRef attachments =
+        CMSampleBufferGetSampleAttachmentsArray(sb, /*create*/ false);
+    if (!attachments || CFArrayGetCount(attachments) == 0) return YES;
+
+    CFDictionaryRef info = CFArrayGetValueAtIndex(attachments, 0);
+    if (!info) return YES;
+
+    CFNumberRef statusRef =
+        CFDictionaryGetValue(info, (__bridge CFStringRef)SCStreamFrameInfoStatus);
+    if (!statusRef) return YES;
+
+    int status = 0;
+    CFNumberGetValue(statusRef, kCFNumberIntType, &status);
+    return status == SCFrameStatusComplete;
 }
 
 static AVFrame *copy_bgra_pixel_buffer(CVPixelBufferRef pb)
@@ -177,6 +226,13 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
         if (c->debug && (c->video_cb == 1 || c->video_cb % 100 == 0))
             fprintf(stderr, "sck: video callback #%ld\n", c->video_cb);
 
+        /* Nothing changed on screen — don't pay to re-encode an identical
+           image.  Wall-clock PTS means the previous frame simply displays
+           longer, which is exactly right for a VFR MP4. */
+        if (!frame_is_complete(sampleBuffer)) { c->video_idle++; return; }
+
+        int64_t pts = sample_pts_us(sampleBuffer);
+
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (!pb) return;
 
@@ -198,20 +254,26 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
         if (!frame) return;
 
         pthread_mutex_lock(&c->lock);
-        if (c->stopped) {
+        /* Before the session is anchored the recording has not begun; and a
+           frame captured ahead of t0 belongs to the startup window. */
+        if (c->stopped || !c->session_started || pts < c->t0_us) {
             av_frame_free(&frame);
             pthread_mutex_unlock(&c->lock);
             return;
         }
 
         if (c->video_count >= VIDEO_QUEUE_DEPTH) {
+            /* Encoder is behind.  Video is the elastic resource: drop the
+               oldest frame rather than stall capture or delay a timestamp. */
             av_frame_free(&c->video_queue[c->video_head]);
             c->video_head = (c->video_head + 1) % VIDEO_QUEUE_DEPTH;
             c->video_count--;
+            c->video_dropped++;
         }
 
         int tail = (c->video_head + c->video_count) % VIDEO_QUEUE_DEPTH;
         c->video_queue[tail] = frame;
+        c->video_pts[tail]   = pts - c->t0_us;
         c->video_count++;
         pthread_mutex_unlock(&c->lock);
         dispatch_semaphore_signal(c->video_sem);
@@ -304,12 +366,21 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
 
         if (nSamples == 0) { CFRelease(blockBuf); return; }
 
+        int64_t apts = sample_pts_us(sampleBuffer);
+
         pthread_mutex_lock(&c->lock);
-        if (c->stopped) {
+        /* Desktop audio flows from the moment the stream starts, which is well
+           before the recording is anchored.  Without this guard those samples
+           are handed over as the first audio of the recording and the whole
+           track leads the video by the startup duration. */
+        if (c->stopped || !c->session_started || apts < c->t0_us) {
             pthread_mutex_unlock(&c->lock);
             CFRelease(blockBuf);
             return;
         }
+
+        if (c->audio_nb_samples == 0)
+            c->audio_head_pts = apts - c->t0_us;
 
         int new_total = c->audio_nb_samples + (int)nSamples;
         /* Interleaved input packs every channel into plane 0, so it needs
@@ -453,6 +524,10 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
         config.channelCount  = 2;
         config.queueDepth = 4;
         config.showsCursor = YES;
+        /* Without this SCK delivers at the display's refresh rate — 60 Hz or
+           120 Hz — and every one of those frames was being converted and
+           encoded, doubling or quadrupling the cost of a 30 fps recording. */
+        config.minimumFrameInterval = CMTimeMake(1, SCK_TARGET_FPS);
 
         /* ── stream ── */
         SCStream *stream = [[SCStream alloc] initWithFilter:filter
@@ -554,7 +629,21 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
     return NULL;
 }
 
-AVFrame *sck_capture_grab_video(SckCapture *c)
+void sck_capture_start_session(SckCapture *c, int64_t t0_us)
+{
+    if (!c) return;
+    pthread_mutex_lock(&c->lock);
+    c->t0_us           = t0_us;
+    c->session_started = 1;
+    /* Anything queued during startup predates the session — discard it. */
+    for (int i = 0; i < VIDEO_QUEUE_DEPTH; i++)
+        av_frame_free(&c->video_queue[i]);
+    c->video_head = c->video_count = 0;
+    c->audio_nb_samples = 0;
+    pthread_mutex_unlock(&c->lock);
+}
+
+AVFrame *sck_capture_grab_video(SckCapture *c, int64_t *pts_us)
 {
     if (!c) return NULL;
 
@@ -571,6 +660,7 @@ AVFrame *sck_capture_grab_video(SckCapture *c)
     }
 
     AVFrame *frame = c->video_queue[c->video_head];
+    if (pts_us) *pts_us = c->video_pts[c->video_head];
     c->video_queue[c->video_head] = NULL;
     c->video_head = (c->video_head + 1) % VIDEO_QUEUE_DEPTH;
     c->video_count--;
@@ -578,7 +668,7 @@ AVFrame *sck_capture_grab_video(SckCapture *c)
     return frame;
 }
 
-AVFrame *sck_capture_grab_audio(SckCapture *c)
+AVFrame *sck_capture_grab_audio(SckCapture *c, int64_t *pts_us)
 {
     if (!c) return NULL;
     pthread_mutex_lock(&c->lock);
@@ -587,6 +677,8 @@ AVFrame *sck_capture_grab_audio(SckCapture *c)
         pthread_mutex_unlock(&c->lock);
         return NULL;
     }
+
+    if (pts_us) *pts_us = c->audio_head_pts;
 
     int nb_samples = c->audio_nb_samples;
     int channels   = c->audio_channels;
@@ -624,8 +716,9 @@ void sck_capture_close(SckCapture *c)
     if (!c) return;
 
     if (c->debug)
-        fprintf(stderr, "sck: totals — video callbacks %ld, audio callbacks %ld\n",
-                c->video_cb, c->audio_cb);
+        fprintf(stderr, "sck: totals — video callbacks %ld (idle %ld, dropped %ld), "
+                        "audio callbacks %ld\n",
+                c->video_cb, c->video_idle, c->video_dropped, c->audio_cb);
 
     pthread_mutex_lock(&c->lock);
     c->stopped = 1;

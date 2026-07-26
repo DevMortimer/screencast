@@ -27,6 +27,7 @@ typedef struct {
     SwrContext       *swr;
     AVChannelLayout   aud_in_layout; /* source layout stamped onto raw frames */
     int64_t           aud_pts;       /* running sample counter */
+    int               aud_anchored;  /* aud_pts has been placed on the timeline */
 
     /* ── Pixel-format conversion (libswscale) ─────── */
     struct SwsContext *sws_screen;   /* screen_pix_fmt  → RGBA canvas */
@@ -55,6 +56,7 @@ typedef struct {
 
     /* ── Timing anchor ────────────────────────────── */
     int64_t t0;          /* av_gettime_relative() at start of recording */
+    int64_t last_key_pts;/* PTS of the last forced keyframe (µs), -1 if none */
     int header_written;
 } EncoderCtx;
 
@@ -95,13 +97,26 @@ void encoder_clear_webcam(EncoderCtx *enc);
  * Composite + encode one video frame.
  * mode 1 = display only, 2 = webcam only, 3 = both.
  * cam_frame may be NULL when no webcam is open or no frame arrived yet.
+ *
+ * pts_us is the frame's capture time in microseconds on the session timeline.
+ * Pass -1 to fall back to stamping wall-clock time at encode, which is what
+ * the Linux path still does until its capture layer carries timestamps.
+ * Prefer a real capture timestamp: a wall-clock stamp silently absorbs any
+ * delay between capture and encode, so the video slides later against the
+ * audio exactly when the machine is too loaded to keep up.
  */
 int  encoder_write_video(EncoderCtx *enc, int mode,
                           AVFrame *screen_frame, AVFrame *cam_frame,
-                          int64_t cam_seq);
+                          int64_t cam_seq, int64_t pts_us);
 
-/* Resample raw audio into FIFO; encodes full 1024-sample chunks. */
-int  encoder_feed_audio(EncoderCtx *enc, AVFrame *raw_frame);
+/*
+ * Resample raw audio into FIFO; encodes full 1024-sample chunks.
+ *
+ * pts_us places the first sample of the very first frame on the session
+ * timeline; later calls ignore it and continue counting samples, which is
+ * drift-free as long as no samples are lost.  Pass -1 to anchor at zero.
+ */
+int  encoder_feed_audio(EncoderCtx *enc, AVFrame *raw_frame, int64_t pts_us);
 
 /* Flush encoders, write MP4 trailer. */
 int  encoder_flush(EncoderCtx *enc);

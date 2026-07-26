@@ -57,10 +57,26 @@ typedef struct {
     int has_aud;               /* has_mic || has_desktop */
     long mic_frames;           /* diagnostics: frames handed to the mixer */
     long desk_frames;
+    int64_t t0_us;             /* session clock origin (host clock) */
+    atomic_llong audio_anchor_us; /* timeline position of the first audio sample */
     char output_path[512];     /* ~/Movies/screencast_YYYYMMDD_HHMMSS.mp4 */
 } RecCtx;
 
 static RecCtx s_rec;
+
+/*
+ * Record where the audio track begins on the session timeline.
+ *
+ * Whichever source delivers first wins, and the value never moves afterwards:
+ * the encoder anchors the track once and then counts samples, so a later
+ * update would be a discontinuity rather than a correction.
+ */
+static void note_audio_anchor(int64_t pts_us)
+{
+    int64_t unset = -1;
+    if (pts_us < 0) pts_us = 0;
+    atomic_compare_exchange_strong(&s_rec.audio_anchor_us, &unset, pts_us);
+}
 
 /* ── helper: build timestamped output path ─────────────────── */
 
@@ -89,7 +105,8 @@ static void cam_frame_cb(void *user, AVFrame *frame)
 
 static void mixer_sink_encode(void *user, AVFrame *mixed)
 {
-    encoder_feed_audio((EncoderCtx *)user, mixed);
+    encoder_feed_audio((EncoderCtx *)user, mixed,
+                       atomic_load(&s_rec.audio_anchor_us));
 }
 
 /* ── microphone audio thread ───────────────────────────────── */
@@ -110,7 +127,8 @@ static void *mic_thread(void *arg)
     int fails = 0;
 
     while (atomic_load(&g_running) && atomic_load(&s_rec_open)) {
-        AVFrame *f = avf_mic_read(rec->avf_mic);
+        int64_t pts_us = 0;
+        AVFrame *f = avf_mic_read(rec->avf_mic, &pts_us);
         if (!f) {
             /* NULL can mean timeout (still recording) or stop. */
             if (!atomic_load(&g_running) || !atomic_load(&s_rec_open))
@@ -125,7 +143,41 @@ static void *mic_thread(void *arg)
         }
         fails = 0;
         rec->mic_frames++;
+        note_audio_anchor(pts_us);
         mixer_feed(rec->mixer, MIX_SRC_MIC, f,
+                   MIX_SAMPLE_RATE,
+                   &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO,
+                   AV_SAMPLE_FMT_FLTP);
+        av_frame_free(&f);
+    }
+    return NULL;
+}
+
+/* ── desktop audio thread ──────────────────────────────────── */
+
+/*
+ * Drains system audio from the ScreenCaptureKit stream.
+ *
+ * This has to be its own thread.  It used to run inline in the record loop,
+ * pulling audio only when a video frame arrived — which was survivable when
+ * every frame was delivered, but the capture layer now skips frames while the
+ * screen is static.  On a talking-head screencast that is most of them, so
+ * audio would sit in the capture buffer growing unboundedly and then arrive in
+ * one lump whenever the picture finally changed.
+ */
+static void *desktop_audio_thread(void *arg)
+{
+    RecCtx *rec = arg;
+    struct timespec tick = { .tv_nsec = 10000000L }; /* 10 ms */
+
+    while (atomic_load(&g_running) && atomic_load(&s_rec_open)) {
+        int64_t pts_us = 0;
+        AVFrame *f = sck_capture_grab_audio(rec->sck, &pts_us);
+        if (!f) { nanosleep(&tick, NULL); continue; }
+
+        rec->desk_frames++;
+        note_audio_anchor(pts_us);
+        mixer_feed(rec->mixer, MIX_SRC_DESKTOP, f,
                    MIX_SAMPLE_RATE,
                    &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO,
                    AV_SAMPLE_FMT_FLTP);
@@ -166,12 +218,23 @@ static int recording_open(void)
     s_rec.cam_h = 0;
     s_rec.cam_fmt = AV_PIX_FMT_NONE;
 
-    /* Default webcam: 640x360 — the overlay is ≤480px and the webcam is
-       secondary.  A low default avoids burning CPU/GPU on high-res frames
-       that get scaled down anyway, and keeps the video PTS close to the
-       audio PTS (sample-count-based, drift-free).  Override with
-       SCREENCAST_CAM_SIZE=WxH if you need higher webcam quality. */
-    int cam_w_hint = 640, cam_h_hint = 360, cam_fps_hint = 30;
+    /*
+     * Default webcam: 1920x1080.
+     *
+     * This is the largest size external UVC cameras deliver as raw NV12 —
+     * above it they switch to MJPEG, which costs a JPEG decode on every single
+     * frame of the recording.  1080p is generous for the ≤480px overlay in
+     * `both` mode and adequate when the webcam fills the canvas, and it stays
+     * in the pixel format the pipeline wants, so it needs no decode at all.
+     *
+     * The format is fixed for the whole session rather than varied per mode:
+     * changing it means restarting the capture device, which would blank the
+     * camera and break the timeline every time the mode hotkey is pressed.
+     *
+     * Override with SCREENCAST_CAM_SIZE=WxH.  Asking for 3840x2160 will
+     * select MJPEG and pay for the decode.
+     */
+    int cam_w_hint = 1920, cam_h_hint = 1080, cam_fps_hint = 30;
     const char *size = getenv("SCREENCAST_CAM_SIZE");
     if (size && size[0]) sscanf(size, "%dx%d", &cam_w_hint, &cam_h_hint);
     const char *fps = getenv("SCREENCAST_CAM_FPS");
@@ -257,6 +320,18 @@ static int recording_open(void)
         return -1;
     }
 
+    /*
+     * Anchor the session timeline.  Everything above — the SCK stream, the
+     * webcam, the microphone — has been running and buffering for as long as
+     * it took to get here, and those buffers are not part of the recording.
+     * Fixing t0 once, after the last source is live, is what stops any one
+     * track from entering with a head start on the others.
+     */
+    s_rec.t0_us = sck_host_time_us();
+    atomic_store(&s_rec.audio_anchor_us, -1);
+    sck_capture_start_session(s_rec.sck, s_rec.t0_us);
+    if (s_rec.avf_mic) avf_mic_start_session(s_rec.avf_mic, s_rec.t0_us);
+
     atomic_store(&s_rec_open, 1);
     return 0;
 }
@@ -266,9 +341,15 @@ static int recording_open(void)
 static void recording_loop(void)
 {
     pthread_t mic_tid = 0;
+    pthread_t desk_tid = 0;
+    int debug = getenv("SCREENCAST_DEBUG") != NULL;
+    int64_t next_report = 10 * 1000000LL;
+    long frames_encoded = 0;
 
     if (s_rec.has_mic)
         pthread_create(&mic_tid, NULL, mic_thread, &s_rec);
+    if (s_rec.has_desktop && s_rec.mixer)
+        pthread_create(&desk_tid, NULL, desktop_audio_thread, &s_rec);
 
     while (atomic_load(&g_running) && atomic_load(&g_recording)) {
         RecordMode mode = atomic_load(&g_mode);
@@ -286,24 +367,12 @@ static void recording_loop(void)
 
         /* Grab screen frame (blocking with timeout — unblocks ~500ms so
            the stop condition is checked promptly). */
-        AVFrame *screen = sck_capture_grab_video(s_rec.sck);
+        int64_t screen_pts = -1;
+        AVFrame *screen = sck_capture_grab_video(s_rec.sck, &screen_pts);
         if (!screen) {
             if (!atomic_load(&g_running) || !atomic_load(&g_recording))
                 break;
             continue;
-        }
-
-        /* Grab desktop audio (non-blocking) */
-        if (s_rec.has_desktop && s_rec.mixer) {
-            AVFrame *desk_audio = sck_capture_grab_audio(s_rec.sck);
-            if (desk_audio) {
-                s_rec.desk_frames++;
-                mixer_feed(s_rec.mixer, MIX_SRC_DESKTOP, desk_audio,
-                           MIX_SAMPLE_RATE,
-                           &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO,
-                           AV_SAMPLE_FMT_FLTP);
-                av_frame_free(&desk_audio);
-            }
         }
 
         /* Get latest webcam frame */
@@ -319,14 +388,39 @@ static void recording_loop(void)
             pthread_mutex_unlock(&s_cam_mutex);
         }
 
-        encoder_write_video(&s_rec.enc, mode, screen, cam, cam_seq);
+        encoder_write_video(&s_rec.enc, mode, screen, cam, cam_seq, screen_pts);
+        frames_encoded++;
 
         av_frame_free(&screen);
         if (cam) av_frame_free(&cam);
+
+        /*
+         * Sync telemetry.  Both tracks are stamped from the same session clock,
+         * so a healthy recording holds this delta near zero for its whole
+         * duration; a delta that grows means one track is slipping and is worth
+         * catching here rather than by watching the finished video.
+         */
+        if (debug && screen_pts >= next_report) {
+            int64_t aud_us = 0;
+            if (s_rec.enc.aud_enc && s_rec.enc.aud_enc->sample_rate > 0)
+                aud_us = av_rescale_q(s_rec.enc.aud_pts,
+                            (AVRational){1, s_rec.enc.aud_enc->sample_rate},
+                            (AVRational){1, 1000000});
+            fprintf(stderr,
+                    "[SYNC] t=%llds video_pts=%lldms audio_pts=%lldms "
+                    "delta=%+lldms frames=%ld\n",
+                    (long long)(screen_pts / 1000000),
+                    (long long)(screen_pts / 1000),
+                    (long long)(aud_us / 1000),
+                    (long long)((aud_us - screen_pts) / 1000),
+                    frames_encoded);
+            next_report += 10 * 1000000LL;
+        }
     }
 
     atomic_store(&s_rec_open, 0);
-    if (mic_tid) pthread_join(mic_tid, NULL);
+    if (mic_tid)  pthread_join(mic_tid, NULL);
+    if (desk_tid) pthread_join(desk_tid, NULL);
 }
 
 /* ── close / flush one recording session ───────────────────── */
