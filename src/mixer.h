@@ -83,4 +83,13 @@ void mixer_drop_source(MixerCtx *m, MixSource src);
  */
 int  mixer_source_live(MixerCtx *m, MixSource src);
 
+/*
+ * Testing seam: replace the clock the mixer measures elapsed time with.
+ *
+ * The mixer decides when a source has gone quiet by how much time has passed,
+ * which is the one thing a test cannot control without sleeping through it.
+ * Call this immediately after mixer_create, and only from tests.
+ */
+void mixer_set_clock(MixerCtx *m, int64_t (*now_us)(void));
+
 void mixer_destroy(MixerCtx *m);

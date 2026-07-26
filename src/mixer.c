@@ -30,18 +30,26 @@ static void log_err(const char *label, int ret)
 #define MIX_GAP_MIN_US (30 * 1000LL)
 
 /*
- * How much a source may buffer before samples are discarded.
+ * How long a source may deliver nothing before the mixer starts covering for it
+ * with silence.
  *
- * This has to exceed MIX_STALL_TIMEOUT_US, and that is the whole reason it is
- * not simply MIX_FIFO_CAP_MS.  While one source is stalled the min() below
- * emits nothing, so the live source's samples accumulate for as long as the
- * stall lasts.  A bound shorter than the stall timeout would start discarding
- * them before the stalled source is declared dead — and a discarded audio
- * sample is not a dropout, it is every later sample playing early for the rest
- * of the recording.  Sized to outlast the timeout, nothing is ever dropped that
- * the timeout would not have resolved.  Costs ~768 kB per source.
+ * This is what keeps the mixed track *flowing*, and that matters far beyond the
+ * mixer: the output is muxed with av_interleaved_write_frame, which holds video
+ * packets until audio covers the same span.  A mixer that goes quiet does not
+ * produce a quiet recording, it produces a frozen picture.  Desktop audio is
+ * the source that makes this real — it only has samples when something is
+ * playing, so it lags the microphone constantly.
+ *
+ * Above ordinary buffer jitter, well below the point a viewer would notice.
  */
-#define MIX_BOUND_MS 2500
+#define MIX_SILENCE_GRACE_US (120 * 1000LL)
+
+/*
+ * How much a source may buffer before samples are discarded.  With the grace
+ * above keeping the mix moving this should never be reached; it is a backstop,
+ * not a policy.  Costs ~384 kB per source.
+ */
+#define MIX_BOUND_MS 1000
 
 struct MixerCtx {
     int             active[MIX_SRC_COUNT];
@@ -50,6 +58,9 @@ struct MixerCtx {
     int64_t         anchor_us[MIX_SRC_COUNT]; /* pts of the source's sample 0 */
     int64_t         written[MIX_SRC_COUNT];   /* canonical samples since anchor,
                                                  inserted silence included */
+    int64_t         covered_us[MIX_SRC_COUNT];/* clock instant this source's
+                                                 content accounts up to */
+    int64_t       (*now_us)(void);         /* clock; swapped out by tests */
     SwrContext     *swr[MIX_SRC_COUNT];   /* source → canonical, lazily built */
     AVAudioFifo    *fifo[MIX_SRC_COUNT];  /* canonical stereo FLTP, bounded */
     int             fifo_cap;             /* samples per emitted chunk */
@@ -61,6 +72,13 @@ struct MixerCtx {
     int             debug;
     pthread_mutex_t lock;
 };
+
+/* Default clock.  Indirected so tests can drive elapsed time exactly rather
+   than sleeping through it; nothing else ever replaces it. */
+static int64_t mixer_default_now_us(void)
+{
+    return av_gettime_relative();
+}
 
 static float clampf(float v)
 {
@@ -121,7 +139,7 @@ static void mixer_pad_silence_locked(MixerCtx *m, MixSource src, int64_t n)
  */
 static void mixer_drain_locked(MixerCtx *m)
 {
-    int64_t now = av_gettime_relative();
+    int64_t now = m->now_us();
 
     for (int i = 0; i < MIX_SRC_COUNT; i++) {
         if (!m->active[i] || !m->primed[i]) continue;
@@ -133,18 +151,36 @@ static void mixer_drain_locked(MixerCtx *m)
     }
 
     /*
-     * There is deliberately no second mechanism here for "this source looks
-     * behind, pad it up to the others".  FIFO depth is not a position on the
-     * timeline: silence inserted for a timestamp gap makes a source's buffer
-     * deeper without any time having passed, so a rule that padded whatever
-     * looked shallow would read a *healthy* source as lagging and inject
-     * silence it never lost — turning one source's gap into a shift of the
-     * whole mix.  Only a source's own timestamps may move it on the timeline.
+     * Cover for a source that is not delivering *now*.
      *
-     * A stalled source therefore just holds the min() at zero while the live
-     * source buffers, which is why that bound is sized to outlast the stall
-     * timeout rather than to a comfortable jitter window.
+     * A source that has gone quiet for longer than the grace is, as far as the
+     * recording is concerned, silent — so write that silence and let the mix
+     * keep moving.  Without this the min() below sits at zero for as long as
+     * the source is away, the mixed track stops, and because the muxer holds
+     * video until audio covers the same span, the picture freezes with it.
+     *
+     * The measure is elapsed time on the clock, never how deep a buffer looks.
+     * That distinction is the whole correctness of this function.  Silence
+     * inserted for a timestamp gap makes a buffer deeper without any time
+     * having passed, so a depth-based rule reads a *healthy* source as lagging
+     * and injects a gap it never had — turning one source's loss into a shift
+     * of the entire mix.  Elapsed time cannot be forged that way: a source that
+     * is still delivering is never behind here, whatever its buffer looks like.
+     *
+     * Padding advances written[], so a source that comes back with timestamps
+     * finds the hole already filled and does not fill it twice.
      */
+    for (int i = 0; i < MIX_SRC_COUNT; i++) {
+        if (!m->active[i] || !m->primed[i]) continue;
+        int64_t behind_us = now - m->covered_us[i];
+        if (behind_us < MIX_SILENCE_GRACE_US) continue;
+        if (m->debug)
+            fprintf(stderr, "mixer: source %d quiet for %lldms — covering\n",
+                    i, (long long)(behind_us / 1000));
+        mixer_pad_silence_locked(m, (MixSource)i,
+                                 av_rescale(behind_us, MIX_SAMPLE_RATE, 1000000));
+        m->covered_us[i] = now;
+    }
 
     /* Loop: a large run of inserted silence can exceed one output frame, and
        leaving the remainder queued would just defer the same work to the next
@@ -197,6 +233,7 @@ MixerCtx *mixer_create(const int active[MIX_SRC_COUNT],
 
     m->sink     = sink;
     m->user     = user;
+    m->now_us   = mixer_default_now_us;
     m->debug    = getenv("SCREENCAST_DEBUG") != NULL;
     m->fifo_cap  = MIX_SAMPLE_RATE * MIX_FIFO_CAP_MS / 1000;
     m->bound_cap = MIX_SAMPLE_RATE * MIX_BOUND_MS / 1000;
@@ -327,7 +364,10 @@ int mixer_feed(MixerCtx *m, MixSource src, AVFrame *raw,
             if (m->debug)
                 fprintf(stderr, "mixer: source %d primed (first samples)\n", src);
         }
-        m->last_feed_us[src] = av_gettime_relative();
+        /* Delivered, so this source accounts for the timeline up to now and
+           owes no silence. */
+        m->last_feed_us[src] = m->now_us();
+        m->covered_us[src]   = m->last_feed_us[src];
     }
     av_frame_free(&res);
 
@@ -377,6 +417,15 @@ int mixer_source_live(MixerCtx *m, MixSource src)
     int live = m->active[src] && m->primed[src];
     pthread_mutex_unlock(&m->lock);
     return live;
+}
+
+void mixer_set_clock(MixerCtx *m, int64_t (*now_us)(void))
+{
+    if (!m || !now_us) return;
+    pthread_mutex_lock(&m->lock);
+    m->now_us = now_us;
+    for (int i = 0; i < MIX_SRC_COUNT; i++) m->covered_us[i] = now_us();
+    pthread_mutex_unlock(&m->lock);
 }
 
 void mixer_destroy(MixerCtx *m)

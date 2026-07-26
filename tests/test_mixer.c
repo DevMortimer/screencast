@@ -10,8 +10,8 @@
  * a source reports through its timestamps becomes silence, and a gap in *one*
  * source never becomes a shift of the whole mix.
  *
- * Everything is deterministic — the mixer moves a source on the timeline only
- * by that source's own timestamps, never by a clock — so no test sleeps.
+ * Everything is deterministic: the tests drive the mixer's clock directly
+ * (mixer_set_clock), so elapsed time is exact and nothing sleeps.
  */
 
 #include "mixer.h"
@@ -88,6 +88,19 @@ static int sink_region_is(int from, int to, float want)
     return 1;
 }
 
+/* ── controllable clock ────────────────────────────────────── */
+
+/*
+ * The mixer decides a source has gone quiet by elapsed time, so the tests own
+ * the clock rather than sleeping through it.  Feeds advance it by the duration
+ * of the audio they carry, which is what a real capture does.
+ */
+static int64_t g_now_us;
+static int64_t test_now_us(void) { return g_now_us; }
+
+/* Let `ms` of recording time pass. */
+static void advance(int ms) { g_now_us += (int64_t)ms * 1000; }
+
 /* ── input helper ──────────────────────────────────────────── */
 
 /* One canonical-format frame of `n` samples holding a constant value. */
@@ -133,6 +146,8 @@ static void test_gap_becomes_silence(void)
     int active[MIX_SRC_COUNT] = { [MIX_SRC_MIC] = 1 };
     MixerCtx *m = mixer_create(active, sink_fn, NULL);
     assert(m);
+    g_now_us = 0;
+    mixer_set_clock(m, test_now_us);
 
     feed(m, MIX_SRC_MIC, MS(10), 0.5f, 0);
     CHECK(g_sink.n == MS(10), "expected %d samples, got %d", MS(10), g_sink.n);
@@ -163,6 +178,8 @@ static void test_jitter_is_not_a_gap(void)
     int active[MIX_SRC_COUNT] = { [MIX_SRC_MIC] = 1 };
     MixerCtx *m = mixer_create(active, sink_fn, NULL);
     assert(m);
+    g_now_us = 0;
+    mixer_set_clock(m, test_now_us);
 
     /* Ten 10 ms buffers, each arriving 2 ms later than nominal. */
     for (int i = 0; i < 10; i++)
@@ -186,6 +203,8 @@ static void test_no_pts_never_pads(void)
     int active[MIX_SRC_COUNT] = { [MIX_SRC_MIC] = 1 };
     MixerCtx *m = mixer_create(active, sink_fn, NULL);
     assert(m);
+    g_now_us = 0;
+    mixer_set_clock(m, test_now_us);
 
     for (int i = 0; i < 5; i++)
         feed(m, MIX_SRC_MIC, MS(10), 0.5f, AV_NOPTS_VALUE);
@@ -206,35 +225,43 @@ static void test_no_pts_never_pads(void)
  * A full second of stall is five times the old 200 ms bound, so nothing here
  * could have survived it before.
  */
-static void test_stalled_source_loses_nothing(void)
+static void test_quiet_source_does_not_freeze_the_mix(void)
 {
-    fprintf(stderr, "test_stalled_source_loses_nothing\n");
+    fprintf(stderr, "test_quiet_source_does_not_freeze_the_mix\n");
     sink_reset();
 
     int active[MIX_SRC_COUNT] = { [MIX_SRC_MIC] = 1, [MIX_SRC_DESKTOP] = 1 };
     MixerCtx *m = mixer_create(active, sink_fn, NULL);
     assert(m);
+    g_now_us = 0;
+    mixer_set_clock(m, test_now_us);
 
     feed(m, MIX_SRC_MIC,     MS(10), 0.5f,  0);
     feed(m, MIX_SRC_DESKTOP, MS(10), 0.25f, 0);
 
-    /* Desktop audio stops dead; the mic keeps going for a full second. */
-    for (int i = 1; i <= 100; i++)
+    /* Desktop audio goes quiet — nothing is playing — while the mic runs on
+       for a full second of recording time. */
+    for (int i = 1; i <= 100; i++) {
+        advance(10);
         feed(m, MIX_SRC_MIC, MS(10), 0.5f, US(10 * i));
+    }
 
-    /* Desktop returns, correctly stamped for where the timeline now is.  Its
-       missing second is written in as the silence it actually was, and the
-       mic's second — held back all this time — comes out intact behind it. */
-    feed(m, MIX_SRC_DESKTOP, MS(10), 0.25f, US(1010));
+    /*
+     * The mix must have kept moving throughout.  It previously emitted nothing
+     * at all here: min() sat at zero for the whole second, and because the
+     * muxer holds video until audio covers the same span, the picture froze
+     * for a second with it.
+     */
+    CHECK(g_sink.n >= MS(1010) - MS(120),
+          "mix stalled behind the quiet source: %d samples for 1010ms",
+          g_sink.n);
+    CHECK(g_sink.n <= MS(1010), "mix ran ahead of real time: %d samples "
+          "for 1010ms", g_sink.n);
 
-    CHECK(g_sink.n == MS(1010), "expected %d samples, got %d",
-          MS(1010), g_sink.n);
-    /* Desktop's one real buffer mixes in behind the mic's priming buffer
-       (0.5 + 0.25); the stalled second after it is mic alone. */
-    CHECK(sink_region_is(MS(10), MS(20), 0.75f),
-          "desktop's only real buffer was not mixed");
-    CHECK(sink_region_is(MS(20), MS(1010), 0.5f),
-          "mic was not carried through the stall at unity");
+    /* The mic is carried at unity — the quiet source contributed silence, not
+       a hole and not its last buffer repeated. */
+    CHECK(sink_region_is(MS(20), g_sink.n, 0.5f),
+          "quiet source contributed something other than silence");
 
     mixer_destroy(m);
 }
@@ -259,8 +286,11 @@ static void test_one_sources_gap_is_not_the_mixs_shift(void)
     int active[MIX_SRC_COUNT] = { [MIX_SRC_MIC] = 1, [MIX_SRC_DESKTOP] = 1 };
     MixerCtx *m = mixer_create(active, sink_fn, NULL);
     assert(m);
+    g_now_us = 0;
+    mixer_set_clock(m, test_now_us);
 
     for (int i = 0; i < 10; i++) {
+        advance(10);
         feed(m, MIX_SRC_MIC,     MS(10), 0.5f,  US(10 * i));
         feed(m, MIX_SRC_DESKTOP, MS(10), 0.25f, US(10 * i));
     }
@@ -268,6 +298,7 @@ static void test_one_sources_gap_is_not_the_mixs_shift(void)
     /* The mic drops half a second but keeps delivering; desktop is untouched
        and its timestamps say so.  Only 100 ms more of real time passes. */
     for (int i = 10; i < 20; i++) {
+        advance(10);
         feed(m, MIX_SRC_MIC,     MS(10), 0.5f,  US(10 * i) + 500000);
         feed(m, MIX_SRC_DESKTOP, MS(10), 0.25f, US(10 * i));
     }
@@ -287,7 +318,7 @@ int main(void)
     test_gap_becomes_silence();
     test_jitter_is_not_a_gap();
     test_no_pts_never_pads();
-    test_stalled_source_loses_nothing();
+    test_quiet_source_does_not_freeze_the_mix();
     test_one_sources_gap_is_not_the_mixs_shift();
 
     for (int c = 0; c < MIX_CHANNELS; c++) free(g_sink.ch[c]);
