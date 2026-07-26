@@ -19,6 +19,7 @@
 #import <libavutil/hwcontext.h>
 #import <libavutil/hwcontext_videotoolbox.h>
 #import <libavutil/imgutils.h>
+#import <libavutil/opt.h>
 #import <stdio.h>
 
 #define W       1280
