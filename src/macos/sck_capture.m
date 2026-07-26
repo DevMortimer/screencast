@@ -32,6 +32,13 @@ struct SckCapture {
     int                     video_count;
     dispatch_semaphore_t    video_sem;
 
+    /* Signalled once as soon as the stream delivers anything at all.  Distinct
+       from video_sem: open() needs to know the stream is live, which is a
+       question about the stream, not about the recording — frames arriving
+       before the session is anchored are still proof it works. */
+    dispatch_semaphore_t    ready_sem;
+    int                     ready_signalled;
+
     uint8_t                *audio_planes[2];
     int                     audio_nb_samples;
     int                     audio_plane_cap;
@@ -225,6 +232,13 @@ static AVFrame *convert_nv12_to_bgra(CVPixelBufferRef pb)
         c->video_cb++;
         if (c->debug && (c->video_cb == 1 || c->video_cb % 100 == 0))
             fprintf(stderr, "sck: video callback #%ld\n", c->video_cb);
+
+        /* Report the stream as live before any filtering below can discard
+           this frame.  Touched only from the serial sample queue. */
+        if (!c->ready_signalled) {
+            c->ready_signalled = 1;
+            dispatch_semaphore_signal(c->ready_sem);
+        }
 
         /* Nothing changed on screen — don't pay to re-encode an identical
            image.  Wall-clock PTS means the previous frame simply displays
@@ -435,7 +449,8 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
     c->debug = (getenv("SCREENCAST_DEBUG") != NULL);
     pthread_mutex_init(&c->lock, NULL);
     c->video_sem = dispatch_semaphore_create(0);
-    if (!c->video_sem) { free(c); return NULL; }
+    c->ready_sem = dispatch_semaphore_create(0);
+    if (!c->video_sem || !c->ready_sem) { free(c); return NULL; }
 
     /* do/while(0) + break for ARC-safe cleanup (goto cannot cross ObjC
        __strong variables inside blocks under ARC). */
@@ -594,14 +609,15 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
             break;
         }
 
-        /* ── wait for first video frame (5 s timeout) ── */
-        intptr_t sig = dispatch_semaphore_wait(c->video_sem,
+        /* ── wait for the stream to prove it is delivering (5 s timeout) ──
+         * The frame itself is not kept: the session is anchored later, and
+         * everything captured before that point is startup, not recording. */
+        intptr_t sig = dispatch_semaphore_wait(c->ready_sem,
                                 dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
         if (sig != 0) {
             fprintf(stderr, "sck_capture: timed out waiting for first frame\n");
             break;
         }
-        dispatch_semaphore_signal(c->video_sem); /* keep frame in queue */
 
         /* ── populate info ── */
         if (info) {
