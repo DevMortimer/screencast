@@ -49,4 +49,15 @@ int  capture_audio_open_monitor(CaptureCtx *ctx, const char *source);
 /* Read + decode one frame into ctx->frame. Returns 0 on success. */
 int  capture_read(CaptureCtx *ctx);
 
+/*
+ * Capture timestamp of the frame currently in ctx->frame, in microseconds on
+ * the source's own clock, or AV_NOPTS_VALUE if it carries none.
+ *
+ * Only the differences between successive calls mean anything — the mixer uses
+ * them to tell a source that skipped samples apart from one that merely
+ * delivered late, which is the difference between silence in the track and a
+ * permanent offset against the video.
+ */
+int64_t capture_frame_pts_us(const CaptureCtx *ctx);
+
 void capture_free(CaptureCtx *ctx);

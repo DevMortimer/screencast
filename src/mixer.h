@@ -16,6 +16,14 @@
  * "Live" means active *and* primed: a source counts toward the min() only after
  * its first delivered sample, and is dropped if it then stalls.  Without this a
  * single silent source zeroes the min() and the whole mixed track disappears.
+ *
+ * Gaps become silence, never a shift.  A source that skips samples — reported
+ * by its timestamps — or that simply stops delivering for a while has the
+ * missing span written into its FIFO as silence, so the mix keeps flowing and
+ * the sources that are still running lose nothing.  The alternative is what
+ * bounded FIFOs do left to themselves: discard the live source's oldest samples
+ * to make room, which does not sound like a dropout, it sounds like every
+ * remaining sample arriving early against the video, for the rest of the take.
  */
 
 /* Canonical mix format: stereo FLTP at 48 kHz (clean AAC input). */
@@ -46,10 +54,20 @@ MixerCtx *mixer_create(const int active[MIX_SRC_COUNT],
  * Feed one raw capture frame for `src` (any rate/layout/format). Resamples to
  * the canonical format, buffers it, and drains any mixable samples to the sink.
  * Thread-safe: mic and desktop threads may call concurrently for their own src.
+ *
+ * `pts_us` is the capture timestamp of the frame's *first* sample, on whatever
+ * clock the source uses — only the differences between one call and the next
+ * matter, so the mixer anchors itself on the first value it sees.  A source
+ * that has no timestamps passes AV_NOPTS_VALUE and is counted by samples alone.
+ *
+ * Timestamps are what let a hole in a source become silence rather than an
+ * offset.  The audio track's PTS is a running sample count, so samples a device
+ * failed to deliver do not play back as a dropout; they play back as every
+ * later sample arriving early, permanently, against the video.
  */
 int  mixer_feed(MixerCtx *m, MixSource src, AVFrame *raw,
                 int in_sample_rate, const AVChannelLayout *in_layout,
-                enum AVSampleFormat in_fmt);
+                enum AVSampleFormat in_fmt, int64_t pts_us);
 
 /*
  * Drop `src` from the mix (e.g. its capture device died mid-recording).  The

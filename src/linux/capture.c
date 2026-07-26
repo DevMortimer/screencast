@@ -264,6 +264,23 @@ int capture_read(CaptureCtx *ctx)
     }
 }
 
+int64_t capture_frame_pts_us(const CaptureCtx *ctx)
+{
+    if (!ctx || ctx->wl_backend || !ctx->frame || !ctx->fmt_ctx)
+        return AV_NOPTS_VALUE;
+    if (ctx->frame->pts == AV_NOPTS_VALUE)
+        return AV_NOPTS_VALUE;
+    if (ctx->stream_idx < 0 || ctx->stream_idx >= (int)ctx->fmt_ctx->nb_streams)
+        return AV_NOPTS_VALUE;
+
+    /* The decoder copies the packet's timestamp through unchanged, so it is
+       still in the demuxer stream's time base. */
+    AVRational tb = ctx->fmt_ctx->streams[ctx->stream_idx]->time_base;
+    if (tb.num <= 0 || tb.den <= 0) return AV_NOPTS_VALUE;
+
+    return av_rescale_q(ctx->frame->pts, tb, (AVRational){1, 1000000});
+}
+
 void capture_free(CaptureCtx *ctx)
 {
     if (!ctx) return;

@@ -120,6 +120,13 @@ clean:
 TEST_BIN  := $(OBJDIR)/test_arbiter
 TEST_SRCS := tests/test_arbiter.c src/linux/arbiter.c
 
+# The mixer is the other pure seam: given frames in, it decides what comes out
+# and when silence has to stand in for a source.  It needs libav (swresample +
+# avutil) but no device, so it runs anywhere the project builds.
+MIXER_TEST_BIN  := $(OBJDIR)/test_mixer
+MIXER_TEST_SRCS := tests/test_mixer.c src/mixer.c
+MIXER_TEST_PKGS := libswresample libavutil
+
 # VideoToolbox hardware-frame probe (macOS only).  Standalone: verifies that
 # h264_videotoolbox accepts CVPixelBuffers by reference, both from libav's own
 # hardware pool and wrapped from an external source.  Links nothing from src/.
@@ -137,14 +144,20 @@ else
 	@echo "probe is macOS only"
 endif
 
+test-mixer: | $(OBJDIR)
+	$(CC) -Isrc -pthread -O2 -Wall -Wextra -std=c11 \
+	    $(shell pkg-config --cflags $(MIXER_TEST_PKGS)) \
+	    -o $(MIXER_TEST_BIN) $(MIXER_TEST_SRCS) \
+	    $(shell pkg-config --libs $(MIXER_TEST_PKGS)) -lm -pthread
+	$(MIXER_TEST_BIN)
+
 ifneq ($(PLATFORM),macos)
-test: | $(OBJDIR)
+test: test-mixer | $(OBJDIR)
 	$(CC) -Isrc -Isrc/linux -pthread -O2 -Wall -Wextra -std=c11 \
 	    -o $(TEST_BIN) $(TEST_SRCS)
 	$(TEST_BIN)
 else
-test:
-	@echo "No tests on macOS yet"
+test: test-mixer
 endif
 
-.PHONY: all clean test probe
+.PHONY: all clean test test-mixer probe

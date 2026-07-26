@@ -459,8 +459,9 @@ static void apply_plan(const ArbiterPlan *p)
 /* Mixed audio is delivered here and handed to the encoder's audio path. */
 static void mixer_sink_encode(void *user, AVFrame *mixed)
 {
-    /* -1: the PipeWire capture path does not carry buffer timestamps yet, so
-       the audio track is anchored at zero and counts samples from there. */
+    /* -1: the track is anchored at zero and counts samples from there.  The
+       mixer has already used the capture timestamps to turn any gap in a
+       source into silence, so counting samples here cannot drift. */
     encoder_feed_audio((EncoderCtx *)user, mixed, -1);
 }
 
@@ -499,7 +500,8 @@ static void *audio_thread(void *arg)
         }
         fails = 0;
         mixer_feed(a->mixer, a->src, a->cap->frame,
-                   a->cap->sample_rate, &a->cap->ch_layout, a->cap->sample_fmt);
+                   a->cap->sample_rate, &a->cap->ch_layout, a->cap->sample_fmt,
+                   capture_frame_pts_us(a->cap));
     }
     return NULL;
 }

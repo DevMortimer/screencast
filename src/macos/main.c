@@ -241,7 +241,7 @@ static void *mic_thread(void *arg)
         mixer_feed(rec->mixer, MIX_SRC_MIC, f,
                    MIX_SAMPLE_RATE,
                    &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO,
-                   AV_SAMPLE_FMT_FLTP);
+                   AV_SAMPLE_FMT_FLTP, pts_us);
         av_frame_free(&f);
     }
     return NULL;
@@ -274,7 +274,7 @@ static void *desktop_audio_thread(void *arg)
         mixer_feed(rec->mixer, MIX_SRC_DESKTOP, f,
                    MIX_SAMPLE_RATE,
                    &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO,
-                   AV_SAMPLE_FMT_FLTP);
+                   AV_SAMPLE_FMT_FLTP, pts_us);
         av_frame_free(&f);
     }
     return NULL;

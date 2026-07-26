@@ -16,20 +16,44 @@ static void log_err(const char *label, int ret)
     fprintf(stderr, "mixer: %s: %s\n", label, buf);
 }
 
-/* ~200 ms per source: absorbs jitter, bounds drift and memory. */
+/* Output chunk: the most the mixer emits in one go, and the size of the scratch
+ * buffers.  ~200 ms absorbs ordinary jitter. */
 #define MIX_FIFO_CAP_MS 200
 
 /* A primed source that goes this long without delivering is presumed dead and
  * dropped, so it cannot hold the remaining sources hostage in the min(). */
 #define MIX_STALL_TIMEOUT_US (2 * 1000000LL)
 
+/* A timestamp jump smaller than this is buffer jitter, not lost samples.
+ * Capture buffers never land exactly on their nominal times, and padding a
+ * millisecond per buffer would be the very drift this is here to prevent. */
+#define MIX_GAP_MIN_US (30 * 1000LL)
+
+/*
+ * How much a source may buffer before samples are discarded.
+ *
+ * This has to exceed MIX_STALL_TIMEOUT_US, and that is the whole reason it is
+ * not simply MIX_FIFO_CAP_MS.  While one source is stalled the min() below
+ * emits nothing, so the live source's samples accumulate for as long as the
+ * stall lasts.  A bound shorter than the stall timeout would start discarding
+ * them before the stalled source is declared dead — and a discarded audio
+ * sample is not a dropout, it is every later sample playing early for the rest
+ * of the recording.  Sized to outlast the timeout, nothing is ever dropped that
+ * the timeout would not have resolved.  Costs ~768 kB per source.
+ */
+#define MIX_BOUND_MS 2500
+
 struct MixerCtx {
     int             active[MIX_SRC_COUNT];
     int             primed[MIX_SRC_COUNT];/* has delivered ≥1 sample */
     int64_t         last_feed_us[MIX_SRC_COUNT];
+    int64_t         anchor_us[MIX_SRC_COUNT]; /* pts of the source's sample 0 */
+    int64_t         written[MIX_SRC_COUNT];   /* canonical samples since anchor,
+                                                 inserted silence included */
     SwrContext     *swr[MIX_SRC_COUNT];   /* source → canonical, lazily built */
     AVAudioFifo    *fifo[MIX_SRC_COUNT];  /* canonical stereo FLTP, bounded */
-    int             fifo_cap;             /* samples */
+    int             fifo_cap;             /* samples per emitted chunk */
+    int             bound_cap;            /* samples a source may buffer */
     float          *scratch[MIX_CHANNELS];/* per-drain read buffer */
     AVFrame        *mixed;                /* reused canonical output frame */
     MixSinkFn       sink;
@@ -46,10 +70,48 @@ static float clampf(float v)
 }
 
 /*
+ * Append `n` samples of silence to a source's FIFO.  Called with m->lock held.
+ *
+ * Silence is the only honest thing to put in a hole: the audio track's PTS is a
+ * running sample count, so a sample that never arrives is not a dropout, it is
+ * an offset every later sample inherits.  Padding counts toward written[] so
+ * that a hole filled here is not filled a second time by the gap arithmetic in
+ * mixer_feed.
+ *
+ * Written in FIFO-sized chunks because scratch is only that long; the FIFO
+ * itself grows as needed and the caller drains it straight after.
+ */
+static void mixer_pad_silence_locked(MixerCtx *m, MixSource src, int64_t n)
+{
+    if (n <= 0 || !m->fifo[src]) return;
+
+    /* Beyond the stall timeout the source is dropped anyway — don't allocate
+       an unbounded run of silence for one that is never coming back.  Truncating
+       does shift this source's timeline, so it is worth saying out loud. */
+    int64_t limit = MIX_SAMPLE_RATE * (MIX_STALL_TIMEOUT_US / 1000) / 1000;
+    if (n > limit) {
+        fprintf(stderr, "mixer: source %d reported a %lldms gap, longer than "
+                        "the stall timeout — filling %lldms (it will shift)\n",
+                src, (long long)(n * 1000 / MIX_SAMPLE_RATE),
+                (long long)(limit * 1000 / MIX_SAMPLE_RATE));
+        n = limit;
+    }
+
+    memset(m->scratch[0], 0, sizeof(float) * (size_t)m->fifo_cap);
+    memset(m->scratch[1], 0, sizeof(float) * (size_t)m->fifo_cap);
+    void *planes[MIX_CHANNELS] = { m->scratch[0], m->scratch[1] };
+
+    while (n > 0) {
+        int chunk = n > m->fifo_cap ? m->fifo_cap : (int)n;
+        if (av_audio_fifo_write(m->fifo[src], planes, chunk) != chunk) break;
+        m->written[src] += chunk;
+        n -= chunk;
+    }
+}
+
+/*
  * Emit min(available) samples across the active sources, summed at unity gain
- * and clamped. Called with m->lock held. The min() keeps the two streams in
- * lockstep; the bounded FIFOs (enforced in mixer_feed) keep the faster source
- * from running away.
+ * and clamped. Called with m->lock held.
  *
  * Only *primed* sources — those that have delivered at least one sample —
  * participate in the min().  A source that is declared active at create time
@@ -60,7 +122,6 @@ static float clampf(float v)
 static void mixer_drain_locked(MixerCtx *m)
 {
     int64_t now = av_gettime_relative();
-    int n_ready = -1;
 
     for (int i = 0; i < MIX_SRC_COUNT; i++) {
         if (!m->active[i] || !m->primed[i]) continue;
@@ -68,33 +129,60 @@ static void mixer_drain_locked(MixerCtx *m)
             fprintf(stderr, "mixer: source %d stalled — dropping from mix\n", i);
             m->active[i] = 0;
             av_audio_fifo_drain(m->fifo[i], av_audio_fifo_size(m->fifo[i]));
-            continue;
         }
-        int sz = av_audio_fifo_size(m->fifo[i]);
-        if (n_ready < 0 || sz < n_ready) n_ready = sz;
-    }
-    if (n_ready <= 0) return;
-    if (n_ready > m->fifo_cap) n_ready = m->fifo_cap;
-
-    float *acc0 = (float *)m->mixed->data[0];
-    float *acc1 = (float *)m->mixed->data[1];
-    memset(acc0, 0, (size_t)n_ready * sizeof(float));
-    memset(acc1, 0, (size_t)n_ready * sizeof(float));
-
-    for (int i = 0; i < MIX_SRC_COUNT; i++) {
-        if (!m->active[i] || !m->primed[i]) continue;
-        void *dst[MIX_CHANNELS] = { m->scratch[0], m->scratch[1] };
-        if (av_audio_fifo_read(m->fifo[i], dst, n_ready) < n_ready) continue;
-        const float *s0 = m->scratch[0];
-        const float *s1 = m->scratch[1];
-        for (int n = 0; n < n_ready; n++) { acc0[n] += s0[n]; acc1[n] += s1[n]; }
     }
 
-    for (int n = 0; n < n_ready; n++) { acc0[n] = clampf(acc0[n]); acc1[n] = clampf(acc1[n]); }
+    /*
+     * There is deliberately no second mechanism here for "this source looks
+     * behind, pad it up to the others".  FIFO depth is not a position on the
+     * timeline: silence inserted for a timestamp gap makes a source's buffer
+     * deeper without any time having passed, so a rule that padded whatever
+     * looked shallow would read a *healthy* source as lagging and inject
+     * silence it never lost — turning one source's gap into a shift of the
+     * whole mix.  Only a source's own timestamps may move it on the timeline.
+     *
+     * A stalled source therefore just holds the min() at zero while the live
+     * source buffers, which is why that bound is sized to outlast the stall
+     * timeout rather than to a comfortable jitter window.
+     */
 
-    m->mixed->nb_samples  = n_ready;
-    m->mixed->sample_rate = MIX_SAMPLE_RATE;
-    if (m->sink) m->sink(m->user, m->mixed);
+    /* Loop: a large run of inserted silence can exceed one output frame, and
+       leaving the remainder queued would just defer the same work to the next
+       feed.  Each pass consumes n_ready from every live FIFO, so the min
+       strictly decreases and this terminates. */
+    for (;;) {
+        int n_ready = -1;
+        for (int i = 0; i < MIX_SRC_COUNT; i++) {
+            if (!m->active[i] || !m->primed[i]) continue;
+            int sz = av_audio_fifo_size(m->fifo[i]);
+            if (n_ready < 0 || sz < n_ready) n_ready = sz;
+        }
+        if (n_ready <= 0) return;
+        if (n_ready > m->fifo_cap) n_ready = m->fifo_cap;
+
+        float *acc0 = (float *)m->mixed->data[0];
+        float *acc1 = (float *)m->mixed->data[1];
+        memset(acc0, 0, (size_t)n_ready * sizeof(float));
+        memset(acc1, 0, (size_t)n_ready * sizeof(float));
+
+        for (int i = 0; i < MIX_SRC_COUNT; i++) {
+            if (!m->active[i] || !m->primed[i]) continue;
+            void *dst[MIX_CHANNELS] = { m->scratch[0], m->scratch[1] };
+            /* n_ready came from the shallowest FIFO, so a short read is not
+               possible.  Bail rather than continue if it ever becomes so: the
+               loop's exit depends on every live FIFO actually being consumed. */
+            if (av_audio_fifo_read(m->fifo[i], dst, n_ready) < n_ready) return;
+            const float *s0 = m->scratch[0];
+            const float *s1 = m->scratch[1];
+            for (int n = 0; n < n_ready; n++) { acc0[n] += s0[n]; acc1[n] += s1[n]; }
+        }
+
+        for (int n = 0; n < n_ready; n++) { acc0[n] = clampf(acc0[n]); acc1[n] = clampf(acc1[n]); }
+
+        m->mixed->nb_samples  = n_ready;
+        m->mixed->sample_rate = MIX_SAMPLE_RATE;
+        if (m->sink) m->sink(m->user, m->mixed);
+    }
 }
 
 MixerCtx *mixer_create(const int active[MIX_SRC_COUNT],
@@ -110,11 +198,15 @@ MixerCtx *mixer_create(const int active[MIX_SRC_COUNT],
     m->sink     = sink;
     m->user     = user;
     m->debug    = getenv("SCREENCAST_DEBUG") != NULL;
-    m->fifo_cap = MIX_SAMPLE_RATE * MIX_FIFO_CAP_MS / 1000;
+    m->fifo_cap  = MIX_SAMPLE_RATE * MIX_FIFO_CAP_MS / 1000;
+    m->bound_cap = MIX_SAMPLE_RATE * MIX_BOUND_MS / 1000;
     pthread_mutex_init(&m->lock, NULL);
 
     for (int i = 0; i < MIX_SRC_COUNT; i++) {
         m->active[i] = active[i] ? 1 : 0;
+        /* 0 is a perfectly good timestamp, so "no anchor yet" needs its own
+           value rather than the one calloc happened to leave behind. */
+        m->anchor_us[i] = AV_NOPTS_VALUE;
         if (!m->active[i]) continue;
         m->fifo[i] = av_audio_fifo_alloc(AV_SAMPLE_FMT_FLTP, MIX_CHANNELS,
                                          m->fifo_cap);
@@ -139,7 +231,7 @@ MixerCtx *mixer_create(const int active[MIX_SRC_COUNT],
 
 int mixer_feed(MixerCtx *m, MixSource src, AVFrame *raw,
                int in_sample_rate, const AVChannelLayout *in_layout,
-               enum AVSampleFormat in_fmt)
+               enum AVSampleFormat in_fmt, int64_t pts_us)
 {
     if (!m || src < 0 || src >= MIX_SRC_COUNT || !m->active[src] || !raw)
         return 0;
@@ -196,20 +288,68 @@ int mixer_feed(MixerCtx *m, MixSource src, AVFrame *raw,
     }
 
     if (res->nb_samples > 0) {
-        av_audio_fifo_write(m->fifo[src], (void **)res->data, res->nb_samples);
+        /*
+         * A source that carries timestamps tells us directly when samples went
+         * missing: the buffer's PTS runs ahead of where its own sample count
+         * says it should be.  Writing it straight after the previous buffer
+         * would close that hole by playing everything after it early, for the
+         * rest of the recording, so the hole is made explicit as silence.
+         *
+         * Sources with no timestamps (the PipeWire capture path) pass
+         * AV_NOPTS_VALUE and simply count samples, as they always did.
+         */
+        if (pts_us != AV_NOPTS_VALUE) {
+            if (m->anchor_us[src] == AV_NOPTS_VALUE) {
+                m->anchor_us[src] = pts_us;
+                m->written[src]   = 0;
+            } else {
+                int64_t expected = m->anchor_us[src] +
+                    av_rescale(m->written[src], 1000000, MIX_SAMPLE_RATE);
+                int64_t gap_us = pts_us - expected;
+                if (gap_us >= MIX_GAP_MIN_US) {
+                    if (m->debug)
+                        fprintf(stderr, "mixer: source %d skipped %lldms — "
+                                        "inserting silence\n",
+                                src, (long long)(gap_us / 1000));
+                    mixer_pad_silence_locked(m, src,
+                        av_rescale(gap_us, MIX_SAMPLE_RATE, 1000000));
+                }
+            }
+        }
+
+        /* written[] is the ledger every later gap is measured against, so it
+           may only advance by what the FIFO actually took. */
+        int put = av_audio_fifo_write(m->fifo[src], (void **)res->data,
+                                      res->nb_samples);
+        if (put > 0) m->written[src] += put;
         if (!m->primed[src]) {
             m->primed[src] = 1;
             if (m->debug)
                 fprintf(stderr, "mixer: source %d primed (first samples)\n", src);
         }
         m->last_feed_us[src] = av_gettime_relative();
-        /* Bound the FIFO: drop the oldest samples of the faster source. */
-        int overflow = av_audio_fifo_size(m->fifo[src]) - m->fifo_cap;
-        if (overflow > 0) av_audio_fifo_drain(m->fifo[src], overflow);
     }
     av_frame_free(&res);
 
     mixer_drain_locked(m);
+
+    /*
+     * Last-resort bound, applied only after the drain.  What a FIFO still holds
+     * at this point is its lead over the slowest live source, and the lockstep
+     * repair in the drain exists to keep that well under the cap.  Reaching
+     * here means it failed to, and the samples dropped shift the track against
+     * the video — so say so rather than lose them quietly.
+     */
+    for (int i = 0; i < MIX_SRC_COUNT; i++) {
+        if (!m->fifo[i]) continue;
+        int overflow = av_audio_fifo_size(m->fifo[i]) - m->bound_cap;
+        if (overflow > 0) {
+            fprintf(stderr, "mixer: source %d overran its buffer — dropping "
+                            "%d samples (the track will shift)\n", i, overflow);
+            av_audio_fifo_drain(m->fifo[i], overflow);
+        }
+    }
+
     pthread_mutex_unlock(&m->lock);
     return 0;
 }
