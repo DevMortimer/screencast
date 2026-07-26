@@ -51,7 +51,7 @@ ifeq ($(PLATFORM),macos)
     LDFLAGS := $(shell pkg-config --libs $(FFMPEG_PKGS)) -pthread -lm \
                -framework AVFoundation -framework ScreenCaptureKit \
                -framework CoreMedia -framework CoreVideo -framework CoreAudio \
-               -framework Cocoa -framework Accelerate
+               -framework Cocoa -framework Accelerate -framework Metal
 else
     PKG     := libavformat libavcodec libavdevice libswscale libswresample \
                libavutil wayland-client libpipewire-0.3 libspa-0.2
@@ -118,12 +118,15 @@ TEST_SRCS := tests/test_arbiter.c src/linux/arbiter.c
 # h264_videotoolbox accepts CVPixelBuffers by reference, both from libav's own
 # hardware pool and wrapped from an external source.  Links nothing from src/.
 PROBE_BIN := $(OBJDIR)/vt_hwframe_probe
+METAL_PROBE_BIN := $(OBJDIR)/metal_probe
 
 probe: | $(OBJDIR)
 ifeq ($(PLATFORM),macos)
 	$(CC) $(CFLAGS) -fobjc-arc -o $(PROBE_BIN) tests/vt_hwframe_probe.m \
-	    $(LDFLAGS) -framework CoreVideo
-	@echo "built $(PROBE_BIN)"
+	    $(LDFLAGS)
+	$(CC) $(CFLAGS) -fobjc-arc -o $(METAL_PROBE_BIN) tests/metal_probe.m \
+	    $(SRCDIR)/macos/metal_compositor.m $(LDFLAGS)
+	@echo "built $(PROBE_BIN) and $(METAL_PROBE_BIN)"
 else
 	@echo "probe is macOS only"
 endif
