@@ -5,7 +5,9 @@ optional webcam and audio) and renders an MP4. Runs on Linux (wlroots Wayland
 compositors) and macOS. This glossary pins down the capture, audio and timing
 vocabulary so the code and docs agree.
 
-Where a term is platform-specific it says so. The two platforms deliberately
+Where a term is platform-specific it says so, and several are: Linux composites
+a webcam into the picture itself and has modes for it, while macOS records the
+display and leaves the presenter to the system. The two platforms deliberately
 share the encoder, the mixer, and the timing vocabulary below; they share
 nothing else.
 
@@ -19,18 +21,34 @@ protocol; on macOS it is a ScreenCaptureKit stream. The term names the *thing
 captured*, not the mechanism.
 _Avoid_: screen grab, output capture
 
-**Webcam**:
-The user's camera video — a PipeWire client on Linux, an AVFoundation capture
-device on macOS. Distinct from display capture; overlaid on the display in
-`both` mode.
+**Webcam** (Linux):
+The user's camera video, captured as a PipeWire client. Distinct from display
+capture; overlaid on the display in `both` mode. macOS has no equivalent term:
+there the camera reaches a recording only as a presenter overlay, which this
+project does not capture, composite, or position.
 _Avoid_: camera video, cam, facecam
 
-**Mode**:
+**Mode** (Linux):
 What the recording currently shows: `display`, `webcam`, or `both`. Switchable
 mid-recording over the control socket, which is why the output stream's
 dimensions and the overlay geometry are fixed for a whole session — they cannot
-change under a running encoder.
+change under a running encoder. macOS records the display and has no modes.
 _Avoid_: layout, view, scene
+
+**Presenter overlay** (macOS):
+The system feature that segments the user from their background and composites
+them into a ScreenCaptureKit stream. Offered by macOS — in Control Center,
+while an app is capturing the screen and using the camera at once — and
+rendered by macOS, so a recording either arrives with the presenter already in
+it or does not. Nothing here decides its size, position, or whether it is on.
+_Avoid_: webcam overlay, facecam, picture-in-picture
+
+**Camera client**:
+An app holding a capture device open. On macOS this is the whole reason the
+camera is opened at all: the presenter overlay is offered only to an app that
+is a camera client and a screen capturer simultaneously. The frames it
+delivers are discarded.
+_Avoid_: camera user, capture session
 
 **Points and pixels** (macOS):
 macOS reports display geometry in *points*, a resolution-independent unit;
@@ -39,18 +57,32 @@ these differ, and confusing them silently records a downscaled capture.
 _Avoid_: logical/physical resolution, size
 
 **Capture scale** (macOS):
-Pixels captured per point. Defaults to the measured ratio of the display mode's
-pixel width to its point width — the size of the framebuffer the window server
-composites into. On a scaled HiDPI mode that framebuffer is *larger* than the
-panel (1440x900 points reports 2880x1800, which the display then resamples down
-to 2560x1664), so this is not the panel's resolution. Overridable with
-`SCREENCAST_SCALE`, clamped so it never upscales.
+Pixels captured per point. Bounded by two things and equal to the smaller: the
+measured ratio of the display mode's pixel width to its point width, and the
+**capture cap**. Not adjustable at runtime.
 _Avoid_: retina factor, DPI, zoom, native resolution
 
+**Native ratio** (macOS):
+The measured pixels-per-point of the current display mode — the size of the
+framebuffer the window server composites into. On a scaled HiDPI mode that
+framebuffer is *larger* than the panel (1440x900 points reports 2880x1800,
+which the display then resamples down to 2560x1664), so this is not the
+panel's resolution. Capture never exceeds it, because asking for more pixels
+than were drawn cannot add detail.
+_Avoid_: native resolution, backing scale
+
+**Capture cap** (macOS):
+The ceiling on the longer edge of the captured canvas, in pixels. Exists
+because the native ratio describes what the window server drew, not what is
+worth recording: the pixel count multiplies the cost of every stage after it,
+and beyond a point buys detail nobody watching a screencast can see.
+_Avoid_: max resolution, limit, quality setting
+
 **Zero-copy path** (macOS):
-Capture to encode without the pixels leaving GPU memory: ScreenCaptureKit and
-AVFoundation hand over IOSurface-backed `CVPixelBuffer`s, the Metal compositor
-renders into another, and VideoToolbox encodes that one directly.
+Capture to encode without the pixels leaving GPU memory: ScreenCaptureKit hands
+over IOSurface-backed `CVPixelBuffer`s and VideoToolbox encodes them directly,
+untouched. There is no compositing stage to pass through — a presenter, when
+there is one, was composited by the system before the buffer arrived.
 _Avoid_: hardware path, GPU pipeline
 
 **Camera node**:
@@ -139,19 +171,22 @@ and video frames are the resource that gives under load. Drop frames and let
 variable frame rate carry it; never re-stamp a timestamp, never drop audio.
 _Avoid_: frame skipping, throttling
 
-**Nearest-PTS matching**:
+**Nearest-PTS matching** (Linux):
 Pairing a webcam frame with the screen frame it was actually captured alongside,
 by choosing the one whose PTS is closest rather than the one most recently
 delivered. Camera pipelines run tens of milliseconds behind the display, by a
 margin that moves with exposure time, so "most recent" pairs a frame with a
-neighbour it was never contemporaneous with.
+neighbour it was never contemporaneous with. Does not arise on macOS, where
+nothing is paired: one stream arrives, already composited.
 _Avoid_: latest frame, frame pairing
 
 **Video clock**:
-The source whose frames decide when an output frame is produced. Display-only
-recording is clocked by the screen, so a static display costs nothing to record.
-The webcam modes are clocked by the *camera*, because there the screen going
-still says nothing about whether the picture is still — clocking them off the
-screen freezes the overlay, and in `webcam` mode the whole frame, for as long as
-the display happens not to change.
+The source whose frames decide when an output frame is produced. Display
+capture is clocked by the screen, so a static display costs nothing to record.
+On Linux the webcam modes are clocked by the *camera* instead, because there
+the screen going still says nothing about whether the picture is still —
+clocking them off the screen freezes the overlay, and in `webcam` mode the
+whole frame, for as long as the display happens not to change. macOS has only
+the screen clock; when a presenter overlay is on, the system's compositing
+keeps frames arriving on its own.
 _Avoid_: frame rate, tick, driver

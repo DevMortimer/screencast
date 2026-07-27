@@ -2,7 +2,15 @@
 
 ## Status
 
-accepted
+accepted; superseded in part by
+[0005](0005-macos-records-the-display-only.md)
+
+The webcam row of the table below, the mode-switching UX, and the reasoning
+that macOS had to keep Linux's commands no longer hold: macOS records the
+display only, and the webcam is the system's Presenter Overlay. Everything
+else here stands. The reasoning is left as it was written — it predates
+knowing the platform would do the compositing, which is exactly the context
+0005 needs to be legible.
 
 ## Context
 

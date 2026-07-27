@@ -9,10 +9,15 @@ implement `wlr-screencopy-unstable-v1`.
 
 **Platforms:** Linux (wlroots Wayland) | macOS 13+
 
-## Features
+The two platforms record different things. Linux composites a webcam into the
+picture itself and has modes for it; macOS records the display and leaves the
+presenter to the system's Presenter Overlay. The features below describe the
+Linux build — see [macOS](#macos) for that one.
+
+## Features (Linux)
 
 - Records a Wayland output via `wlr-screencopy` (shm buffers).
-- Supports display-only, webcam-only, and display-plus-webcam modes.
+- Supports display-only, webcam-only, and display-plus-webcam modes. (macOS records the display only.)
 - Captures the webcam as a **PipeWire** client. The webcam path is
   display-server-agnostic and works under both Xorg and Wayland.
 - **Cooperative camera capture.** `display` recording never touches the webcam
@@ -77,12 +82,14 @@ make clean
 
 On macOS, screencast uses native frameworks:
 - **ScreenCaptureKit** for display capture and system audio
-- **AVFoundation** for webcam and microphone
-- **VideoToolbox** for hardware-accelerated H.264 encoding
+- **AVFoundation** for the microphone
+- **VideoToolbox** for hardware-accelerated H.264 encoding, at constant quality
+
+Frames never leave GPU memory between capture and encode.
 
 ### Requirements (macOS)
 
-- macOS 13 (Ventura) or later
+- macOS 13 (Ventura) or later; macOS 14 (Sonoma) on Apple silicon for Presenter Overlay
 - Xcode Command Line Tools (`xcode-select --install`)
 - FFmpeg development libraries:
   - `libavformat`, `libavcodec`, `libavdevice`, `libswscale`, `libswresample`, `libavutil`
@@ -104,14 +111,34 @@ The compiled binary is written to `./screencast`.
 
 ### macOS usage
 
-Same CLI as Linux, but bind the commands to **skhd** (or any macOS hotkey tool):
+macOS records the display. There are two commands:
+
+```sh
+screencast            # record the display + microphone + desktop audio
+screencast presenter  # the same, but make Presenter Overlay available
+screencast stop
+```
+
+**To appear in the recording**, run `screencast presenter` and turn on
+Presenter Overlay from the Video Effects menu in Control Center. macOS
+segments you from your background and composites you into the capture
+itself — you can switch it on and off, and between the small and large
+layouts, as often as you like while recording.
+
+The `presenter` form exists because that menu item only appears for an app
+using the camera and the screen at once. Plain `screencast` opens no camera,
+so it costs no power and lights no camera indicator.
+
+Bind them with **skhd** (or any macOS hotkey tool):
 
 ```cfg
-shift + cmd - d : screencast display
-shift + cmd - w : screencast webcam
-shift + cmd - b : screencast both
-shift + cmd - escape : screencast stop
+shift + cmd - s : pgrep -x screencast > /dev/null || \
+                  ("$HOME/.local/bin/screencast" >> "$HOME/Library/Logs/screencast.log" 2>&1 &)
+cmd - escape    : pgrep -x screencast > /dev/null && "$HOME/.local/bin/screencast" stop
 ```
+
+Launched from a hotkey there is no terminal, so the daemon's output goes to a
+log — that is where a failed start can be read back from.
 
 ### macOS paths
 
@@ -122,15 +149,16 @@ shift + cmd - escape : screencast stop
 
 ### macOS limitations vs Linux
 
-- **Single-pass encode.** No two-pass NVENC render; VideoToolbox encodes directly to the final file.
+- **No webcam modes.** Linux has `display`, `webcam` and `both`, and composites the camera itself. macOS records the display and leaves the presenter to the system — see [ADR 0005](docs/adr/0005-macos-records-the-display-only.md). Sending `webcam` or `both` to a macOS build is rejected with a pointer to Control Center.
+- **Presenter Overlay needs macOS 14 on Apple silicon.** On macOS 13 or Intel, screencast records the display and there is no way to appear in it.
+- **Presenter Overlay is not scriptable.** It is a Control Center toggle. Nothing can bind it to a key or turn it on from the command line.
+- **Capture is capped at 1920 on the long edge**, below the full backing store on a HiDPI panel. The pixel count multiplies the cost of every stage after it, and beyond that point buys detail nobody watching a screencast can see.
+- **Single-pass encode.** No two-pass NVENC render; VideoToolbox encodes directly to the final file at constant quality.
 - **No recording indicator.** macOS enforces its own system recording indicator in the menu bar.
-- **No camera arbitration.** AVFoundation handles multiple camera consumers natively.
-- **No display override.** The daemon locks to the display it was invoked from.
-- **No NVENC tuning.** `SCREENCAST_NVENC_*` environment variables are silently ignored.
-- **No `SCREENCAST_OUTPUT`.** The display cannot be overridden.
-- **No `SCREENCAST_KEEP_CAPTURE`.** There is no intermediate capture file.
+- **No display override.** The daemon locks to the display the cursor was on when it started.
+- **No tuning variables.** Every `SCREENCAST_*` variable except `SCREENCAST_DEBUG` is Linux-only. There is no intermediate capture file to keep.
 
-## Usage
+## Usage (Linux)
 
 Wayland compositors own global keybindings, so — unlike the old X11 version —
 `screencast` no longer grabs hotkeys itself. Instead it is a small
@@ -168,7 +196,7 @@ Recordings are written to the home directory:
 The intermediate file is removed after a successful final render unless
 `SCREENCAST_KEEP_CAPTURE` is set.
 
-## Configuration
+## Configuration (Linux)
 
 The recorder can be tuned with environment variables:
 
@@ -189,23 +217,17 @@ The recorder can be tuned with environment variables:
 | `SCREENCAST_NVENC_FINAL_AQ` | `10` | NVENC adaptive quantization strength. |
 | `SCREENCAST_KEEP_CAPTURE` | unset | Keep the intermediate capture file when set to any non-empty value. |
 
-> **Note:** The `SCREENCAST_OUTPUT`, `SCREENCAST_DESKTOP_DEV`, `SCREENCAST_NVENC_*`, and `SCREENCAST_KEEP_CAPTURE` variables are Linux-only and silently ignored on macOS.
+> **Note:** every variable in the table above is Linux-only.
 
 ### macOS configuration
 
-Only these environment variables apply on macOS:
+There isn't any. macOS reads no configuration variables except
+`SCREENCAST_DEBUG`, which reports rather than tunes: per-frame delivery
+counts, a periodic A/V sync line, and whether Presenter Overlay is on.
 
-| Variable | Default | Description |
-|---|---|---|
-| `SCREENCAST_DRAW_MOUSE` | `1` | Composite the cursor into the recording; set to `0` to hide it. |
-| `SCREENCAST_DESKTOP_AUDIO` | `1` | Mix desktop audio into the track; set to `0` to record microphone only. |
-| `SCREENCAST_SCALE` | measured backing-store ratio | Pixels captured per point of display geometry. Defaults to the framebuffer macOS composites into — on a scaled HiDPI mode that is typically `2`, giving a 2880x1800 capture from a 1440x900 desktop. That is ~4x the pixels of a point-sized capture and more than the panel itself shows, so **lower it if frames are dropping**: `1.5` is a good middle, `1` captures at point size. Clamped to the measured ratio, since asking for more cannot add detail. |
-| `SCREENCAST_CAM_FPS` | `30` | Preferred webcam frame rate. |
-| `SCREENCAST_CAM_SIZE` | `1920x1080` | Preferred webcam capture size. 1080p is the largest most USB-C cameras deliver as raw NV12; above it they switch to MJPEG and cost a JPEG decode on every frame. |
-| `SCREENCAST_CAM_OFFSET_MS` | `0` | Shift webcam frames against the screen, in milliseconds, if your camera's timestamps are biased. Normally unnecessary — frames are matched to the screen frame they were captured with. |
-
-`SCREENCAST_WEBCAM_DEV` is ignored on macOS: AVFoundation fans the camera out
-natively, so there is nothing to select between.
+Capture resolution, encoder quality and camera format are all fixed —
+measured from the display, or chosen once. If one of them is wrong on your
+hardware that is a bug worth fixing rather than a value worth overriding.
 
 Example:
 
