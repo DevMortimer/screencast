@@ -85,7 +85,18 @@ void sck_capture_start_session(SckCapture *c, int64_t t0_us);
  */
 void *sck_capture_grab_video(SckCapture *c, int64_t *pts_us);
 
-/* Release a buffer returned by sck_capture_grab_video(). */
+/*
+ * Same, but returns NULL immediately when no frame is waiting.
+ *
+ * The webcam modes cannot block on the screen: ScreenCaptureKit stops
+ * delivering entirely while the display is static, and a loop that waits for it
+ * would hold the camera at whatever frame it had when the screen went still.
+ * They drain the screen queue with this instead and take their cadence from the
+ * camera.
+ */
+void *sck_capture_try_grab_video(SckCapture *c, int64_t *pts_us);
+
+/* Release a buffer returned by either grab_video variant. */
 void sck_capture_release_frame(void *pixbuf);
 
 /*

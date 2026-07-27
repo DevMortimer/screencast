@@ -33,23 +33,41 @@
 /* ── shared state ──────────────────────────────────────────── */
 
 /*
- * Recent webcam frames, kept with their timestamps so the record loop can pick
- * the one that belongs beside a given screen frame.
+ * Recent webcam frames, kept with their timestamps.
  *
- * Taking "the most recent frame" instead — which is what this used to do —
- * pairs the screen with whatever the camera happened to have delivered by
- * then.  Camera pipelines run tens of milliseconds behind the display, and by
- * a margin that moves with exposure time, so the face ends up consistently
- * behind the voice by a wobbling amount.
+ * In the webcam modes the camera *is* the video clock: one output frame per
+ * camera frame, stamped with that frame's own capture time.  So this ring only
+ * ever has to hold the frames that arrived while the loop was busy encoding the
+ * previous one — the depth is slack, not history.
+ *
+ * The screen used to be the clock, and the pairing ran the other way: hold a
+ * screen frame back and wait for the camera to catch up with it.  That wait
+ * cost a quarter second of latency per frame and, worse, made the picture
+ * hostage to a source that stops entirely — see the record loop.
  */
 #define CAM_RING_DEPTH   24              /* ~800 ms at 30 fps */
-#define CAM_MATCH_LAG_US (250 * 1000LL)  /* how long to wait for a later frame */
 
 static pthread_mutex_t s_cam_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_cam_cond  = PTHREAD_COND_INITIALIZER;
 static void           *s_cam_ring[CAM_RING_DEPTH];   /* CVPixelBufferRef */
 static int64_t         s_cam_ring_pts[CAM_RING_DEPTH];
 static int             s_cam_ring_head;
 static int             s_cam_ring_count;
+
+/*
+ * Recent screen frames, most recent last.
+ *
+ * Deep enough to cover how far the camera runs behind the display — the loop
+ * pairs a camera frame with the screen frame captured alongside it, and the
+ * screen frame it wants is therefore always a little older than the newest one
+ * in hand.  Six frames is ~200 ms at 30 fps, comfortably past any camera's lag.
+ */
+#define SCREEN_HOLD 6
+
+static void    *s_scr_ring[SCREEN_HOLD];   /* CVPixelBufferRef */
+static int64_t  s_scr_pts[SCREEN_HOLD];
+static int      s_scr_head;
+static int      s_scr_count;
 
 /*
  * Correction for cameras that timestamp on arrival rather than on exposure.
@@ -134,6 +152,7 @@ static void cam_frame_cb(void *user, void *pixbuf, int64_t pts_us)
     s_cam_ring_pts[tail] = pts_us - s_cam_offset_us;
     s_cam_ring_count++;
 
+    pthread_cond_signal(&s_cam_cond);
     pthread_mutex_unlock(&s_cam_mutex);
 }
 
@@ -148,52 +167,112 @@ static void cam_ring_clear(void)
     pthread_mutex_unlock(&s_cam_mutex);
 }
 
+/* How long the record loop waits on the camera before giving up on this tick
+   and letting the screen carry the picture instead. */
+#define CAM_WAIT_MS 250
+
 /*
- * Pick the webcam frame closest in time to `target_us`, returning a new
- * reference and reporting the chosen frame's timestamp in *out_pts (which
- * doubles as its identity, so the encoder can tell when the same frame is
- * being composited again).
+ * Take the newest webcam frame captured after `after_us`, waiting up to
+ * CAM_WAIT_MS for one to arrive.  Ownership of the returned buffer passes to
+ * the caller; every frame older than it is released here.
  *
- * Briefly waits for a frame *later* than the target to show up before
- * choosing.  Without that the ring only ever holds frames older than the
- * target and the nearest match is always the newest one — which is the
- * behaviour this is meant to replace.  The wait costs a quarter second of
- * latency between capture and encode; for a recorder that is invisible.
+ * *Newest*, not oldest: this is the elastic-video rule applied to the camera.
+ * When the loop keeps up there is exactly one new frame per call and the choice
+ * is moot; when it falls behind, encoding the backlog in order would only sink
+ * it further, so the intervening frames are dropped and the timeline stays
+ * honest — the returned frame carries its own capture time, which is what the
+ * output is stamped with.
  */
-static void *cam_pick_nearest(int64_t target_us, int64_t *out_pts)
+static void *cam_take_latest(int64_t after_us, int64_t *out_pts)
 {
-    int64_t deadline = sck_host_time_us() + CAM_MATCH_LAG_US;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += CAM_WAIT_MS * 1000000L;
+    deadline.tv_sec  += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+
+    void *out = NULL;
+    pthread_mutex_lock(&s_cam_mutex);
 
     for (;;) {
-        pthread_mutex_lock(&s_cam_mutex);
-
-        int best = -1;
-        int64_t best_dist = INT64_MAX;
-        int have_later = 0;
-
-        for (int i = 0; i < s_cam_ring_count; i++) {
-            int idx = (s_cam_ring_head + i) % CAM_RING_DEPTH;
-            int64_t d = s_cam_ring_pts[idx] - target_us;
-            if (d >= 0) have_later = 1;
-            if (d < 0) d = -d;
-            if (d < best_dist) { best_dist = d; best = idx; }
+        int newest = s_cam_ring_count > 0
+            ? (s_cam_ring_head + s_cam_ring_count - 1) % CAM_RING_DEPTH : -1;
+        if (newest >= 0 && s_cam_ring_pts[newest] > after_us) {
+            out = s_cam_ring[newest];
+            if (out_pts) *out_pts = s_cam_ring_pts[newest];
+            s_cam_ring[newest] = NULL;
+            /* Everything still in the ring predates the frame being taken. */
+            for (int i = 0; i < s_cam_ring_count - 1; i++) {
+                int idx = (s_cam_ring_head + i) % CAM_RING_DEPTH;
+                avf_camera_release_frame(s_cam_ring[idx]);
+                s_cam_ring[idx] = NULL;
+            }
+            s_cam_ring_head = s_cam_ring_count = 0;
+            break;
         }
 
-        if (best >= 0 && (have_later || sck_host_time_us() >= deadline)) {
-            void *out = (void *)CFRetain(s_cam_ring[best]);
-            if (out_pts) *out_pts = s_cam_ring_pts[best];
-            pthread_mutex_unlock(&s_cam_mutex);
-            return out;
-        }
-
-        pthread_mutex_unlock(&s_cam_mutex);
-
-        if (sck_host_time_us() >= deadline) return NULL;
-        if (!atomic_load(&g_running) || !atomic_load(&s_rec_open)) return NULL;
-
-        struct timespec nap = { .tv_nsec = 2000000L }; /* 2 ms */
-        nanosleep(&nap, NULL);
+        if (!atomic_load(&g_running) || !atomic_load(&s_rec_open)) break;
+        if (pthread_cond_timedwait(&s_cam_cond, &s_cam_mutex, &deadline)
+                == ETIMEDOUT)
+            break;
     }
+
+    pthread_mutex_unlock(&s_cam_mutex);
+    return out;
+}
+
+/* ── screen frame ring ─────────────────────────────────────── */
+
+/* Takes ownership of `pixbuf`, evicting the oldest frame when full. */
+static void screen_ring_push(void *pixbuf, int64_t pts_us)
+{
+    if (s_scr_count >= SCREEN_HOLD) {
+        sck_capture_release_frame(s_scr_ring[s_scr_head]);
+        s_scr_ring[s_scr_head] = NULL;
+        s_scr_head = (s_scr_head + 1) % SCREEN_HOLD;
+        s_scr_count--;
+    }
+    int tail = (s_scr_head + s_scr_count) % SCREEN_HOLD;
+    s_scr_ring[tail] = pixbuf;
+    s_scr_pts[tail]  = pts_us;
+    s_scr_count++;
+}
+
+static void screen_ring_clear(void)
+{
+    for (int i = 0; i < SCREEN_HOLD; i++) {
+        sck_capture_release_frame(s_scr_ring[i]);
+        s_scr_ring[i] = NULL;
+    }
+    s_scr_head = s_scr_count = 0;
+}
+
+/*
+ * The screen frame captured closest in time to `target_us`, borrowed — the ring
+ * keeps the reference, so the caller must not release it and must be done with
+ * it before the next push.  NULL only when nothing has been captured yet.
+ */
+static void *screen_ring_nearest(int64_t target_us)
+{
+    void *best = NULL;
+    int64_t best_dist = INT64_MAX;
+
+    for (int i = 0; i < s_scr_count; i++) {
+        int idx = (s_scr_head + i) % SCREEN_HOLD;
+        int64_t d = s_scr_pts[idx] - target_us;
+        if (d < 0) d = -d;
+        if (d < best_dist) { best_dist = d; best = s_scr_ring[idx]; }
+    }
+    return best;
+}
+
+/* Newest screen frame in the ring, borrowed, with its timestamp. */
+static void *screen_ring_newest(int64_t *out_pts)
+{
+    if (s_scr_count == 0) return NULL;
+    int idx = (s_scr_head + s_scr_count - 1) % SCREEN_HOLD;
+    if (out_pts) *out_pts = s_scr_pts[idx];
+    return s_scr_ring[idx];
 }
 
 /* ── mixed audio delivered to the encoder ──────────────────── */
@@ -452,6 +531,7 @@ static int recording_open(void)
                 (long long)(s_cam_offset_us / 1000));
 
     cam_ring_clear();
+    screen_ring_clear();
     s_rec.t0_us = sck_host_time_us();
     atomic_store(&s_rec.audio_anchor_us, -1);
     sck_capture_start_session(s_rec.sck, s_rec.t0_us);
@@ -477,6 +557,26 @@ static void recording_loop(void)
     if (s_rec.has_desktop && s_rec.mixer)
         pthread_create(&desk_tid, NULL, desktop_audio_thread, &s_rec);
 
+    /*
+     * Which source clocks the output.
+     *
+     * Display-only recording is clocked by the screen: ScreenCaptureKit stops
+     * delivering while the picture is static, nothing is encoded, and variable
+     * frame rate carries the still image for as long as it lasts.  That is the
+     * cheapest possible recording of a screen that is not moving.
+     *
+     * The webcam modes cannot use that clock, because in those modes the screen
+     * going still says nothing about whether the *picture* is still.  Waiting on
+     * it froze the overlay — and in webcam mode the entire frame — for as long
+     * as the display happened not to change, which on a talking-head screencast
+     * is most of the recording.  So the camera clocks them instead: one output
+     * frame per camera frame, paired with the screen frame captured alongside
+     * it, at the camera's own timestamp.
+     */
+    int64_t last_cam_pts  = INT64_MIN;   /* newest camera frame consumed */
+    int64_t last_emit_pts = INT64_MIN;   /* keeps output PTS strictly rising */
+    int     was_cam_mode  = -1;
+
     while (atomic_load(&g_running) && atomic_load(&g_recording)) {
         RecordMode mode = atomic_load(&g_mode);
 
@@ -484,21 +584,72 @@ static void recording_loop(void)
            just a different draw — nothing to set up or tear down. */
         int want_cam = (mode == MODE_WEBCAM || mode == MODE_BOTH) && s_rec.avf_cam;
 
-        /* Grab screen frame (blocking with timeout — unblocks ~500ms so
-           the stop condition is checked promptly). */
-        int64_t screen_pts = -1;
-        void *screen = sck_capture_grab_video(s_rec.sck, &screen_pts);
-        if (!screen) {
-            if (!atomic_load(&g_running) || !atomic_load(&g_recording))
-                break;
-            continue;
+        /* Whatever the other clock buffered while it was not driving is stale
+           by the time the mode switches back. */
+        if (want_cam != was_cam_mode) {
+            screen_ring_clear();
+            last_cam_pts = INT64_MIN;
+            was_cam_mode = want_cam;
         }
 
-        /* Pair this screen frame with the webcam frame captured alongside it */
-        void *cam = NULL;
-        int64_t cam_pts = -1;
-        if (want_cam)
-            cam = cam_pick_nearest(screen_pts, &cam_pts);
+        void   *screen     = NULL;   /* borrowed from the ring, or owned below */
+        void   *own_screen = NULL;   /* set when this iteration owns `screen` */
+        void   *cam        = NULL;
+        int64_t emit_pts   = -1;
+
+        if (want_cam) {
+            /* Keep the screen queue drained so it never backs up behind the
+               camera's cadence, and so the pairing has history to choose from. */
+            for (;;) {
+                int64_t pts = -1;
+                void *s = sck_capture_try_grab_video(s_rec.sck, &pts);
+                if (!s) break;
+                screen_ring_push(s, pts);
+            }
+
+            int64_t cam_pts = -1;
+            cam = cam_take_latest(last_cam_pts, &cam_pts);
+            if (cam) {
+                last_cam_pts = cam_pts;
+                emit_pts     = cam_pts;
+                screen       = screen_ring_nearest(cam_pts);
+            } else {
+                /* Camera stalled.  Don't let it take the screen down with it:
+                   fall back to the newest screen frame for this tick. */
+                if (!atomic_load(&g_running) || !atomic_load(&g_recording))
+                    break;
+                screen = screen_ring_newest(&emit_pts);
+                if (!screen) continue;
+            }
+
+            /* Mode 3 draws the screen underneath, so it needs one. */
+            if (!screen && mode == MODE_BOTH) {
+                if (cam) avf_camera_release_frame(cam);
+                continue;
+            }
+        } else {
+            /* Blocking with timeout — unblocks ~500 ms so the stop condition
+               and a mode switch are both noticed promptly. */
+            int64_t pts = -1;
+            own_screen = sck_capture_grab_video(s_rec.sck, &pts);
+            if (!own_screen) {
+                if (!atomic_load(&g_running) || !atomic_load(&g_recording))
+                    break;
+                continue;
+            }
+            screen   = own_screen;
+            emit_pts = pts;
+        }
+
+        /* The encoder counts on a strictly rising timeline, and two clocks feed
+           it here — a mode switch or a camera hiccup can hand back a timestamp
+           that has already been used. */
+        if (emit_pts <= last_emit_pts) {
+            if (cam) avf_camera_release_frame(cam);
+            if (own_screen) sck_capture_release_frame(own_screen);
+            continue;
+        }
+        last_emit_pts = emit_pts;
 
         /*
          * Display mode composites nothing, so the capture buffer goes to the
@@ -507,18 +658,21 @@ static void recording_loop(void)
          */
         void *encode_buf = screen;
         void *composited = NULL;
-        if (mode != 1 && s_rec.comp) {
+        if (mode != MODE_DISPLAY && s_rec.comp) {
             composited = metal_compositor_render(s_rec.comp, mode, screen, cam);
             if (composited) encode_buf = composited;
         }
 
-        encoder_write_pixbuf(&s_rec.enc, encode_buf, screen_pts);
-        frames_encoded++;
+        if (encode_buf) {
+            encoder_write_pixbuf(&s_rec.enc, encode_buf, emit_pts);
+            frames_encoded++;
+        }
 
         if (composited) metal_compositor_release_frame(composited);
         if (cam) avf_camera_release_frame(cam);
-        sck_capture_release_frame(screen);
+        if (own_screen) sck_capture_release_frame(own_screen);
 
+        int64_t screen_pts = emit_pts;
         /*
          * Sync telemetry.  Both tracks are stamped from the same session clock,
          * so a healthy recording holds this delta near zero for its whole
@@ -544,6 +698,12 @@ static void recording_loop(void)
     }
 
     atomic_store(&s_rec_open, 0);
+    /* Wake the camera wait so it notices the session is over. */
+    pthread_mutex_lock(&s_cam_mutex);
+    pthread_cond_broadcast(&s_cam_cond);
+    pthread_mutex_unlock(&s_cam_mutex);
+
+    screen_ring_clear();
     if (mic_tid)  pthread_join(mic_tid, NULL);
     if (desk_tid) pthread_join(desk_tid, NULL);
 }

@@ -634,16 +634,11 @@ void sck_capture_release_frame(void *pixbuf)
     if (pixbuf) CVPixelBufferRelease((CVPixelBufferRef)pixbuf);
 }
 
-void *sck_capture_grab_video(SckCapture *c, int64_t *pts_us)
+/* Pop the head of the video queue.  The caller has already claimed a slot on
+   video_sem, so a frame is normally present; the queue can still be empty if
+   close() signalled the semaphore to wake a waiter. */
+static void *dequeue_video(SckCapture *c, int64_t *pts_us)
 {
-    if (!c) return NULL;
-
-    /* Timed wait — allows the caller to re-check g_recording/g_running
-       periodically (every ~500 ms) rather than blocking forever. */
-    intptr_t sig = dispatch_semaphore_wait(c->video_sem,
-                        dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC));
-    if (sig != 0) return NULL;  /* timeout — caller should retry or check stop */
-
     pthread_mutex_lock(&c->lock);
     if (c->stopped || c->video_count == 0) {
         pthread_mutex_unlock(&c->lock);
@@ -657,6 +652,29 @@ void *sck_capture_grab_video(SckCapture *c, int64_t *pts_us)
     c->video_count--;
     pthread_mutex_unlock(&c->lock);
     return pb;   /* ownership passes to the caller */
+}
+
+void *sck_capture_grab_video(SckCapture *c, int64_t *pts_us)
+{
+    if (!c) return NULL;
+
+    /* Timed wait — allows the caller to re-check g_recording/g_running
+       periodically (every ~500 ms) rather than blocking forever. */
+    intptr_t sig = dispatch_semaphore_wait(c->video_sem,
+                        dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC));
+    if (sig != 0) return NULL;  /* timeout — caller should retry or check stop */
+
+    return dequeue_video(c, pts_us);
+}
+
+void *sck_capture_try_grab_video(SckCapture *c, int64_t *pts_us)
+{
+    if (!c) return NULL;
+
+    if (dispatch_semaphore_wait(c->video_sem, DISPATCH_TIME_NOW) != 0)
+        return NULL;   /* nothing queued */
+
+    return dequeue_video(c, pts_us);
 }
 
 AVFrame *sck_capture_grab_audio(SckCapture *c, int64_t *pts_us)

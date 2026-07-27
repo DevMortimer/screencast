@@ -141,7 +141,17 @@ _Avoid_: frame skipping, throttling
 
 **Nearest-PTS matching**:
 Pairing a webcam frame with the screen frame it was actually captured alongside,
-by choosing the camera frame whose PTS is closest. Taking "the most recent
-camera frame" instead pairs the screen with whatever the camera pipeline had got
-around to delivering, which runs tens of milliseconds behind.
+by choosing the one whose PTS is closest rather than the one most recently
+delivered. Camera pipelines run tens of milliseconds behind the display, by a
+margin that moves with exposure time, so "most recent" pairs a frame with a
+neighbour it was never contemporaneous with.
 _Avoid_: latest frame, frame pairing
+
+**Video clock**:
+The source whose frames decide when an output frame is produced. Display-only
+recording is clocked by the screen, so a static display costs nothing to record.
+The webcam modes are clocked by the *camera*, because there the screen going
+still says nothing about whether the picture is still — clocking them off the
+screen freezes the overlay, and in `webcam` mode the whole frame, for as long as
+the display happens not to change.
+_Avoid_: frame rate, tick, driver
