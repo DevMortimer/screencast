@@ -138,11 +138,28 @@ static int64_t sample_pts_us(CMSampleBufferRef sb)
  * reports its true 1:1 or 2:1 ratio rather than a guessed one), but it is not
  * the panel's resolution and should not be described as such.
  *
- * SCREENCAST_SCALE overrides it; 1 restores the old point-sized capture.
- * Values above the native scale are clamped, because upscaling costs encode
- * bandwidth and memory without adding any detail.
+ * Capturing all of it, though, is not worth what it costs.  The full backing
+ * store is ~5.2 megapixels; every one of them is paid for again at each stage
+ * downstream — the encode, the memory bandwidth, the file — and on a fanless
+ * machine that is the difference between a recording that keeps up and one that
+ * drops frames.  So the default is capped at CAPTURE_LONG_EDGE_MAX on the
+ * longer edge.  1920 is the standard delivery size for a screencast and still
+ * oversamples a 1440x900 desktop by a third, which is where text sharpness
+ * actually comes from.
+ *
+ * Two bounds therefore apply, and the log says which one bit: the measured
+ * native ratio, and the cap.  The default is the smaller.
+ *
+ * SCREENCAST_SCALE overrides both; 1 restores a point-sized capture, and
+ * asking for more than the cap is honoured up to the native ratio, since an
+ * explicit request outranks a default.  Values above native are still clamped,
+ * because upscaling costs encode bandwidth and memory without adding detail.
  */
-static double display_capture_scale(CGDirectDisplayID did)
+#define CAPTURE_LONG_EDGE_MAX 1920
+
+static double display_capture_scale(CGDirectDisplayID did,
+                                    int pt_w, int pt_h,
+                                    const char **bound_by)
 {
     double native = 1.0;
 
@@ -155,18 +172,29 @@ static double display_capture_scale(CGDirectDisplayID did)
     }
     if (native < 1.0) native = 1.0;
 
-    double scale = native;
+    /* The cap is expressed in pixels, so turn it into the scale that would
+       produce it.  On a display already wider than the cap in points this is
+       below 1 — a deliberate downscale, not a clamp. */
+    int    long_pt   = pt_w > pt_h ? pt_w : pt_h;
+    double cap_scale = long_pt > 0
+                       ? (double)CAPTURE_LONG_EDGE_MAX / (double)long_pt
+                       : native;
+
+    double scale = native < cap_scale ? native : cap_scale;
+    *bound_by = native < cap_scale ? "native" : "1920 cap";
+
     const char *env = getenv("SCREENCAST_SCALE");
     if (env && env[0]) {
         double v = atof(env);
         if (v > 0.0) {
-            scale = v;
+            scale    = v;
+            *bound_by = "SCREENCAST_SCALE";
         } else {
             fprintf(stderr, "sck_capture: ignoring SCREENCAST_SCALE=%s "
                             "(not a positive number)\n", env);
         }
     }
-    if (scale > native) scale = native;
+    if (scale > native) { scale = native; *bound_by = "native"; }
     return scale;
 }
 
@@ -516,13 +544,15 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
             break;
         }
 
-        c->scale  = display_capture_scale(display.displayID);
+        const char *bound_by = "native";
+        c->scale  = display_capture_scale(display.displayID, pt_w, pt_h,
+                                          &bound_by);
         c->width  = scaled_even(pt_w, c->scale);
         c->height = scaled_even(pt_h, c->scale);
         fprintf(stderr, "[REC] Display: id %u, %dx%d px "
-                        "(%dx%d pt, scale %.2f) at (%d,%d)\n",
+                        "(%dx%d pt, scale %.2f, bound by %s) at (%d,%d)\n",
                 (unsigned)display.displayID, c->width, c->height,
-                pt_w, pt_h, c->scale,
+                pt_w, pt_h, c->scale, bound_by,
                 (int)CGRectGetMinX(db), (int)CGRectGetMinY(db));
 
         /* ── content filter ── */
