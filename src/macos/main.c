@@ -208,11 +208,6 @@ static int recording_open(void)
     s_rec.canvas_h = sck_info.height;
     s_rec.has_desktop = (sck_info.sample_rate > 0 && sck_info.channels > 0);
 
-    /* Respect SCREENCAST_DESKTOP_AUDIO=0 */
-    const char *desktop_env = getenv("SCREENCAST_DESKTOP_AUDIO");
-    if (desktop_env && strcmp(desktop_env, "0") == 0)
-        s_rec.has_desktop = 0;
-
     printf("[REC] Output: %s\n", s_rec.output_path);
     printf("[REC] Capture: %dx%d BGRA\n", s_rec.canvas_w, s_rec.canvas_h);
 

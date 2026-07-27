@@ -148,12 +148,13 @@ static int64_t sample_pts_us(CMSampleBufferRef sb)
  * actually comes from.
  *
  * Two bounds therefore apply, and the log says which one bit: the measured
- * native ratio, and the cap.  The default is the smaller.
+ * native ratio, and the cap.  The result is the smaller — never more than the
+ * framebuffer holds, because upscaling costs encode bandwidth and memory
+ * without adding any detail, and never more than the cap.
  *
- * SCREENCAST_SCALE overrides both; 1 restores a point-sized capture, and
- * asking for more than the cap is honoured up to the native ratio, since an
- * explicit request outranks a default.  Values above native are still clamped,
- * because upscaling costs encode bandwidth and memory without adding detail.
+ * There is no knob.  Both bounds are measured or fixed, and a recording that
+ * comes out wrong is a bug in one of them rather than something to be tuned
+ * per-run from the environment.
  */
 #define CAPTURE_LONG_EDGE_MAX 1920
 
@@ -180,22 +181,8 @@ static double display_capture_scale(CGDirectDisplayID did,
                        ? (double)CAPTURE_LONG_EDGE_MAX / (double)long_pt
                        : native;
 
-    double scale = native < cap_scale ? native : cap_scale;
     *bound_by = native < cap_scale ? "native" : "1920 cap";
-
-    const char *env = getenv("SCREENCAST_SCALE");
-    if (env && env[0]) {
-        double v = atof(env);
-        if (v > 0.0) {
-            scale    = v;
-            *bound_by = "SCREENCAST_SCALE";
-        } else {
-            fprintf(stderr, "sck_capture: ignoring SCREENCAST_SCALE=%s "
-                            "(not a positive number)\n", env);
-        }
-    }
-    if (scale > native) { scale = native; *bound_by = "native"; }
-    return scale;
+    return native < cap_scale ? native : cap_scale;
 }
 
 /* Points → pixels, rounded to an even count.  NV12 subsamples chroma 2x2, so
