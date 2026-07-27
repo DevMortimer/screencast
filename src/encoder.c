@@ -13,6 +13,11 @@
 /* Wall-clock spacing between forced keyframes. */
 #define KEYFRAME_INTERVAL_US (2 * 1000000LL)
 
+/* VideoToolbox constant-quality target, 0-100.  65 is visually clean on screen
+   content — text stays crisp — without spending the bits that the top of the
+   range costs for detail a screen recording does not contain. */
+#define VT_QUALITY 65
+
 /* ── logging ──────────────────────────────────────────────── */
 
 static void log_err(const char *label, int ret)
@@ -164,6 +169,28 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     av_opt_set(enc->vid_enc->priv_data, "realtime",        "1", 0);
     av_opt_set(enc->vid_enc->priv_data, "power_efficient", "1", 0);
     av_opt_set(enc->vid_enc->priv_data, "prio_speed",      "1", 0);
+
+    /*
+     * Rate control.  Setting none at all left the codec on libavcodec's
+     * generic default bit rate, which is not a considered figure for a screen
+     * capture at any resolution.
+     *
+     * A screencast is the case constant quality exists for: a still terminal
+     * costs almost nothing, and the bits go to the moments something actually
+     * moves.  A fixed bit rate pays the same for a motionless frame as for a
+     * scroll, which is the opposite of what this pipeline is built around.
+     *
+     * VideoToolbox only offers constant quality on Apple silicon —
+     * libavcodec rejects AV_CODEC_FLAG_QSCALE outright on x86_64 — so Intel
+     * gets an average bit rate derived from the canvas instead, at roughly
+     * the bits per pixel that quality lands on for screen content.
+     */
+#if defined(__aarch64__)
+    enc->vid_enc->flags         |= AV_CODEC_FLAG_QSCALE;
+    enc->vid_enc->global_quality = VT_QUALITY * FF_QP2LAMBDA;
+#else
+    enc->vid_enc->bit_rate = (int64_t)w * h * fps / 7;
+#endif
 #endif
 
     int ret = avcodec_open2(enc->vid_enc, codec, NULL);
