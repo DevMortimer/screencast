@@ -43,19 +43,23 @@ typedef void (*AvfCameraFrameFn)(void *user, void *pixbuf, int64_t pts_us);
 void avf_camera_release_frame(void *pixbuf);
 
 /*
- * Open the default (or specified) camera and start capture.
+ * Open the default (or specified) camera and start capture, at the smallest
+ * stream the device offers.
+ *
+ * There is no size to ask for because there is nothing to size.  The camera
+ * is held open so macOS offers Presenter Overlay for this app; the system
+ * renders the presenter from the device itself, and the frames delivered here
+ * are discarded.
  *
  * target selects a specific camera: a device UID, name substring, or
  * NULL / "" / "auto" for the system default.
- * want_w / want_h / want_fps are negotiation hints; 0 = let the system choose.
  *
- * Populates *info with the actual negotiated format.
+ * Populates *info with the format actually delivered.
  * Returns an opaque handle, or NULL on failure (no camera, permission denied,
- * format negotiation failure, etc.).  The caller treats the webcam as
- * best-effort and records without it on failure.
+ * and so on).  The caller treats the camera as best-effort and records without
+ * it on failure.
  */
-AvfCamera *avf_camera_open(const char *target, int want_w, int want_h,
-                           int want_fps, AvfCameraInfo *info,
+AvfCamera *avf_camera_open(const char *target, AvfCameraInfo *info,
                            AvfCameraFrameFn on_frame, void *user);
 
 /*

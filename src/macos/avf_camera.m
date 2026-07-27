@@ -165,130 +165,9 @@ static AVCaptureDevice *find_device(const char *target)
     return nil;
 }
 
-/* Is this format delivered as raw pixels rather than compressed frames?
-   MJPEG is how UVC cameras expose their highest resolutions, but every frame
-   then costs a decode — for a 30-minute recording that is a decode session
-   running the entire time, mostly to produce pixels that get scaled down into
-   a 480px overlay. */
-static BOOL format_is_raw(AVCaptureDeviceFormat *fmt)
-{
-    FourCharCode sub =
-        CMFormatDescriptionGetMediaSubType(fmt.formatDescription);
-    return sub == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
-           sub == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange  ||
-           sub == kCVPixelFormatType_422YpCbCr8                   ||
-           sub == kCVPixelFormatType_422YpCbCr8_yuvs              ||
-           sub == kCVPixelFormatType_32BGRA;
-}
-
-/* Try to match a device format for the given dimensions and frame rate.
-   Returns the closest match by area (not just exact), or nil if no formats
-   at all.  When want_w/want_h are 0 the device default is left alone. */
-static AVCaptureDeviceFormat *match_format(AVCaptureDevice *dev,
-                                            int want_w, int want_h,
-                                            int want_fps)
-{
-    if (want_w <= 0 || want_h <= 0) return nil;
-
-    int64_t want_area = (int64_t)want_w * want_h;
-    AVCaptureDeviceFormat *best = nil;
-    int64_t best_diff = INT64_MAX;
-
-    for (AVCaptureDeviceFormat *fmt in dev.formats) {
-        CMVideoDimensions dims =
-            CMVideoFormatDescriptionGetDimensions(
-                fmt.formatDescription);
-        if (dims.width < 320 || dims.height < 240) continue;
-        if (want_fps > 0) {
-            BOOL supported = NO;
-            for (AVFrameRateRange *r in
-                 fmt.videoSupportedFrameRateRanges) {
-                if (want_fps >= (int)r.minFrameRate &&
-                    want_fps <= (int)r.maxFrameRate) {
-                    supported = YES;
-                    break;
-                }
-            }
-            if (!supported) continue;
-        }
-
-        /* Prefer exact match; otherwise closest area (smaller is better
-           for screencast overlays — we scale down anyway). */
-        if ((int)dims.width == want_w && (int)dims.height == want_h) {
-            if (format_is_raw(fmt)) {
-                best = fmt;
-                break; /* exact match in a raw format wins immediately */
-            }
-            /* Right size but compressed — hold it as a candidate and keep
-               looking for the same size in a raw format. */
-            if (!best || !format_is_raw(best)) { best = fmt; best_diff = 0; }
-            continue;
-        }
-        int64_t area = (int64_t)dims.width * dims.height;
-        int64_t diff = llabs(area - want_area);
-        /* Slight bias toward smaller-than-requested: add 5% penalty when
-           the format is larger, so we prefer to scale down rather than up. */
-        if (area > want_area) diff = diff * 105 / 100;
-        /* Compressed formats cost a hardware decode on every frame for the
-           whole recording; make one worth a substantial size advantage before
-           it beats a raw format. */
-        if (!format_is_raw(fmt)) diff = diff * 2 + want_area / 2;
-        if (diff < best_diff) {
-            best_diff = diff;
-            best = fmt;
-        }
-    }
-    return best;
-}
-
-/* Lock the device for configuration, set the format and/or frame rate. */
-static int configure_device(AVCaptureDevice *dev,
-                             int want_w, int want_h, int want_fps)
-{
-    NSError *err = nil;
-    if (![dev lockForConfiguration:&err]) {
-        fprintf(stderr, "avf_camera: lockForConfiguration failed: %s\n",
-                err.localizedDescription.UTF8String);
-        return -1;
-    }
-
-    if (want_w > 0 && want_h > 0) {
-        AVCaptureDeviceFormat *match = match_format(dev, want_w, want_h, want_fps);
-        if (match) {
-            CMVideoDimensions dims =
-                CMVideoFormatDescriptionGetDimensions(match.formatDescription);
-            fprintf(stderr, "avf_camera: matched format %dx%d (requested %dx%d)\n",
-                    dims.width, dims.height, want_w, want_h);
-            dev.activeFormat = match;
-        } else {
-            fprintf(stderr, "avf_camera: no matching format for %dx%d, "
-                    "keeping device default\n", want_w, want_h);
-        }
-    }
-
-    if (want_fps > 0) {
-        /* Find the frame-rate range that contains want_fps and pin to its
-           exact CMTime values — AVFoundation compares rational times exactly
-           and will throw if we supply a slightly different 1/fps value. */
-        AVCaptureDeviceFormat *active = dev.activeFormat;
-        for (AVFrameRateRange *r in active.videoSupportedFrameRateRanges) {
-            if (want_fps >= (int)r.minFrameRate &&
-                want_fps <= (int)r.maxFrameRate) {
-                dev.activeVideoMinFrameDuration = r.minFrameDuration;
-                dev.activeVideoMaxFrameDuration = r.minFrameDuration;
-                break;
-            }
-        }
-    }
-
-    [dev unlockForConfiguration];
-    return 0;
-}
-
 #pragma mark - Public C API
 
-AvfCamera *avf_camera_open(const char *target, int want_w, int want_h,
-                           int want_fps, AvfCameraInfo *info,
+AvfCamera *avf_camera_open(const char *target, AvfCameraInfo *info,
                            AvfCameraFrameFn on_frame, void *user)
 {
     /* --- authorization --- */
@@ -346,8 +225,23 @@ AvfCamera *avf_camera_open(const char *target, int want_w, int want_h,
     AVCaptureSession *session = [[AVCaptureSession alloc] init];
     cam->session = (__bridge_retained void *)session;
 
-    /* --- configure device format --- */
-    configure_device(dev, want_w, want_h, want_fps);
+    /*
+     * The smallest stream the device will give us.
+     *
+     * Nothing here looks at these pixels.  The camera is open so that macOS
+     * offers Presenter Overlay for this app, and when the overlay is on the
+     * system takes the camera and renders the presenter from it directly, at
+     * whatever quality it wants.  Every frame that reaches this process is
+     * released on arrival, so paying an ISP to fill a 1080p buffer for the
+     * length of a recording buys precisely nothing.
+     *
+     * The preset, not the device's activeFormat, is what decides this on
+     * macOS: a session re-applies its preset on startRunning and silently
+     * overwrites any format set beforehand, and the preset that would defer
+     * to the device instead (InputPriority) is iOS-only.
+     */
+    if ([session canSetSessionPreset:AVCaptureSessionPresetLow])
+        session.sessionPreset = AVCaptureSessionPresetLow;
 
     /* --- input --- */
     NSError *err = nil;
@@ -373,15 +267,20 @@ AvfCamera *avf_camera_open(const char *target, int want_w, int want_h,
         [[AVCaptureVideoDataOutput alloc] init];
     cam->output = (__bridge_retained void *)output;
 
-    /* Request NV12, which is what UVC cameras deliver natively and what the
-       compositor's shader samples.  Asking for BGRA instead would make
-       AVFoundation convert every frame for no benefit, since the pixels are
-       going to the GPU either way.  Buffers must be Metal-compatible so they
-       can be bound as textures without a copy. */
+    /*
+     * NV12, and as small as the output will scale to.
+     *
+     * The session preset does not govern what this output delivers — with the
+     * preset set to Low the device still handed over 1920x1080 — so the size
+     * has to be stated on the output itself, which is the one place that does
+     * decide it.  These pixels are discarded on arrival; the number of them is
+     * pure cost.
+     */
     output.videoSettings = @{
         (id)kCVPixelBufferPixelFormatTypeKey:
             @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-        (id)kCVPixelBufferMetalCompatibilityKey: @YES,
+        (id)kCVPixelBufferWidthKey:  @(320),
+        (id)kCVPixelBufferHeightKey: @(240),
     };
     output.alwaysDiscardsLateVideoFrames = YES;
 

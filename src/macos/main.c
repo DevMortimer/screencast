@@ -31,6 +31,9 @@
 
 /* ── shared state ──────────────────────────────────────────── */
 
+/* Set from the command line: open the camera so Presenter Overlay is offered. */
+static int s_want_camera;
+
 /* Signal between main and capture threads: 1 while file is open. */
 static atomic_int s_rec_open = 0;
 
@@ -222,19 +225,33 @@ static int recording_open(void)
      * turning it on has ScreenCaptureKit composite the presenter into the
      * frames this process already receives.
      *
+     * At the smallest format the device offers, because nothing here looks at
+     * a single one of those pixels — the system takes the camera when the
+     * overlay engages and renders the presenter from it directly.  Asking for
+     * 1080p would light up the ISP for the length of the recording to fill a
+     * buffer that goes straight in the bin.
+     *
+     * Only when asked for.  Most recordings are a screen and a voice, and an
+     * open camera on those costs power and holds the camera indicator on for
+     * a feature that was never going to be used.
+     *
      * A camera we cannot open is not a failure: it costs the overlay, not the
      * recording.
      */
-    AvfCameraInfo cam_info;
-    s_rec.avf_cam = avf_camera_open(WEBCAM_DEV, 1920, 1080, 30, &cam_info,
-                                    cam_frame_cb, NULL);
-    if (s_rec.avf_cam) {
-        printf("[REC] Camera held open for Presenter Overlay (%dx%d %s)\n",
-               cam_info.width, cam_info.height,
-               av_get_pix_fmt_name(cam_info.pix_fmt));
-    } else {
-        fprintf(stderr, "main: camera unavailable — recording the display "
-                        "without Presenter Overlay\n");
+    if (s_want_camera) {
+        AvfCameraInfo cam_info;
+        s_rec.avf_cam = avf_camera_open(WEBCAM_DEV, &cam_info,
+                                        cam_frame_cb, NULL);
+        if (s_rec.avf_cam) {
+            printf("[REC] Camera held open for Presenter Overlay (%dx%d %s)\n",
+                   cam_info.width, cam_info.height,
+                   av_get_pix_fmt_name(cam_info.pix_fmt));
+            printf("[REC] Turn the overlay on from Control Center > "
+                   "Video Effects.\n");
+        } else {
+            fprintf(stderr, "main: camera unavailable — recording the display "
+                            "without Presenter Overlay\n");
+        }
     }
 
     /* Open microphone */
@@ -471,14 +488,16 @@ static void sig_stop(int sig)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "usage: %s [stop]\n"
+        "usage: %s [presenter|stop]\n"
         "\n"
         "  (no argument)  record the display + audio (mic + desktop)\n"
+        "  presenter      the same, but hold the camera open so macOS offers\n"
+        "                 Presenter Overlay in Control Center > Video Effects.\n"
+        "                 Turning it on there composites you into the capture;\n"
+        "                 you can switch it on and off as often as you like.\n"
         "  stop           stop the running recorder\n"
         "\n"
-        "To appear in the recording, turn on Presenter Overlay from the Video\n"
-        "Effects menu in Control Center while a recording is running; macOS\n"
-        "composites you into the capture itself.  Bind these to skhd keys:\n"
+        "Bind these to skhd keys:\n"
         "  shift + cmd - s : screencast\n"
         "  cmd - escape    : screencast stop\n",
         argv0);
@@ -486,11 +505,29 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
-    const char *cmd = (argc > 1) ? argv[1] : "display";
+    const char *arg = (argc > 1) ? argv[1] : "display";
+
+    /*
+     * `presenter` is a start-time choice, not a mode.
+     *
+     * It records exactly what a plain invocation records; the difference is
+     * that it opens the camera, which is what makes macOS offer Presenter
+     * Overlay for this stream.  There is nothing to switch mid-recording —
+     * whether you actually appear is decided in Control Center, at any point,
+     * as often as you like.
+     */
+    int want_camera = !strcmp(arg, "presenter");
+    const char *cmd = want_camera ? "display" : arg;
 
     /* If a daemon is already running, this invocation is just a controller. */
-    if (control_client_send(cmd) == 0)
+    if (control_client_send(cmd) == 0) {
+        if (want_camera)
+            fprintf(stderr, "screencast: already recording, and the camera is "
+                            "opened at start — stop\n"
+                            "            and run `screencast presenter` to "
+                            "record with the overlay available.\n");
         return 0;
+    }
 
     /* No daemon running. */
     if (control_is_stop(cmd))
@@ -507,6 +544,7 @@ int main(int argc, char **argv)
 
     av_log_set_level(AV_LOG_ERROR);
 
+    s_want_camera = want_camera;
     atomic_store(&g_mode,      mode);
     atomic_store(&g_recording, 1);
     atomic_store(&g_running,   1);
