@@ -14,6 +14,7 @@
 #import <Accelerate/Accelerate.h>
 #import <math.h>
 #import <pthread.h>
+#import <stdatomic.h>
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
@@ -25,6 +26,12 @@
 #define VIDEO_QUEUE_DEPTH   32
 #define AUDIO_INIT_SAMPLES  (1024 * 8)
 #define SCK_TARGET_FPS      30
+
+/* How long the stream may go without delivering a single video callback before
+   we say so on stderr.  Deliberately a warning and not a verdict: SCK is
+   allowed to go quiet while the display is static, and ending a recording of a
+   still slide would be a worse failure than the one this watches for. */
+#define SCK_STALL_WARN_US   (5 * 1000000LL)
 
 /* ── opaque struct ─────────────────────────────────────────── */
 
@@ -67,6 +74,15 @@ struct SckCapture {
     pthread_mutex_t         lock;
     SckCaptureInfo          info;
     int                     stopped;
+
+    /* Liveness.  ScreenCaptureKit can retire a stream at any time — a second
+       capture client, a display reconfiguration, the system recorder claiming
+       the display — and when it does the only symptom is that frames stop
+       arriving.  `failed` is set from the stream delegate; last_video_cb_us
+       catches a stream that goes quiet without saying anything. */
+    atomic_int              failed;
+    atomic_llong            last_video_cb_us;
+    int                     stall_warned;
 
     /* diagnostics (SCREENCAST_DEBUG=1) — each counter is touched by exactly
        one serial queue, so plain increments are safe */
@@ -186,7 +202,7 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
 
 /* ── SCStreamOutput delegate (SDK 27+) ─────────────────────── */
 
-@interface _SckStreamHelper : NSObject <SCStreamOutput>
+@interface _SckStreamHelper : NSObject <SCStreamOutput, SCStreamDelegate>
 @property (nonatomic, assign) SckCapture *capture;
 @end
 
@@ -201,6 +217,10 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
 
     if (type == SCStreamOutputTypeScreen) {
         c->video_cb++;
+        /* Proof of life, recorded before any filtering below can discard this
+           frame — an idle screen still delivers callbacks, a dead stream does
+           not, and that is the difference worth measuring. */
+        atomic_store(&c->last_video_cb_us, (long long)sck_host_time_us());
         if (c->debug && (c->video_cb == 1 || c->video_cb % 100 == 0))
             fprintf(stderr, "sck: video callback #%ld\n", c->video_cb);
 
@@ -394,6 +414,28 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
         CFRelease(blockBuf);
     }
 }
+
+/*
+ * The stream is gone.  Without this the loss is completely silent: SCK simply
+ * stops calling back, the record loop keeps pairing webcam frames against the
+ * last screen frame it held, and the recording continues with a frozen
+ * background for as long as it runs.
+ */
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error
+{
+    (void)stream;
+    SckCapture *c = _capture;
+    if (!c) return;
+    if (c->stopped) return;   /* our own close() — this is the expected path */
+
+    fprintf(stderr, "sck_capture: the system stopped the capture stream: %s\n",
+            error ? [[error localizedDescription] UTF8String]
+                  : "no reason given");
+    atomic_store(&c->failed, 1);
+
+    /* Wake anyone blocked on a frame that is never going to arrive. */
+    dispatch_semaphore_signal(c->video_sem);
+}
 @end
 
 /* ── public API ────────────────────────────────────────────── */
@@ -511,20 +553,23 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
            encoded, doubling or quadrupling the cost of a 30 fps recording. */
         config.minimumFrameInterval = CMTimeMake(1, SCK_TARGET_FPS);
 
+        /* ── stream output + stream delegate ── */
+        /* Built before the stream, because the stream wants it at init: SCK
+           holds the delegate weakly, so it is also retained for the lifetime of
+           the struct. */
+        _SckStreamHelper *helper = [[_SckStreamHelper alloc] init];
+        helper.capture = c;
+        c->helper = (void *)CFBridgingRetain(helper); /* retain for struct lifetime */
+
         /* ── stream ── */
         SCStream *stream = [[SCStream alloc] initWithFilter:filter
                                               configuration:config
-                                                   delegate:nil];
+                                                   delegate:helper];
         if (!stream) {
             fprintf(stderr, "sck_capture: could not create stream\n");
             break;
         }
         c->stream = (void *)CFBridgingRetain(stream);
-
-        /* ── stream output delegate ── */
-        _SckStreamHelper *helper = [[_SckStreamHelper alloc] init];
-        helper.capture = c;
-        c->helper = (void *)CFBridgingRetain(helper); /* retain for struct lifetime */
 
         dispatch_queue_t sq = dispatch_queue_create(
             "screencast.sck.samples", DISPATCH_QUEUE_SERIAL);
@@ -665,6 +710,28 @@ void *sck_capture_grab_video(SckCapture *c, int64_t *pts_us)
     if (sig != 0) return NULL;  /* timeout — caller should retry or check stop */
 
     return dequeue_video(c, pts_us);
+}
+
+int sck_capture_failed(SckCapture *c)
+{
+    if (!c) return 0;
+    if (atomic_load(&c->failed)) return 1;
+
+    /* A stream can also die without SCK saying anything, so note when the
+       callbacks stop.  This only warns.  SCK is entitled to go quiet — the
+       display being static is the ordinary reason — and ending a recording of
+       a still screen would be a worse bug than the one being guarded here. */
+    if (!c->ready_signalled || c->stall_warned) return 0;
+
+    long long last = atomic_load(&c->last_video_cb_us);
+    if (last > 0 && sck_host_time_us() - (int64_t)last > SCK_STALL_WARN_US) {
+        c->stall_warned = 1;
+        fprintf(stderr,
+                "sck_capture: no video callback for %llds (callbacks %ld) — "
+                "the screen may have stopped updating\n",
+                (long long)(SCK_STALL_WARN_US / 1000000), c->video_cb);
+    }
+    return 0;
 }
 
 void *sck_capture_try_grab_video(SckCapture *c, int64_t *pts_us)

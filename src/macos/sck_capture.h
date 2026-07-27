@@ -96,6 +96,23 @@ void *sck_capture_grab_video(SckCapture *c, int64_t *pts_us);
  */
 void *sck_capture_try_grab_video(SckCapture *c, int64_t *pts_us);
 
+/*
+ * Has the stream died underneath us?
+ *
+ * ScreenCaptureKit can retire a stream at any time — a second capture client,
+ * a display reconfiguration, the system recorder claiming the display.  When it
+ * does, the only symptom on this side is that frames stop arriving, which is
+ * indistinguishable from a screen that simply is not changing.  A caller that
+ * holds the last frame it received will therefore go on recording a frozen
+ * screen, at full frame rate, with live audio over the top, and nothing in the
+ * finished file says anything went wrong.
+ *
+ * Callers that composite the screen should poll this and stop rather than write
+ * a recording they cannot use.  Returns non-zero once the stream has stopped
+ * for any reason other than sck_capture_close().
+ */
+int sck_capture_failed(SckCapture *c);
+
 /* Release a buffer returned by either grab_video variant. */
 void sck_capture_release_frame(void *pixbuf);
 

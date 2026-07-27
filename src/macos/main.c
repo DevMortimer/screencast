@@ -580,6 +580,21 @@ static void recording_loop(void)
     while (atomic_load(&g_running) && atomic_load(&g_recording)) {
         RecordMode mode = atomic_load(&g_mode);
 
+        /*
+         * A dead screen stream is only fatal to the modes that draw the screen.
+         * Those cannot tell the difference between a stream that stopped and a
+         * display that is not changing — both look like "no new frame" — so
+         * they would keep compositing over the last frame they held and record
+         * a frozen screen until stopped by hand.  Better to end here, where the
+         * file is still finalised and the reason can be said out loud.
+         */
+        if (mode != MODE_WEBCAM && sck_capture_failed(s_rec.sck)) {
+            fprintf(stderr, "screencast: screen capture stopped — ending the "
+                            "recording rather than writing a frozen screen\n");
+            atomic_store(&g_recording, 0);
+            break;
+        }
+
         /* The compositor is built once for the session, so switching modes is
            just a different draw — nothing to set up or tear down. */
         int want_cam = (mode == MODE_WEBCAM || mode == MODE_BOTH) && s_rec.avf_cam;
