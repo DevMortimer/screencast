@@ -165,6 +165,7 @@ struct MetalCompositor {
 
     int canvas_w, canvas_h;
     int overlay_size, overlay_x, overlay_y;
+    long frames;          /* renders since creation; paces the cache flush */
 };
 
 /* ── texture helpers ───────────────────────────────────────── */
@@ -328,10 +329,14 @@ void *metal_compositor_render(MetalCompositor *mc, int mode,
                                             MTLPixelFormatR8Unorm, keep);
         id<MTLTexture> outUV = plane_texture(mc, out, 1,
                                              MTLPixelFormatRG8Unorm, keep);
-        id<MTLTexture> scrY = plane_texture(mc, screen, 0,
-                                            MTLPixelFormatR8Unorm, keep);
-        id<MTLTexture> scrUV = plane_texture(mc, screen, 1,
-                                             MTLPixelFormatRG8Unorm, keep);
+        /* Mode 2 fills the canvas with the camera and never samples the
+           screen, so binding it would mean wrapping two textures per frame
+           that the shader is guaranteed to discard. */
+        BOOL wantScreen = (mode != 2);
+        id<MTLTexture> scrY = wantScreen
+            ? plane_texture(mc, screen, 0, MTLPixelFormatR8Unorm, keep) : nil;
+        id<MTLTexture> scrUV = wantScreen
+            ? plane_texture(mc, screen, 1, MTLPixelFormatRG8Unorm, keep) : nil;
         id<MTLTexture> camY = plane_texture(mc, cam, 0,
                                             MTLPixelFormatR8Unorm, keep);
         id<MTLTexture> camUV = plane_texture(mc, cam, 1,
@@ -339,10 +344,19 @@ void *metal_compositor_render(MetalCompositor *mc, int mode,
 
         if (!outY || !outUV) { CVPixelBufferRelease(out); return NULL; }
 
-        /* Every texture slot must be bound even when unused. */
+        /*
+         * Every texture slot must be bound even when the shader will not read
+         * it.  Alias missing inputs onto the other input rather than onto the
+         * render target: binding a colour attachment as a fragment texture in
+         * the same pass is a read-write hazard, and mode 2 leaves the screen
+         * slots empty on every single frame.
+         */
         int hasCam = (camY && camUV) ? 1 : 0;
-        if (!scrY  || !scrUV) { scrY  = outY;  scrUV = outUV; }
-        if (!hasCam)          { camY  = scrY;  camUV = scrUV; }
+        if (!scrY || !scrUV) {
+            scrY  = hasCam ? camY  : outY;
+            scrUV = hasCam ? camUV : outUV;
+        }
+        if (!hasCam) { camY = scrY; camUV = scrUV; }
 
         /* Largest centre-crop of the camera that matches the target aspect:
            the square overlay in mode 3, the canvas in mode 2. */
@@ -403,7 +417,17 @@ void *metal_compositor_render(MetalCompositor *mc, int mode,
         [cb waitUntilCompleted];
 
         [keep removeAllObjects];
-        CVMetalTextureCacheFlush(mc->texCache, 0);
+
+        /*
+         * Flushing every frame emptied the cache every frame, which is the one
+         * thing it exists to prevent: capture, camera and output buffers all
+         * cycle through a small fixed set of IOSurfaces, so the wrapper for
+         * each is worth keeping and was instead being rebuilt six times a
+         * frame.  Flush occasionally to bound the cache when a buffer pool
+         * does get replaced — a mode switch, a resolution change.
+         */
+        if (++mc->frames % 300 == 0)
+            CVMetalTextureCacheFlush(mc->texCache, 0);
     }
 
     return out;
