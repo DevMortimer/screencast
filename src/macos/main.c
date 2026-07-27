@@ -22,7 +22,6 @@
 #include "sck_capture.h"
 #include "avf_camera.h"
 #include "avf_mic.h"
-#include "metal_compositor.h"
 #include <CoreVideo/CoreVideo.h>
 
 /* ── configuration ─────────────────────────────────────────── */
@@ -32,54 +31,6 @@
 
 /* ── shared state ──────────────────────────────────────────── */
 
-/*
- * Recent webcam frames, kept with their timestamps.
- *
- * In the webcam modes the camera *is* the video clock: one output frame per
- * camera frame, stamped with that frame's own capture time.  So this ring only
- * ever has to hold the frames that arrived while the loop was busy encoding the
- * previous one — the depth is slack, not history.
- *
- * The screen used to be the clock, and the pairing ran the other way: hold a
- * screen frame back and wait for the camera to catch up with it.  That wait
- * cost a quarter second of latency per frame and, worse, made the picture
- * hostage to a source that stops entirely — see the record loop.
- */
-#define CAM_RING_DEPTH   24              /* ~800 ms at 30 fps */
-
-static pthread_mutex_t s_cam_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  s_cam_cond  = PTHREAD_COND_INITIALIZER;
-static void           *s_cam_ring[CAM_RING_DEPTH];   /* CVPixelBufferRef */
-static int64_t         s_cam_ring_pts[CAM_RING_DEPTH];
-static int             s_cam_ring_head;
-static int             s_cam_ring_count;
-
-/*
- * Recent screen frames, most recent last.
- *
- * Deep enough to cover how far the camera runs behind the display — the loop
- * pairs a camera frame with the screen frame captured alongside it, and the
- * screen frame it wants is therefore always a little older than the newest one
- * in hand.  Six frames is ~200 ms at 30 fps, comfortably past any camera's lag.
- */
-#define SCREEN_HOLD 6
-
-static void    *s_scr_ring[SCREEN_HOLD];   /* CVPixelBufferRef */
-static int64_t  s_scr_pts[SCREEN_HOLD];
-static int      s_scr_head;
-static int      s_scr_count;
-
-/*
- * Correction for cameras that timestamp on arrival rather than on exposure.
- *
- * USB cameras generally stamp a buffer when the host receives it, by which
- * point the image is already however old the sensor readout and transport
- * made it.  There is no way to interrogate a UVC device for that figure, so
- * it is a manual constant: record a hand clap, find the offset between the
- * sound and the picture, and set it once for that camera.
- */
-static int64_t s_cam_offset_us;
-
 /* Signal between main and capture threads: 1 while file is open. */
 static atomic_int s_rec_open = 0;
 
@@ -87,15 +38,12 @@ static atomic_int s_rec_open = 0;
 
 typedef struct {
     SckCapture *sck;           /* screen + desktop audio */
-    AvfCamera  *avf_cam;       /* webcam (always on, no arbiter) */
+    AvfCamera  *avf_cam;       /* held open only to make Presenter Overlay
+                                  available; its frames are never read */
     AvfMic     *avf_mic;       /* microphone */
     EncoderCtx enc;
     MixerCtx  *mixer;          /* mixes mic + desktop into one track */
-    MetalCompositor *comp;     /* GPU compositing; NULL in display-only mode */
     int canvas_w, canvas_h;
-    int cam_w, cam_h;
-    enum AVPixelFormat cam_fmt;
-    int cam_active;            /* 1 when webcam compositing is engaged */
     int has_mic;
     int has_desktop;
     int has_aud;               /* has_mic || has_desktop */
@@ -135,144 +83,23 @@ static void make_output_path(char *buf, size_t n)
 
 /* ── webcam frame callback (AVFoundation delivery queue) ───── */
 
+/*
+ * Nothing here reads the camera.
+ *
+ * The device is opened so that macOS offers Presenter Overlay for this stream
+ * — ScreenCaptureKit makes the effect available to an app that is capturing
+ * the screen and using the camera at the same time — and once the overlay is
+ * on, the system takes the camera and composites the presenter into the SCK
+ * frames we already receive.  AVFoundation stops delivering a live camera
+ * stream at that point anyway.
+ *
+ * So every frame that does arrive is released immediately.  Compositing an
+ * overlay ourselves is what this replaced.
+ */
 static void cam_frame_cb(void *user, void *pixbuf, int64_t pts_us)
 {
-    (void)user;
-    pthread_mutex_lock(&s_cam_mutex);
-
-    if (s_cam_ring_count >= CAM_RING_DEPTH) {
-        avf_camera_release_frame(s_cam_ring[s_cam_ring_head]);
-        s_cam_ring[s_cam_ring_head] = NULL;
-        s_cam_ring_head = (s_cam_ring_head + 1) % CAM_RING_DEPTH;
-        s_cam_ring_count--;
-    }
-
-    int tail = (s_cam_ring_head + s_cam_ring_count) % CAM_RING_DEPTH;
-    s_cam_ring[tail]     = pixbuf;   /* ownership taken */
-    s_cam_ring_pts[tail] = pts_us - s_cam_offset_us;
-    s_cam_ring_count++;
-
-    pthread_cond_signal(&s_cam_cond);
-    pthread_mutex_unlock(&s_cam_mutex);
-}
-
-static void cam_ring_clear(void)
-{
-    pthread_mutex_lock(&s_cam_mutex);
-    for (int i = 0; i < CAM_RING_DEPTH; i++) {
-        avf_camera_release_frame(s_cam_ring[i]);
-        s_cam_ring[i] = NULL;
-    }
-    s_cam_ring_head = s_cam_ring_count = 0;
-    pthread_mutex_unlock(&s_cam_mutex);
-}
-
-/* How long the record loop waits on the camera before giving up on this tick
-   and letting the screen carry the picture instead. */
-#define CAM_WAIT_MS 250
-
-/*
- * Take the newest webcam frame captured after `after_us`, waiting up to
- * CAM_WAIT_MS for one to arrive.  Ownership of the returned buffer passes to
- * the caller; every frame older than it is released here.
- *
- * *Newest*, not oldest: this is the elastic-video rule applied to the camera.
- * When the loop keeps up there is exactly one new frame per call and the choice
- * is moot; when it falls behind, encoding the backlog in order would only sink
- * it further, so the intervening frames are dropped and the timeline stays
- * honest — the returned frame carries its own capture time, which is what the
- * output is stamped with.
- */
-static void *cam_take_latest(int64_t after_us, int64_t *out_pts)
-{
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_nsec += CAM_WAIT_MS * 1000000L;
-    deadline.tv_sec  += deadline.tv_nsec / 1000000000L;
-    deadline.tv_nsec %= 1000000000L;
-
-    void *out = NULL;
-    pthread_mutex_lock(&s_cam_mutex);
-
-    for (;;) {
-        int newest = s_cam_ring_count > 0
-            ? (s_cam_ring_head + s_cam_ring_count - 1) % CAM_RING_DEPTH : -1;
-        if (newest >= 0 && s_cam_ring_pts[newest] > after_us) {
-            out = s_cam_ring[newest];
-            if (out_pts) *out_pts = s_cam_ring_pts[newest];
-            s_cam_ring[newest] = NULL;
-            /* Everything still in the ring predates the frame being taken. */
-            for (int i = 0; i < s_cam_ring_count - 1; i++) {
-                int idx = (s_cam_ring_head + i) % CAM_RING_DEPTH;
-                avf_camera_release_frame(s_cam_ring[idx]);
-                s_cam_ring[idx] = NULL;
-            }
-            s_cam_ring_head = s_cam_ring_count = 0;
-            break;
-        }
-
-        if (!atomic_load(&g_running) || !atomic_load(&s_rec_open)) break;
-        if (pthread_cond_timedwait(&s_cam_cond, &s_cam_mutex, &deadline)
-                == ETIMEDOUT)
-            break;
-    }
-
-    pthread_mutex_unlock(&s_cam_mutex);
-    return out;
-}
-
-/* ── screen frame ring ─────────────────────────────────────── */
-
-/* Takes ownership of `pixbuf`, evicting the oldest frame when full. */
-static void screen_ring_push(void *pixbuf, int64_t pts_us)
-{
-    if (s_scr_count >= SCREEN_HOLD) {
-        sck_capture_release_frame(s_scr_ring[s_scr_head]);
-        s_scr_ring[s_scr_head] = NULL;
-        s_scr_head = (s_scr_head + 1) % SCREEN_HOLD;
-        s_scr_count--;
-    }
-    int tail = (s_scr_head + s_scr_count) % SCREEN_HOLD;
-    s_scr_ring[tail] = pixbuf;
-    s_scr_pts[tail]  = pts_us;
-    s_scr_count++;
-}
-
-static void screen_ring_clear(void)
-{
-    for (int i = 0; i < SCREEN_HOLD; i++) {
-        sck_capture_release_frame(s_scr_ring[i]);
-        s_scr_ring[i] = NULL;
-    }
-    s_scr_head = s_scr_count = 0;
-}
-
-/*
- * The screen frame captured closest in time to `target_us`, borrowed — the ring
- * keeps the reference, so the caller must not release it and must be done with
- * it before the next push.  NULL only when nothing has been captured yet.
- */
-static void *screen_ring_nearest(int64_t target_us)
-{
-    void *best = NULL;
-    int64_t best_dist = INT64_MAX;
-
-    for (int i = 0; i < s_scr_count; i++) {
-        int idx = (s_scr_head + i) % SCREEN_HOLD;
-        int64_t d = s_scr_pts[idx] - target_us;
-        if (d < 0) d = -d;
-        if (d < best_dist) { best_dist = d; best = s_scr_ring[idx]; }
-    }
-    return best;
-}
-
-/* Newest screen frame in the ring, borrowed, with its timestamp. */
-static void *screen_ring_newest(int64_t *out_pts)
-{
-    if (s_scr_count == 0) return NULL;
-    int idx = (s_scr_head + s_scr_count - 1) % SCREEN_HOLD;
-    if (out_pts) *out_pts = s_scr_pts[idx];
-    return s_scr_ring[idx];
+    (void)user; (void)pts_us;
+    avf_camera_release_frame(pixbuf);
 }
 
 /* ── mixed audio delivered to the encoder ──────────────────── */
@@ -386,48 +213,28 @@ static int recording_open(void)
     printf("[REC] Output: %s\n", s_rec.output_path);
     printf("[REC] Capture: %dx%d BGRA\n", s_rec.canvas_w, s_rec.canvas_h);
 
-    /* Open webcam (always on — AVFoundation fans out, no arbiter needed) */
-    s_rec.cam_active = 0;
-    s_rec.cam_w = 0;
-    s_rec.cam_h = 0;
-    s_rec.cam_fmt = AV_PIX_FMT_NONE;
-
     /*
-     * Default webcam: 1920x1080.
+     * Open the camera, and read nothing from it.
      *
-     * This is the largest size external UVC cameras deliver as raw NV12 —
-     * above it they switch to MJPEG, which costs a JPEG decode on every single
-     * frame of the recording.  1080p is generous for the ≤480px overlay in
-     * `both` mode and adequate when the webcam fills the canvas, and it stays
-     * in the pixel format the pipeline wants, so it needs no decode at all.
+     * Its only job is to make this app a camera client while an SCK stream is
+     * running, which is the condition macOS attaches Presenter Overlay to.
+     * With that satisfied the overlay appears in the Video Effects menu, and
+     * turning it on has ScreenCaptureKit composite the presenter into the
+     * frames this process already receives.
      *
-     * The format is fixed for the whole session rather than varied per mode:
-     * changing it means restarting the capture device, which would blank the
-     * camera and break the timeline every time the mode hotkey is pressed.
-     *
-     * Override with SCREENCAST_CAM_SIZE=WxH.  Asking for 3840x2160 will
-     * select MJPEG and pay for the decode.
+     * A camera we cannot open is not a failure: it costs the overlay, not the
+     * recording.
      */
-    int cam_w_hint = 1920, cam_h_hint = 1080, cam_fps_hint = 30;
-    const char *size = getenv("SCREENCAST_CAM_SIZE");
-    if (size && size[0]) sscanf(size, "%dx%d", &cam_w_hint, &cam_h_hint);
-    const char *fps = getenv("SCREENCAST_CAM_FPS");
-    if (fps && fps[0]) cam_fps_hint = atoi(fps);
-
-    /* NOTE: SCREENCAST_WEBCAM_DEV is intentionally ignored on macOS —
-       AVFoundation fans out natively so camera selection isn't needed. */
     AvfCameraInfo cam_info;
-    s_rec.avf_cam = avf_camera_open(WEBCAM_DEV, cam_w_hint, cam_h_hint,
-                                    cam_fps_hint, &cam_info,
+    s_rec.avf_cam = avf_camera_open(WEBCAM_DEV, 1920, 1080, 30, &cam_info,
                                     cam_frame_cb, NULL);
     if (s_rec.avf_cam) {
-        s_rec.cam_w = cam_info.width;
-        s_rec.cam_h = cam_info.height;
-        s_rec.cam_fmt = cam_info.pix_fmt;
-        printf("[REC] Webcam: %dx%d %s\n", cam_info.width, cam_info.height,
+        printf("[REC] Camera held open for Presenter Overlay (%dx%d %s)\n",
+               cam_info.width, cam_info.height,
                av_get_pix_fmt_name(cam_info.pix_fmt));
     } else {
-        fprintf(stderr, "main: webcam not available — recording without it\n");
+        fprintf(stderr, "main: camera unavailable — recording the display "
+                        "without Presenter Overlay\n");
     }
 
     /* Open microphone */
@@ -501,37 +308,6 @@ static int recording_open(void)
      * Fixing t0 once, after the last source is live, is what stops any one
      * track from entering with a head start on the others.
      */
-    /*
-     * Overlay geometry: a quarter of the canvas width, capped at 480 points,
-     * inset 20 points from the bottom-right corner.
-     *
-     * The cap and the inset are defined in points and scaled with the capture,
-     * so the camera keeps the same apparent size and margin however many pixels
-     * per point the display turned out to have.  Left in raw pixels they would
-     * halve on a Retina panel, which is the whole difference between an overlay
-     * that reads and one that does not.
-     */
-    double scale = sck_info.scale > 0.0 ? sck_info.scale : 1.0;
-    int overlay_cap = (int)lround(480.0 * scale);
-    int inset       = (int)lround(20.0 * scale);
-    int overlay = s_rec.canvas_w / 4;
-    if (overlay > overlay_cap) overlay = overlay_cap;
-    s_rec.comp = metal_compositor_create(s_rec.canvas_w, s_rec.canvas_h,
-                                         overlay,
-                                         s_rec.canvas_w - overlay - inset,
-                                         s_rec.canvas_h - overlay - inset);
-    if (!s_rec.comp)
-        fprintf(stderr, "main: compositor unavailable — "
-                        "webcam overlay disabled\n");
-
-    const char *cam_off = getenv("SCREENCAST_CAM_OFFSET_MS");
-    s_cam_offset_us = (cam_off && cam_off[0]) ? atoll(cam_off) * 1000LL : 0;
-    if (s_cam_offset_us)
-        fprintf(stderr, "[REC] Webcam offset: %lldms\n",
-                (long long)(s_cam_offset_us / 1000));
-
-    cam_ring_clear();
-    screen_ring_clear();
     s_rec.t0_us = sck_host_time_us();
     atomic_store(&s_rec.audio_anchor_us, -1);
     sck_capture_start_session(s_rec.sck, s_rec.t0_us);
@@ -558,136 +334,60 @@ static void recording_loop(void)
         pthread_create(&desk_tid, NULL, desktop_audio_thread, &s_rec);
 
     /*
-     * Which source clocks the output.
+     * The screen clocks the output, and nothing else does.
      *
-     * Display-only recording is clocked by the screen: ScreenCaptureKit stops
-     * delivering while the picture is static, nothing is encoded, and variable
-     * frame rate carries the still image for as long as it lasts.  That is the
-     * cheapest possible recording of a screen that is not moving.
+     * ScreenCaptureKit stops delivering while the picture is static, so a still
+     * display encodes nothing at all and variable frame rate carries the image
+     * for as long as it lasts.  That is the cheapest a screen recording gets.
      *
-     * The webcam modes cannot use that clock, because in those modes the screen
-     * going still says nothing about whether the *picture* is still.  Waiting on
-     * it froze the overlay — and in webcam mode the entire frame — for as long
-     * as the display happened not to change, which on a talking-head screencast
-     * is most of the recording.  So the camera clocks them instead: one output
-     * frame per camera frame, paired with the screen frame captured alongside
-     * it, at the camera's own timestamp.
+     * It holds now because the presenter is no longer ours to draw.  When
+     * Presenter Overlay is on, the frames arriving here already have the
+     * presenter composited into them by the system, and they keep arriving
+     * because the presenter is moving even when the screen is not — the cost
+     * of the overlay is paid only while it is switched on.
      */
-    int64_t last_cam_pts  = INT64_MIN;   /* newest camera frame consumed */
     int64_t last_emit_pts = INT64_MIN;   /* keeps output PTS strictly rising */
-    int     was_cam_mode  = -1;
 
     while (atomic_load(&g_running) && atomic_load(&g_recording)) {
-        RecordMode mode = atomic_load(&g_mode);
-
         /*
-         * A dead screen stream is only fatal to the modes that draw the screen.
-         * Those cannot tell the difference between a stream that stopped and a
-         * display that is not changing — both look like "no new frame" — so
-         * they would keep compositing over the last frame they held and record
-         * a frozen screen until stopped by hand.  Better to end here, where the
-         * file is still finalised and the reason can be said out loud.
+         * A stream that stopped and a display that is not changing look
+         * identical from here — both are simply "no new frame".  Left alone we
+         * would go on holding the last frame we received and record a frozen
+         * screen with live audio over it, and nothing in the finished file
+         * would say so.  Better to end here, where it is still finalised and
+         * the reason can be said out loud.
          */
-        if (mode != MODE_WEBCAM && sck_capture_failed(s_rec.sck)) {
+        if (sck_capture_failed(s_rec.sck)) {
             fprintf(stderr, "screencast: screen capture stopped — ending the "
                             "recording rather than writing a frozen screen\n");
             atomic_store(&g_recording, 0);
             break;
         }
 
-        /* The compositor is built once for the session, so switching modes is
-           just a different draw — nothing to set up or tear down. */
-        int want_cam = (mode == MODE_WEBCAM || mode == MODE_BOTH) && s_rec.avf_cam;
-
-        /* Whatever the other clock buffered while it was not driving is stale
-           by the time the mode switches back. */
-        if (want_cam != was_cam_mode) {
-            screen_ring_clear();
-            last_cam_pts = INT64_MIN;
-            was_cam_mode = want_cam;
-        }
-
-        void   *screen     = NULL;   /* borrowed from the ring, or owned below */
-        void   *own_screen = NULL;   /* set when this iteration owns `screen` */
-        void   *cam        = NULL;
-        int64_t emit_pts   = -1;
-
-        if (want_cam) {
-            /* Keep the screen queue drained so it never backs up behind the
-               camera's cadence, and so the pairing has history to choose from. */
-            for (;;) {
-                int64_t pts = -1;
-                void *s = sck_capture_try_grab_video(s_rec.sck, &pts);
-                if (!s) break;
-                screen_ring_push(s, pts);
-            }
-
-            int64_t cam_pts = -1;
-            cam = cam_take_latest(last_cam_pts, &cam_pts);
-            if (cam) {
-                last_cam_pts = cam_pts;
-                emit_pts     = cam_pts;
-                screen       = screen_ring_nearest(cam_pts);
-            } else {
-                /* Camera stalled.  Don't let it take the screen down with it:
-                   fall back to the newest screen frame for this tick. */
-                if (!atomic_load(&g_running) || !atomic_load(&g_recording))
-                    break;
-                screen = screen_ring_newest(&emit_pts);
-                if (!screen) continue;
-            }
-
-            /* Mode 3 draws the screen underneath, so it needs one. */
-            if (!screen && mode == MODE_BOTH) {
-                if (cam) avf_camera_release_frame(cam);
-                continue;
-            }
-        } else {
-            /* Blocking with timeout — unblocks ~500 ms so the stop condition
-               and a mode switch are both noticed promptly. */
-            int64_t pts = -1;
-            own_screen = sck_capture_grab_video(s_rec.sck, &pts);
-            if (!own_screen) {
-                if (!atomic_load(&g_running) || !atomic_load(&g_recording))
-                    break;
-                continue;
-            }
-            screen   = own_screen;
-            emit_pts = pts;
-        }
-
-        /* The encoder counts on a strictly rising timeline, and two clocks feed
-           it here — a mode switch or a camera hiccup can hand back a timestamp
-           that has already been used. */
-        if (emit_pts <= last_emit_pts) {
-            if (cam) avf_camera_release_frame(cam);
-            if (own_screen) sck_capture_release_frame(own_screen);
+        /* Blocking with timeout — unblocks ~500 ms so the stop condition is
+           noticed promptly even while the display is perfectly still. */
+        int64_t pts = -1;
+        void *screen = sck_capture_grab_video(s_rec.sck, &pts);
+        if (!screen) {
+            if (!atomic_load(&g_running) || !atomic_load(&g_recording))
+                break;
             continue;
         }
-        last_emit_pts = emit_pts;
 
-        /*
-         * Display mode composites nothing, so the capture buffer goes to the
-         * encoder untouched — no GPU pass, no CPU pass, no copy at all.  The
-         * other modes need one Metal pass to draw the webcam in.
-         */
-        void *encode_buf = screen;
-        void *composited = NULL;
-        if (mode != MODE_DISPLAY && s_rec.comp) {
-            composited = metal_compositor_render(s_rec.comp, mode, screen, cam);
-            if (composited) encode_buf = composited;
+        /* The encoder counts on a strictly rising timeline. */
+        if (pts <= last_emit_pts) {
+            sck_capture_release_frame(screen);
+            continue;
         }
+        last_emit_pts = pts;
 
-        if (encode_buf) {
-            encoder_write_pixbuf(&s_rec.enc, encode_buf, emit_pts);
-            frames_encoded++;
-        }
+        /* Nothing is composited, so the capture buffer goes to the encoder
+           untouched — no GPU pass, no CPU pass, no copy at all. */
+        encoder_write_pixbuf(&s_rec.enc, screen, pts);
+        frames_encoded++;
+        sck_capture_release_frame(screen);
 
-        if (composited) metal_compositor_release_frame(composited);
-        if (cam) avf_camera_release_frame(cam);
-        if (own_screen) sck_capture_release_frame(own_screen);
-
-        int64_t screen_pts = emit_pts;
+        int64_t screen_pts = pts;
         /*
          * Sync telemetry.  Both tracks are stamped from the same session clock,
          * so a healthy recording holds this delta near zero for its whole
@@ -713,12 +413,6 @@ static void recording_loop(void)
     }
 
     atomic_store(&s_rec_open, 0);
-    /* Wake the camera wait so it notices the session is over. */
-    pthread_mutex_lock(&s_cam_mutex);
-    pthread_cond_broadcast(&s_cam_cond);
-    pthread_mutex_unlock(&s_cam_mutex);
-
-    screen_ring_clear();
     if (mic_tid)  pthread_join(mic_tid, NULL);
     if (desk_tid) pthread_join(desk_tid, NULL);
 }
@@ -751,15 +445,11 @@ static void recording_close(void)
     encoder_free(&s_rec.enc);
 
     if (s_rec.mixer) { mixer_destroy(s_rec.mixer); s_rec.mixer = NULL; }
-    if (s_rec.comp)  { metal_compositor_destroy(s_rec.comp); s_rec.comp = NULL; }
 
     if (s_rec.avf_mic) { avf_mic_close(s_rec.avf_mic); s_rec.avf_mic = NULL; }
     if (s_rec.avf_cam) { avf_camera_close(s_rec.avf_cam); s_rec.avf_cam = NULL; }
     sck_capture_close(s_rec.sck);
     s_rec.sck = NULL;
-
-    /* Clear any remaining webcam frames */
-    cam_ring_clear();
 
     printf("[REC] Capture stopped.\n");
     printf("[REC] Output: %s\n", s_rec.output_path);
@@ -781,19 +471,16 @@ static void sig_stop(int sig)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "usage: %s <display|webcam|both|stop>\n"
+        "usage: %s [stop]\n"
         "\n"
-        "  display   record the screen + audio (mic + desktop)\n"
-        "  webcam    record the webcam + audio (mic + desktop)\n"
-        "  both      record screen + webcam overlay + audio (mic + desktop)\n"
-        "  stop      stop the running recorder\n"
+        "  (no argument)  record the display + audio (mic + desktop)\n"
+        "  stop           stop the running recorder\n"
         "\n"
-        "The first record command starts a background daemon; later commands\n"
-        "switch its mode over the control socket.  Bind these to skhd keys:\n"
-        "  shift + cmd - d : screencast display\n"
-        "  shift + cmd - w : screencast webcam\n"
-        "  shift + cmd - b : screencast both\n"
-        "  shift + cmd - escape : screencast stop\n",
+        "To appear in the recording, turn on Presenter Overlay from the Video\n"
+        "Effects menu in Control Center while a recording is running; macOS\n"
+        "composites you into the capture itself.  Bind these to skhd keys:\n"
+        "  shift + cmd - s : screencast\n"
+        "  cmd - escape    : screencast stop\n",
         argv0);
 }
 
@@ -834,7 +521,7 @@ int main(int argc, char **argv)
     while (atomic_load(&g_running)) {
         if (atomic_load(&g_recording)) {
             if (recording_open() == 0) {
-                printf("[REC] Mode %d active.\n", atomic_load(&g_mode));
+                printf("[REC] Recording.\n");
                 recording_loop();
             } else {
                 /* Capture could not start — don't spin re-opening it. */

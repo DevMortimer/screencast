@@ -85,7 +85,13 @@ void control_notify(const char *summary, const char *body)
 const char *control_mode_label(RecordMode mode)
 {
     switch (mode) {
+#ifdef __APPLE__
+    /* The only mode there is, so it names what is recorded rather than which
+       of several shapes was chosen. */
+    case MODE_DISPLAY: return "Display + mic + desktop audio";
+#else
     case MODE_DISPLAY: return "Display + mic";
+#endif
     case MODE_WEBCAM:  return "Webcam + mic";
     case MODE_BOTH:    return "Display + webcam + mic";
     default:           return NULL;
@@ -96,8 +102,32 @@ int control_parse_mode(const char *cmd)
 {
     if (!cmd) return -1;
     if (!strcmp(cmd, "display") || !strcmp(cmd, "d")) return MODE_DISPLAY;
+
+#ifdef __APPLE__
+    /*
+     * macOS records the display and nothing else.  The webcam is Control
+     * Center's Presenter Overlay, which ScreenCaptureKit composites into the
+     * capture itself, so there is no mode here to switch into.
+     *
+     * Say that rather than quietly accepting the word and doing nothing: this
+     * message is the only place the webcam went that a reader will find.  The
+     * platform's whole command vocabulary is defined in this function, which
+     * is where someone looking for the divergence would come.
+     */
+    if (!strcmp(cmd, "webcam") || !strcmp(cmd, "w") ||
+        !strcmp(cmd, "both")   || !strcmp(cmd, "b")) {
+        fprintf(stderr,
+                "screencast: '%s' is Linux-only.  On macOS the webcam is "
+                "Presenter Overlay —\n"
+                "            turn it on from the Video Effects menu in "
+                "Control Center while\n"
+                "            a recording is running.\n", cmd);
+        return -1;
+    }
+#else
     if (!strcmp(cmd, "webcam")  || !strcmp(cmd, "w")) return MODE_WEBCAM;
     if (!strcmp(cmd, "both")    || !strcmp(cmd, "b")) return MODE_BOTH;
+#endif
     return -1;
 }
 
@@ -222,8 +252,12 @@ int control_server_start(void)
     s_thread_started = 1;
 
     printf("[INFO] Control socket: %s\n", path);
+#ifdef __APPLE__
+    printf("  screencast stop  ->  stop and exit\n\n");
+#else
     printf("  screencast display | webcam | both  ->  switch mode\n");
     printf("  screencast stop                      ->  stop and exit\n\n");
+#endif
     return 0;
 }
 

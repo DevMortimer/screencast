@@ -445,9 +445,9 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
 
 /*
  * The stream is gone.  Without this the loss is completely silent: SCK simply
- * stops calling back, the record loop keeps pairing webcam frames against the
- * last screen frame it held, and the recording continues with a frozen
- * background for as long as it runs.
+ * stops calling back, the record loop goes on holding the last screen frame it
+ * received, and the recording continues with a frozen picture for as long as
+ * it runs.
  */
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error
 {
@@ -459,10 +459,47 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
     fprintf(stderr, "sck_capture: the system stopped the capture stream: %s\n",
             error ? [[error localizedDescription] UTF8String]
                   : "no reason given");
+    /*
+     * Name the likeliest cause, because the error rarely does.  Concurrent
+     * ScreenCaptureKit streams are only reliable against different displays,
+     * so a second app starting a capture of this one — a call sharing your
+     * screen, another recorder — is the usual way this happens.
+     */
+    fprintf(stderr, "sck_capture: another app may have started capturing this "
+                    "display; only one\n"
+                    "            capture of a given display is reliable at a "
+                    "time\n");
     atomic_store(&c->failed, 1);
 
     /* Wake anyone blocked on a frame that is never going to arrive. */
     dispatch_semaphore_signal(c->video_sem);
+}
+
+/*
+ * Presenter Overlay went on or off.
+ *
+ * Nothing to do — the system composites the presenter into the frames this
+ * stream already delivers, so the pipeline is unaffected either way.  It is
+ * worth recording all the same, because it changes the cost of a recording
+ * out of all recognition: with the overlay off a static screen delivers
+ * almost no frames, and with it on the presenter is always moving, so frames
+ * arrive continuously for as long as it is switched on.  Two recordings from
+ * the same binary can look nothing alike, and this is the only line that says
+ * which one you are looking at.
+ */
+- (void)outputVideoEffectDidStartForStream:(SCStream *)stream
+{
+    (void)stream;
+    if (getenv("SCREENCAST_DEBUG"))
+        fprintf(stderr, "sck: presenter overlay on — the system is "
+                        "compositing into the capture\n");
+}
+
+- (void)outputVideoEffectDidStopForStream:(SCStream *)stream
+{
+    (void)stream;
+    if (getenv("SCREENCAST_DEBUG"))
+        fprintf(stderr, "sck: presenter overlay off\n");
 }
 @end
 

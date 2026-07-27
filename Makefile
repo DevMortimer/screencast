@@ -21,7 +21,7 @@ SHARED_SRCS := $(SRCDIR)/control.c $(SRCDIR)/encoder.c $(SRCDIR)/composite.c $(S
 ifeq ($(PLATFORM),macos)
     PLATFORM_SRCS := $(SRCDIR)/macos/main.c
     OBJC_SRCS     := $(SRCDIR)/macos/sck_capture.m $(SRCDIR)/macos/avf_camera.m \
-                     $(SRCDIR)/macos/avf_mic.m $(SRCDIR)/macos/metal_compositor.m
+                     $(SRCDIR)/macos/avf_mic.m
     SRCS          := $(SHARED_SRCS) $(PLATFORM_SRCS) $(OBJC_SRCS)
 else
     PLATFORM_SRCS := $(SRCDIR)/linux/main.c $(SRCDIR)/linux/wlcap.c \
@@ -52,7 +52,7 @@ ifeq ($(PLATFORM),macos)
     LDFLAGS := $(shell pkg-config --libs $(FFMPEG_PKGS)) -pthread -lm \
                -framework AVFoundation -framework ScreenCaptureKit \
                -framework CoreMedia -framework CoreVideo -framework CoreAudio \
-               -framework Cocoa -framework Accelerate -framework Metal
+               -framework Cocoa -framework Accelerate
 else
     PKG     := libavformat libavcodec libavdevice libswscale libswresample \
                libavutil wayland-client libpipewire-0.3 libspa-0.2
@@ -96,13 +96,8 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Pattern rule for .m -> .o (Objective-C on macOS, ARC only where needed)
-# sck_capture uses SCStreamOutput protocol which requires ARC; the compositor
-# bridges Metal objects into a C struct and needs it too.
+# sck_capture uses the SCStreamOutput protocol, which requires ARC.
 $(OBJDIR)/macos/sck_capture.o: $(SRCDIR)/macos/sck_capture.m | $(OBJDIR)
-	mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
-
-$(OBJDIR)/macos/metal_compositor.o: $(SRCDIR)/macos/metal_compositor.m | $(OBJDIR)
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 
@@ -131,15 +126,12 @@ MIXER_TEST_PKGS := libswresample libavutil
 # h264_videotoolbox accepts CVPixelBuffers by reference, both from libav's own
 # hardware pool and wrapped from an external source.  Links nothing from src/.
 PROBE_BIN := $(OBJDIR)/vt_hwframe_probe
-METAL_PROBE_BIN := $(OBJDIR)/metal_probe
 
 probe: | $(OBJDIR)
 ifeq ($(PLATFORM),macos)
 	$(CC) $(CFLAGS) -fobjc-arc -o $(PROBE_BIN) tests/vt_hwframe_probe.m \
 	    $(LDFLAGS)
-	$(CC) $(CFLAGS) -fobjc-arc -o $(METAL_PROBE_BIN) tests/metal_probe.m \
-	    $(SRCDIR)/macos/metal_compositor.m $(LDFLAGS)
-	@echo "built $(PROBE_BIN) and $(METAL_PROBE_BIN)"
+	@echo "built $(PROBE_BIN)"
 else
 	@echo "probe is macOS only"
 endif
