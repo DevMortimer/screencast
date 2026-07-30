@@ -95,14 +95,17 @@ static void log_error_av(const char *msg, int ret)
     fprintf(stderr, "avf_mic: %s: %s\n", msg, buf);
 }
 
-/* Derive an AVSampleFormat + channel count from the ASBD. */
+/* Derive an AVSampleFormat + channel count from the ASBD.
+ *
+ * Handles both Float PCM (the standard Mac mic format) and Signed Integer PCM
+ * (common on USB mics like Fifine).  The resampler converts everything to
+ * 48 kHz stereo FLTP regardless. */
 static int asbd_to_avfmt(const AudioStreamBasicDescription *asbd,
                          enum AVSampleFormat *out_fmt,
                          int *out_channels)
 {
-    if (!(asbd->mFormatID == kAudioFormatLinearPCM &&
-          asbd->mFormatFlags & kAudioFormatFlagIsFloat)) {
-        fprintf(stderr, "avf_mic: unsupported format (not Float PCM)\n");
+    if (asbd->mFormatID != kAudioFormatLinearPCM) {
+        fprintf(stderr, "avf_mic: unsupported format (not Linear PCM)\n");
         return -1;
     }
 
@@ -113,11 +116,33 @@ static int asbd_to_avfmt(const AudioStreamBasicDescription *asbd,
         ch = 2;
     }
 
-    *out_channels = ch;
-    *out_fmt      = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved)
-                        ? AV_SAMPLE_FMT_FLTP
-                        : AV_SAMPLE_FMT_FLT;
-    return 0;
+    int planar = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+
+    if (asbd->mFormatFlags & kAudioFormatFlagIsFloat) {
+        *out_channels = ch;
+        *out_fmt = planar ? AV_SAMPLE_FMT_FLTP : AV_SAMPLE_FMT_FLT;
+        return 0;
+    }
+
+    if (asbd->mFormatFlags & kAudioFormatFlagIsSignedInteger) {
+        switch (asbd->mBitsPerChannel) {
+        case 16:
+            *out_channels = ch;
+            *out_fmt = planar ? AV_SAMPLE_FMT_S16P : AV_SAMPLE_FMT_S16;
+            return 0;
+        case 32:
+            *out_channels = ch;
+            *out_fmt = planar ? AV_SAMPLE_FMT_S32P : AV_SAMPLE_FMT_S32;
+            return 0;
+        default:
+            fprintf(stderr, "avf_mic: unsupported integer bit depth (%d)\n",
+                    (int)asbd->mBitsPerChannel);
+            return -1;
+        }
+    }
+
+    fprintf(stderr, "avf_mic: unsupported format (not Float or Signed Integer PCM)\n");
+    return -1;
 }
 
 /* ── AVCapture delegate ────────────────────────────────────── */
@@ -194,6 +219,9 @@ static int asbd_to_avfmt(const AudioStreamBasicDescription *asbd,
 
     if (m->src_channels <= 0) { CFRelease(blockBuf); return; }
 
+    int elem_bytes = av_get_bytes_per_sample(m->src_fmt);
+    if (elem_bytes <= 0) { CFRelease(blockBuf); return; }
+
     /* We need bufListSize bytes — use alloca for the stack-friendly case. */
     bufList = alloca(bufListSize);
     memset(bufList, 0, bufListSize);
@@ -211,14 +239,21 @@ static int asbd_to_avfmt(const AudioStreamBasicDescription *asbd,
     }
     /* blockBuf is now retained; release when done. */
 
-    /* Number of samples from the first non-empty buffer. */
+    /* Number of audio frames (per-channel samples) across all buffers. */
     size_t nSamples = 0;
-    for (UInt32 i = 0; i < bufList->mNumberBuffers; i++) {
-        AudioBuffer *ab = &bufList->mBuffers[i];
-        if (ab->mData && ab->mDataByteSize > 0) {
-            size_t s = ab->mDataByteSize / (sizeof(float));
-            if (nSamples == 0 || s < nSamples) nSamples = s;
+    if (av_sample_fmt_is_planar(m->src_fmt)) {
+        for (UInt32 i = 0; i < bufList->mNumberBuffers; i++) {
+            AudioBuffer *ab = &bufList->mBuffers[i];
+            if (ab->mData && ab->mDataByteSize > 0) {
+                size_t s = ab->mDataByteSize / elem_bytes;
+                if (nSamples == 0 || s < nSamples) nSamples = s;
+            }
         }
+    } else {
+        /* Interleaved: single buffer has samples for all channels. */
+        AudioBuffer *ab = &bufList->mBuffers[0];
+        if (ab->mData && ab->mDataByteSize > 0)
+            nSamples = ab->mDataByteSize / (elem_bytes * m->src_channels);
     }
     if (nSamples == 0) {
         CFRelease(blockBuf);
@@ -241,19 +276,19 @@ static int asbd_to_avfmt(const AudioStreamBasicDescription *asbd,
         return;
     }
 
-    if (m->src_fmt == AV_SAMPLE_FMT_FLT) {
-        /* Interleaved: single buffer, L,R,L,R,... */
-        AudioBuffer *ab = &bufList->mBuffers[0];
-        memcpy(src_frame->data[0], ab->mData,
-               (size_t)nSamples * sizeof(float) * (size_t)m->src_channels);
-    } else {
+    if (av_sample_fmt_is_planar(m->src_fmt)) {
         /* Planar non-interleaved: each channel in its own AudioBuffer. */
         for (int ch = 0; ch < m->src_channels && ch < (int)bufList->mNumberBuffers; ch++) {
             AudioBuffer *ab = &bufList->mBuffers[ch];
-            size_t copy = (size_t)nSamples * sizeof(float);
+            size_t copy = (size_t)nSamples * elem_bytes;
             if (copy > ab->mDataByteSize) copy = ab->mDataByteSize;
             memcpy(src_frame->data[ch], ab->mData, copy);
         }
+    } else {
+        /* Interleaved: single buffer, L,R,L,R,... */
+        AudioBuffer *ab = &bufList->mBuffers[0];
+        memcpy(src_frame->data[0], ab->mData,
+               (size_t)nSamples * elem_bytes * (size_t)m->src_channels);
     }
     CFRelease(blockBuf);
 
