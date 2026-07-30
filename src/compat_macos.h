@@ -15,6 +15,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+/* CFRunLoopRunInMode (used for AppKit event pumping from C code). */
+#include <CoreFoundation/CFRunLoop.h>
+
 // Undefine any prior macro so the real socket() is available.
 #ifdef socket
 #undef socket

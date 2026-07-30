@@ -105,8 +105,36 @@ $(OBJDIR)/macos/%.o: $(SRCDIR)/macos/%.m | $(OBJDIR)
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# ── macOS app bundle ────────────────────────────────────────
+# Presenter Overlay is offered in Control Center's Video Effects panel, which
+# only lists camera clients macOS can attribute to an app.  The bundle gives
+# the recorder that identity; main.c hands `screencast presenter` off to it.
+# Ad-hoc signed by default (CODESIGN_ID=-), which means TCC re-asks for
+# permissions after a rebuild — an ad-hoc seal names the exact build.  Pass
+# CODESIGN_ID=<identity> to sign with a stable certificate instead.
+ifeq ($(PLATFORM),macos)
+BUNDLE      := Screencast.app
+CODESIGN_ID ?= -
+
+bundle: $(TARGET) $(SRCDIR)/macos/Info.plist
+	rm -rf $(BUNDLE)
+	mkdir -p $(BUNDLE)/Contents/MacOS
+	cp $(SRCDIR)/macos/Info.plist $(BUNDLE)/Contents/Info.plist
+	cp $(TARGET) $(BUNDLE)/Contents/MacOS/$(TARGET)
+	codesign --force --sign "$(CODESIGN_ID)" $(BUNDLE)
+
+# ~/Applications/Screencast.app is where relaunch_as_bundle() looks.
+install: bundle
+	mkdir -p $(HOME)/.local/bin $(HOME)/Applications
+	install -m 755 $(TARGET) $(HOME)/.local/bin/$(TARGET)
+	rm -rf $(HOME)/Applications/$(BUNDLE)
+	cp -R $(BUNDLE) $(HOME)/Applications/$(BUNDLE)
+
+.PHONY: bundle install
+endif
+
 clean:
-	rm -rf $(OBJDIR) $(TARGET) $(TEST_BIN)
+	rm -rf $(OBJDIR) $(TARGET) $(TEST_BIN) $(BUNDLE)
 
 # ── tests ───────────────────────────────────────────────────
 # The capture arbiter is a pure, I/O-free unit — the one testing seam.  Build a

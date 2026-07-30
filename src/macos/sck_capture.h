@@ -35,6 +35,31 @@ typedef struct {
 } SckCaptureInfo;
 
 /*
+ * Bootstrap the NSApplication shared instance.
+ *
+ * Call early in main() when the process may have been launched from a
+ * terminal multiplexer (Zellij, tmux, etc.) where AppKit is not
+ * automatically initialised.  Without this call macOS may not offer
+ * Presenter Overlay in Control Center, because ScreenCaptureKit and
+ * AVFoundation need the NSApplication infrastructure to register the
+ * process as a camera + screen client.
+ *
+ * Safe to call multiple times — only the first call does anything.
+ */
+void sck_bootstrap_app(void);
+
+/*
+ * Pump one iteration of the AppKit run loop.
+ *
+ * Call this periodically during recording so that AppKit can process
+ * system messages (including Presenter Overlay registration and state
+ * changes).  The main thread blocks for seconds at a time inside the
+ * capture loop, so without this help the system may never recognise
+ * this process as a live screen+camera client.
+ */
+void sck_pump_run_loop(void);
+
+/*
  * Current reading of the session clock, in microseconds.
  *
  * This is CMClockGetHostTimeClock() — the same time domain that stamps every

@@ -104,10 +104,15 @@ brew install ffmpeg
 ### Build (macOS)
 
 ```sh
-make
+make          # ./screencast and, via `make bundle`, ./Screencast.app
+make install  # ~/.local/bin/screencast + ~/Applications/Screencast.app
 ```
 
-The compiled binary is written to `./screencast`.
+The compiled binary is written to `./screencast`. `make install` also builds
+`Screencast.app`, a minimal app bundle around the same binary — `presenter`
+needs it (below). The bundle is ad-hoc signed, so macOS asks for the
+privacy permissions again after a rebuild; pass `CODESIGN_ID=<identity>` to
+sign with a stable certificate instead.
 
 ### macOS usage
 
@@ -129,16 +134,28 @@ The `presenter` form exists because that menu item only appears for an app
 using the camera and the screen at once. Plain `screencast` opens no camera,
 so it costs no power and lights no camera indicator.
 
+`presenter` hands the recording off to `~/Applications/Screencast.app`
+(via LaunchServices) rather than recording in the calling process. Control
+Center attributes a camera stream to the responsible process, and the Video
+Effects panel only lists processes with an app identity — launched bare from
+skhd or a zellij server there is no app on the chain, so the camera runs but
+the overlay is unreachable. The bundle gives every launcher the same
+identity. The first bundled run asks for Camera, Microphone, and Screen
+Recording permissions under the name **Screencast**.
+
 Bind them with **skhd** (or any macOS hotkey tool):
 
 ```cfg
 shift + cmd - s : pgrep -x screencast > /dev/null || \
                   ("$HOME/.local/bin/screencast" >> "$HOME/Library/Logs/screencast.log" 2>&1 &)
+shift + cmd - p : pgrep -x screencast > /dev/null || \
+                  ("$HOME/.local/bin/screencast" presenter >> "$HOME/Library/Logs/screencast.log" 2>&1 &)
 cmd - escape    : pgrep -x screencast > /dev/null && "$HOME/.local/bin/screencast" stop
 ```
 
 Launched from a hotkey there is no terminal, so the daemon's output goes to a
-log — that is where a failed start can be read back from.
+log — that is where a failed start can be read back from. The bundled daemon
+appends to the same log itself.
 
 ### macOS paths
 
@@ -146,6 +163,8 @@ log — that is where a failed start can be read back from.
 |---|---|
 | Output recordings | `~/Movies/screencast_YYYYMMDD_HHMMSS.mp4` |
 | Control socket | `~/Library/Caches/screencast/screencast.sock` |
+| App bundle (presenter identity) | `~/Applications/Screencast.app` |
+| Daemon log | `~/Library/Logs/screencast.log` |
 
 ### macOS limitations vs Linux
 

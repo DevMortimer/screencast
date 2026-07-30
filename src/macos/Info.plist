@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Control Center attributes camera use to the responsible process, and its
+  Video Effects panel — where Presenter Overlay lives — only lists processes
+  with an app identity.  This bundle is that identity: `screencast presenter`
+  hands off to Screencast.app via LaunchServices so the recorder owns its
+  camera stream under the same name from every launcher (Terminal, zellij,
+  skhd).  See main.c's relaunch_as_bundle().
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.screencast.recorder</string>
+	<key>CFBundleName</key>
+	<string>Screencast</string>
+	<key>CFBundleDisplayName</key>
+	<string>Screencast</string>
+	<key>CFBundleExecutable</key>
+	<string>screencast</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<!-- Accessory app: no Dock icon, no menu bar.  The recorder's whole UI is
+	     the hotkeys and Control Center. -->
+	<key>LSUIElement</key>
+	<true/>
+	<!-- A bundled app that touches the camera or microphone without a usage
+	     string is killed by TCC, not denied. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Screencast holds the camera open so macOS offers Presenter Overlay while recording.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Screencast records the microphone alongside the screen.</string>
+</dict>
+</plist>

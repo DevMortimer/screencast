@@ -100,6 +100,49 @@ static void log_error(const char *msg, OSStatus code)
     fprintf(stderr, "sck_capture: %s (osstatus %d)\n", msg, (int)code);
 }
 
+void sck_bootstrap_app(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSApplication *app = [NSApplication sharedApplication];
+
+        /*
+         * Register this process with the Window Server.
+         *
+         * Launched from the app bundle (the normal presenter path — main.c
+         * hands off through LaunchServices), registration already happened
+         * at launch and LSUIElement in the Info.plist pins the Accessory
+         * policy; re-asserting Regular here would flash a Dock icon.
+         *
+         * Launched as a bare binary — display-only recording, or the
+         * fallback when the bundle is not installed — the process starts
+         * Prohibited, so walk it to Accessory the long way round: the
+         * intermediate Regular forces the full Window Server registration
+         * that a direct Prohibited→Accessory transition can skip on newer
+         * macOS versions.
+         */
+        if ([[NSBundle mainBundle] bundleIdentifier] == nil) {
+            [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+            [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        }
+
+        /*
+         * Pump the run loop once so AppKit can finish its initialisation
+         * and register the process with the Window Server.  Without this
+         * the change to Accessory may not take full effect because the
+         * main thread never yields to AppKit's event processing.
+         */
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+    });
+}
+
+void sck_pump_run_loop(void)
+{
+    /* Pump one pass of the AppKit run loop so it can process system
+       messages related to Presenter Overlay registration and state. */
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+}
+
 int64_t sck_host_time_us(void)
 {
     CMTime now = CMClockGetTime(CMClockGetHostTimeClock());
@@ -606,6 +649,19 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
            120 Hz — and every one of those frames was being converted and
            encoded, doubling or quadrupling the cost of a 30 fps recording. */
         config.minimumFrameInterval = CMTimeMake(1, SCK_TARGET_FPS);
+
+        /*
+         *  Presenter Overlay settings (macOS 14+).
+         *
+         * Let the system manage the privacy alert for Presenter Overlay.
+         * This setting exists to prevent constant re-prompting; it does NOT
+         * enable or disable the overlay itself — that is controlled by the
+         * user through Control Center.
+         */
+        if (@available(macOS 14.0, *)) {
+            config.presenterOverlayPrivacyAlertSetting =
+                SCPresenterOverlayAlertSettingSystem;
+        }
 
         /* ── stream output + stream delegate ── */
         /* Built before the stream, because the stream wants it at init: SCK

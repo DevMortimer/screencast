@@ -22,6 +22,7 @@
 #include "sck_capture.h"
 #include "avf_camera.h"
 #include "avf_mic.h"
+#include <CoreFoundation/CoreFoundation.h>
 #include <CoreVideo/CoreVideo.h>
 
 /* ── configuration ─────────────────────────────────────────── */
@@ -381,6 +382,11 @@ static void recording_loop(void)
         int64_t pts = -1;
         void *screen = sck_capture_grab_video(s_rec.sck, &pts);
         if (!screen) {
+            /*
+             * Pump the AppKit run loop while waiting for the next frame so
+             * the system can communicate Presenter Overlay state changes.
+             */
+            sck_pump_run_loop();
             if (!atomic_load(&g_running) || !atomic_load(&g_recording))
                 break;
             continue;
@@ -494,8 +500,60 @@ static void usage(const char *argv0)
         "\n"
         "Bind these to skhd keys:\n"
         "  shift + cmd - s : screencast\n"
+        "  shift + cmd - p : screencast presenter\n"
         "  cmd - escape    : screencast stop\n",
         argv0);
+}
+
+/* ── app-bundle handoff ────────────────────────────────────── */
+
+/* A bare executable's main bundle has no identifier; only a real .app with
+   an Info.plist does.  That identity is what Control Center attributes the
+   camera stream to. */
+static int running_in_bundle(void)
+{
+    CFBundleRef b = CFBundleGetMainBundle();
+    return b && CFBundleGetIdentifier(b) != NULL;
+}
+
+static int relaunch_as_bundle(void)
+{
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return -1;
+
+    char app[512];
+    snprintf(app, sizeof(app), "%s/Applications/Screencast.app", home);
+    if (access(app, X_OK) != 0) return -1; /* not installed */
+
+    /*
+     * open(1) routes through LaunchServices, which is the point: launchd
+     * starts the app as its own responsible process, under the bundle's
+     * identity, instead of this process inheriting whoever ran the command.
+     * If the app is somehow already running, open activates it rather than
+     * starting a second daemon — the control-socket check above already
+     * made that window small.
+     */
+    char sh[600];
+    snprintf(sh, sizeof(sh), "/usr/bin/open '%s' --args presenter", app);
+    return system(sh) == 0 ? 0 : -1;
+}
+
+/* The bundled daemon has no terminal.  Append to the same log the skhd
+   bindings redirect to, so every launch context reads back from one place. */
+static void log_to_file(void)
+{
+    /* Running the bundle's executable by hand for debugging keeps the tty. */
+    if (isatty(STDERR_FILENO)) return;
+
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return;
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/Library/Logs/screencast.log", home);
+    if (freopen(path, "a", stderr))
+        setvbuf(stderr, NULL, _IONBF, 0);
+    if (freopen(path, "a", stdout))
+        setvbuf(stdout, NULL, _IOLBF, 0);
 }
 
 int main(int argc, char **argv)
@@ -534,6 +592,43 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * Presenter Overlay lives in Control Center's Video Effects panel, and
+     * that panel only lists camera clients macOS can attribute to an app.
+     * Attribution follows the responsible process: launched from Terminal
+     * that is Terminal.app and the panel appears under Terminal's name, but
+     * launched from skhd or a zellij server there is no app anywhere on the
+     * chain — the camera runs, its indicator lights, and the overlay is
+     * unreachable.  No in-process AppKit setup changes who macOS says owns
+     * the camera, which is why bootstrapping NSApplication here never fixed
+     * it.
+     *
+     * So when the overlay is wanted and this process has no app identity of
+     * its own, hand the recording to the installed bundle and exit.  Every
+     * launcher converges on the same identity: Screencast.app.
+     */
+    if (want_camera && !running_in_bundle()) {
+        if (relaunch_as_bundle() == 0) {
+            fprintf(stderr, "screencast: handing off to Screencast.app so "
+                            "Presenter Overlay is offered "
+                            "(log: ~/Library/Logs/screencast.log)\n");
+            return 0;
+        }
+        fprintf(stderr, "screencast: Screencast.app not installed (run `make "
+                        "install`) — recording here; Control Center may not "
+                        "offer Presenter Overlay\n");
+    }
+
+    if (running_in_bundle())
+        log_to_file();
+
+    /*
+     * Bootstrap NSApplication before touching any Apple framework, so the
+     * process is registered with the window server before ScreenCaptureKit
+     * or AVFoundation see it.
+     */
+    sck_bootstrap_app();
+
     signal(SIGINT,  sig_stop);
     signal(SIGTERM, sig_stop);
 
@@ -549,8 +644,6 @@ int main(int argc, char **argv)
 
     control_notify("Screencast recording", control_mode_label(mode));
 
-    struct timespec poll = { .tv_nsec = 20000000L }; /* 20 ms */
-
     while (atomic_load(&g_running)) {
         if (atomic_load(&g_recording)) {
             if (recording_open() == 0) {
@@ -563,7 +656,12 @@ int main(int argc, char **argv)
             }
             recording_close();
         } else {
-            nanosleep(&poll, NULL);
+            /*
+             * Pump the AppKit run loop instead of sleeping so the system
+             * can communicate state changes — especially Presenter Overlay
+             * availability — even while no recording is active.
+             */
+            sck_pump_run_loop();
         }
     }
 
