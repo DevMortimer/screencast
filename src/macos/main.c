@@ -35,6 +35,9 @@
 /* Set from the command line: open the camera so Presenter Overlay is offered. */
 static int s_want_camera;
 
+/* Set from the command line: leave desktop audio out of the mix. */
+static int s_mute_desktop;
+
 /* Signal between main and capture threads: 1 while file is open. */
 static atomic_int s_rec_open = 0;
 
@@ -208,6 +211,10 @@ static int recording_open(void)
     s_rec.canvas_w = sck_info.width;
     s_rec.canvas_h = sck_info.height;
     s_rec.has_desktop = (sck_info.sample_rate > 0 && sck_info.channels > 0);
+    if (s_mute_desktop) {
+        s_rec.has_desktop = 0;
+        printf("[REC] Desktop audio muted by request.\n");
+    }
 
     printf("[REC] Output: %s\n", s_rec.output_path);
     printf("[REC] Capture: %dx%d BGRA\n", s_rec.canvas_w, s_rec.canvas_h);
@@ -489,13 +496,14 @@ static void sig_stop(int sig)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "usage: %s [presenter|stop]\n"
+        "usage: %s [presenter|stop] [mute]\n"
         "\n"
         "  (no argument)  record the display + audio (mic + desktop)\n"
         "  presenter      the same, but hold the camera open so macOS offers\n"
         "                 Presenter Overlay in Control Center > Video Effects.\n"
         "                 Turning it on there composites you into the capture;\n"
         "                 you can switch it on and off as often as you like.\n"
+        "  mute           leave desktop audio out of the mix (mic only)\n"
         "  stop           stop the running recorder\n"
         "\n"
         "Bind these to skhd keys:\n"
@@ -534,7 +542,8 @@ static int relaunch_as_bundle(void)
      * made that window small.
      */
     char sh[600];
-    snprintf(sh, sizeof(sh), "/usr/bin/open '%s' --args presenter", app);
+    snprintf(sh, sizeof(sh), "/usr/bin/open '%s' --args presenter%s", app,
+             s_mute_desktop ? " mute" : "");
     return system(sh) == 0 ? 0 : -1;
 }
 
@@ -558,7 +567,18 @@ static void log_to_file(void)
 
 int main(int argc, char **argv)
 {
-    const char *arg = (argc > 1) ? argv[1] : "display";
+    /*
+     * `mute` can accompany any record argument (`screencast mute`,
+     * `screencast presenter mute`); whatever else is on the line is the
+     * command itself.
+     */
+    const char *arg = "display";
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "mute"))
+            s_mute_desktop = 1;
+        else
+            arg = argv[i];
+    }
 
     /*
      * `presenter` is a start-time choice, not a mode.
@@ -579,6 +599,9 @@ int main(int argc, char **argv)
                             "opened at start — stop\n"
                             "            and run `screencast presenter` to "
                             "record with the overlay available.\n");
+        if (s_mute_desktop)
+            fprintf(stderr, "screencast: already recording — `mute` applies "
+                            "when a recording starts, not mid-recording.\n");
         return 0;
     }
 

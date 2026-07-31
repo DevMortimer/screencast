@@ -81,6 +81,9 @@ static atomic_llong    s_cam_seq    = 0;
 /* Signal between main and capture threads: 1 while file is open. */
 static atomic_int s_rec_open = 0;
 
+/* Set from the command line: leave desktop audio out of the mix. */
+static int s_mute_desktop;
+
 static int recording_interrupted(void *opaque)
 {
     (void)opaque;
@@ -559,6 +562,10 @@ static int recording_open(void)
     s_rec.has_desktop = 0;
     const char *desktop_env = getenv("SCREENCAST_DESKTOP_AUDIO");
     int want_desktop = !(desktop_env && strcmp(desktop_env, "0") == 0);
+    if (s_mute_desktop) {
+        want_desktop = 0;
+        printf("[REC] Desktop audio muted by request.\n");
+    }
     if (want_desktop) {
         const char *desktop_dev = env_default("SCREENCAST_DESKTOP_DEV", DESKTOP_DEV);
         if (capture_audio_open_monitor(&s_rec.desk_cap, desktop_dev) == 0) {
@@ -760,11 +767,12 @@ static void sig_stop(int sig)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "usage: %s <display|webcam|both|stop>\n"
+        "usage: %s <display|webcam|both|stop> [mute]\n"
         "\n"
         "  display   record the screen + audio (mic + desktop)\n"
         "  webcam    record the webcam + audio (mic + desktop)\n"
         "  both      record screen + webcam overlay + audio (mic + desktop)\n"
+        "  mute      leave desktop audio out of the mix (mic only)\n"
         "  stop      stop the running recorder and render the final file\n"
         "\n"
         "The first record command starts a background daemon; later commands\n"
@@ -775,11 +783,26 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
-    const char *cmd = (argc > 1) ? argv[1] : "display";
+    /*
+     * `mute` can accompany any record argument (`screencast mute`,
+     * `screencast both mute`); whatever else is on the line is the
+     * command itself.
+     */
+    const char *cmd = "display";
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "mute"))
+            s_mute_desktop = 1;
+        else
+            cmd = argv[i];
+    }
 
     /* If a daemon is already running, this invocation is just a controller. */
-    if (control_client_send(cmd) == 0)
+    if (control_client_send(cmd) == 0) {
+        if (s_mute_desktop)
+            fprintf(stderr, "screencast: already recording — `mute` applies "
+                            "when a recording starts, not mid-recording.\n");
         return 0;
+    }
 
     /* No daemon running. */
     if (control_is_stop(cmd))
