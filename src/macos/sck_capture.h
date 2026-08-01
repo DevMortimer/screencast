@@ -10,7 +10,8 @@
  *
  * Bridges the async SCK stream model into a synchronous grab interface.
  * Captures the main display at native resolution with BGRA pixel format
- * and captures system audio (Float32 PCM).
+ * and captures system audio (any Linear PCM the output device negotiates,
+ * normalised to 48 kHz stereo FLTP before it is queued).
  *
  * The header is pure C — callers need not know about Objective-C or Apple
  * frameworks.
@@ -143,8 +144,8 @@ void sck_capture_release_frame(void *pixbuf);
 
 /*
  * Non-blocking read of the accumulated audio samples.  Returns a heap-allocated
- * AVFrame in the format reported by info (typically FLTP planar float at
- * 48 kHz), or NULL if no audio data is queued.
+ * AVFrame in the canonical mix format (48 kHz stereo FLTP), or NULL if no
+ * audio data is queued.
  *
  * *pts_us receives the session-relative timestamp of the *first* sample in the
  * returned frame.

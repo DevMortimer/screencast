@@ -4,7 +4,8 @@
 // grab interface.  Frames arrive on an SCK-managed dispatch queue; the stream
 // output delegate pushes video into a bounded circular buffer (signalled via
 // dispatch semaphore) and accumulates audio samples in per-channel plane
-// buffers.
+// buffers.  System audio is normalised to 48 kHz stereo FLTP — the mixer's
+// canonical format — before it is queued.
 
 #import "sck_capture.h"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -12,6 +13,10 @@
 #import <CoreVideo/CoreVideo.h>
 #import <AppKit/AppKit.h>
 #import <Accelerate/Accelerate.h>
+#import <libswresample/swresample.h>
+#import <libavutil/channel_layout.h>
+#import <libavutil/error.h>
+#import <libavutil/samplefmt.h>
 #import <math.h>
 #import <pthread.h>
 #import <stdatomic.h>
@@ -57,6 +62,15 @@ struct SckCapture {
     enum AVSampleFormat     audio_fmt;
     int64_t                 audio_head_pts;   /* host-clock µs of sample 0 */
 
+    /* Negotiated source format, read from the first audio buffer's ASBD.
+       The stream follows the output device, so this can be float or integer
+       PCM at the device's own rate; swr converts it to the canonical
+       48 kHz stereo FLTP that audio_planes[] actually holds. */
+    int                     src_sample_rate;
+    int                     src_channels;
+    enum AVSampleFormat     src_fmt;
+    SwrContext              *swr;
+
     /* Session timeline.  t0_us is the host-clock reading that PTS 0 maps to;
        until session_started is set, arriving buffers are dropped rather than
        queued, so nothing captured during startup enters the recording. */
@@ -98,6 +112,80 @@ struct SckCapture {
 static void log_error(const char *msg, OSStatus code)
 {
     fprintf(stderr, "sck_capture: %s (osstatus %d)\n", msg, (int)code);
+}
+
+static void log_error_av(const char *msg, int ret)
+{
+    char buf[128];
+    av_strerror(ret, buf, sizeof(buf));
+    fprintf(stderr, "sck_capture: %s: %s\n", msg, buf);
+}
+
+/* Derive an AVSampleFormat + channel count from the ASBD.
+ *
+ * The negotiated format is the output device's, not ours: Float32 on the
+ * built-in audio path, signed integer (16- or 32-bit) on many USB/HDMI sinks
+ * — the same split the microphone backend hit with the Fifine.  Sample size
+ * is read from the description, never assumed; libswresample then converts
+ * whatever this admits to the canonical 48 kHz stereo FLTP. */
+static int asbd_to_avfmt(const AudioStreamBasicDescription *asbd,
+                         enum AVSampleFormat *out_fmt,
+                         int *out_channels)
+{
+    if (asbd->mFormatID != kAudioFormatLinearPCM) {
+        fprintf(stderr, "sck_capture: unsupported format (not Linear PCM)\n");
+        return -1;
+    }
+
+    int ch = (int)asbd->mChannelsPerFrame;
+    if (ch < 1) ch = 1;
+    if (ch > 2) {
+        fprintf(stderr, "sck_capture: >2 channel system audio not expected (%d)\n", ch);
+        ch = 2;
+    }
+
+    int planar = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+
+    if (asbd->mFormatFlags & kAudioFormatFlagIsFloat) {
+        if (asbd->mBitsPerChannel != 32) {
+            fprintf(stderr, "sck_capture: unsupported float bit depth (%d)\n",
+                    (int)asbd->mBitsPerChannel);
+            return -1;
+        }
+        *out_channels = ch;
+        *out_fmt = planar ? AV_SAMPLE_FMT_FLTP : AV_SAMPLE_FMT_FLT;
+        return 0;
+    }
+
+    if (asbd->mFormatFlags & kAudioFormatFlagIsSignedInteger) {
+        /* 24-bit audio usually arrives as 24 bits aligned high inside a
+           32-bit word — that is S32 data with a limited range, and swr
+           scales it correctly.  True 24-bit packed frames (3 bytes per
+           sample) have no native AVSampleFormat and are rejected loudly
+           rather than misread. */
+        if (asbd->mBitsPerChannel == 24 && asbd->mBytesPerFrame / ch == 4) {
+            *out_channels = ch;
+            *out_fmt = planar ? AV_SAMPLE_FMT_S32P : AV_SAMPLE_FMT_S32;
+            return 0;
+        }
+        switch (asbd->mBitsPerChannel) {
+        case 16:
+            *out_channels = ch;
+            *out_fmt = planar ? AV_SAMPLE_FMT_S16P : AV_SAMPLE_FMT_S16;
+            return 0;
+        case 32:
+            *out_channels = ch;
+            *out_fmt = planar ? AV_SAMPLE_FMT_S32P : AV_SAMPLE_FMT_S32;
+            return 0;
+        default:
+            fprintf(stderr, "sck_capture: unsupported integer bit depth (%d)\n",
+                    (int)asbd->mBitsPerChannel);
+            return -1;
+        }
+    }
+
+    fprintf(stderr, "sck_capture: unsupported format (not Float or Signed Integer PCM)\n");
+    return -1;
 }
 
 void sck_bootstrap_app(void)
@@ -341,20 +429,67 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
                 CMAudioFormatDescriptionGetStreamBasicDescription(fmtDesc);
             if (!asbd) return;
 
-            int ch = (int)asbd->mChannelsPerFrame;
-            if (ch < 1) ch = 1;
-            if (ch > 2) ch = 2;
+            enum AVSampleFormat src_fmt;
+            int src_channels;
+            if (asbd_to_avfmt(asbd, &src_fmt, &src_channels) < 0)
+                return;
 
-            c->audio_channels    = ch;
-            c->audio_sample_rate = (asbd->mSampleRate > 0) ? (int)asbd->mSampleRate : 48000;
-            c->audio_fmt = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved)
-                               ? AV_SAMPLE_FMT_FLTP : AV_SAMPLE_FMT_FLT;
+            int src_rate = (int)asbd->mSampleRate;
+            if (src_rate <= 0) src_rate = 48000;
+
+            /*
+             * Normalise to the mixer's canonical 48 kHz stereo FLTP here,
+             * on the capture path.
+             *
+             * The negotiated format is the output device's — float or
+             * integer PCM, planar or interleaved, at the device's rate.
+             * Reading it as float32 regardless (as this code used to) turns
+             * every integer sample into garbage the mixer's clamp pins at
+             * full scale, drowning the microphone completely.  Normalising
+             * here means the frames handed to the mixer are always the
+             * format the desktop thread tells it they are, exactly as the
+             * microphone backend does in its own callback.
+             */
+            AVChannelLayout out_layout, src_layout;
+            av_channel_layout_default(&out_layout, 2);
+            av_channel_layout_default(&src_layout, src_channels);
+            SwrContext *swr = NULL;
+            int ret = swr_alloc_set_opts2(&swr,
+                         &out_layout, AV_SAMPLE_FMT_FLTP, 48000,
+                         &src_layout, src_fmt,         src_rate,
+                         0, NULL);
+            av_channel_layout_uninit(&out_layout);
+            av_channel_layout_uninit(&src_layout);
+            if (ret < 0 || !swr || swr_init(swr) < 0) {
+                log_error_av("swr init", ret < 0 ? ret : AVERROR_EXTERNAL);
+                if (swr) swr_free(&swr);
+                return;
+            }
+            c->swr = swr;
+
+            c->src_sample_rate = src_rate;
+            c->src_channels    = src_channels;
+            c->src_fmt         = src_fmt;
+
+            /* What grab_audio reports from here on: always canonical. */
+            c->audio_channels    = 2;
+            c->audio_sample_rate = 48000;
+            c->audio_fmt         = AV_SAMPLE_FMT_FLTP;
+
+            printf("[REC] Desktop audio: %d Hz, %d channel%s, %s\n",
+                   src_rate, src_channels, src_channels == 1 ? "" : "s",
+                   av_get_sample_fmt_name(src_fmt));
 
             c->audio_plane_cap = AUDIO_INIT_SAMPLES * (int)sizeof(float);
             for (int i = 0; i < c->audio_channels; i++) {
                 c->audio_planes[i] = (uint8_t *)malloc((size_t)c->audio_plane_cap);
                 if (!c->audio_planes[i]) {
                     fprintf(stderr, "sck_capture: audio plane alloc failed\n");
+                    for (int j = 0; j < c->audio_channels; j++) {
+                        free(c->audio_planes[j]);
+                        c->audio_planes[j] = NULL;
+                    }
+                    c->audio_sample_rate = 0;   /* retry the one-time init */
                     return;
                 }
             }
@@ -395,25 +530,79 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
         }
         if (!blockBuf) return;
 
-        /* nSamples counts frames *per channel*.  For interleaved input a single
-         * buffer holds every channel, so the byte count must be divided by the
-         * channel count as well. */
+        /* nSamples counts frames *per channel*, sized from the format the
+         * ASBD actually declared — never assumed. */
+        int elem_bytes = av_get_bytes_per_sample(c->src_fmt);
+        if (elem_bytes <= 0) { CFRelease(blockBuf); return; }
+
         size_t nSamples = 0;
-        if (c->audio_fmt == AV_SAMPLE_FMT_FLT) {
-            AudioBuffer *ab = &bufList->mBuffers[0];
-            if (ab->mData && c->audio_channels > 0)
-                nSamples = ab->mDataByteSize /
-                           (sizeof(float) * (size_t)c->audio_channels);
-        } else {
+        if (av_sample_fmt_is_planar(c->src_fmt)) {
             for (UInt32 i = 0; i < bufList->mNumberBuffers; i++) {
                 AudioBuffer *ab = &bufList->mBuffers[i];
-                if (!ab->mData || ab->mDataByteSize == 0) continue;
-                size_t s = ab->mDataByteSize / sizeof(float);
-                if (nSamples == 0 || s < nSamples) nSamples = s;
+                if (ab->mData && ab->mDataByteSize > 0) {
+                    size_t s = ab->mDataByteSize / (size_t)elem_bytes;
+                    if (nSamples == 0 || s < nSamples) nSamples = s;
+                }
             }
+        } else {
+            /* Interleaved: a single buffer holds every channel. */
+            AudioBuffer *ab = &bufList->mBuffers[0];
+            if (ab->mData && ab->mDataByteSize > 0)
+                nSamples = ab->mDataByteSize /
+                           ((size_t)elem_bytes * (size_t)c->src_channels);
+        }
+        if (nSamples == 0) { CFRelease(blockBuf); return; }
+
+        /* Wrap the raw bytes in a frame that describes them truthfully. */
+        AVFrame *src = av_frame_alloc();
+        if (!src) { CFRelease(blockBuf); return; }
+        src->format      = c->src_fmt;
+        src->sample_rate = c->src_sample_rate;
+        src->nb_samples  = (int)nSamples;
+        av_channel_layout_default(&src->ch_layout, c->src_channels);
+        if (av_frame_get_buffer(src, 0) < 0) {
+            av_frame_free(&src);
+            CFRelease(blockBuf);
+            return;
         }
 
-        if (nSamples == 0) { CFRelease(blockBuf); return; }
+        if (av_sample_fmt_is_planar(c->src_fmt)) {
+            for (int ch = 0; ch < c->src_channels && ch < (int)bufList->mNumberBuffers; ch++) {
+                AudioBuffer *ab = &bufList->mBuffers[ch];
+                size_t copy = (size_t)nSamples * (size_t)elem_bytes;
+                if (copy > ab->mDataByteSize) copy = ab->mDataByteSize;
+                memcpy(src->data[ch], ab->mData, copy);
+            }
+        } else {
+            AudioBuffer *ab = &bufList->mBuffers[0];
+            memcpy(src->data[0], ab->mData,
+                   (size_t)nSamples * (size_t)elem_bytes * (size_t)c->src_channels);
+        }
+        CFRelease(blockBuf);
+
+        /* Convert to the canonical format before anything can misread it. */
+        AVFrame *dst = av_frame_alloc();
+        if (!dst) { av_frame_free(&src); return; }
+        dst->format      = AV_SAMPLE_FMT_FLTP;
+        dst->sample_rate = 48000;
+        av_channel_layout_default(&dst->ch_layout, 2);
+
+        int ret = swr_convert_frame(c->swr, dst, src);
+        if (ret == AVERROR_INPUT_CHANGED) {
+            /* Device renegotiated mid-stream; retry once. */
+            av_frame_unref(dst);
+            dst->format      = AV_SAMPLE_FMT_FLTP;
+            dst->sample_rate = 48000;
+            av_channel_layout_default(&dst->ch_layout, 2);
+            ret = swr_convert_frame(c->swr, dst, src);
+        }
+        av_frame_free(&src);
+        if (ret < 0) {
+            log_error_av("swr_convert_frame", ret);
+            av_frame_free(&dst);
+            return;
+        }
+        if (dst->nb_samples <= 0) { av_frame_free(&dst); return; }
 
         int64_t apts = sample_pts_us(sampleBuffer);
 
@@ -424,26 +613,22 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
            track leads the video by the startup duration. */
         if (c->stopped || !c->session_started || apts < c->t0_us) {
             pthread_mutex_unlock(&c->lock);
-            CFRelease(blockBuf);
+            av_frame_free(&dst);
             return;
         }
 
         if (c->audio_nb_samples == 0)
             c->audio_head_pts = apts - c->t0_us;
 
-        int new_total = c->audio_nb_samples + (int)nSamples;
-        /* Interleaved input packs every channel into plane 0, so it needs
-         * channels× the bytes a planar frame count implies. */
-        int bytes_per_frame = (int)sizeof(float) *
-            (c->audio_fmt == AV_SAMPLE_FMT_FLT ? c->audio_channels : 1);
-        if (new_total * bytes_per_frame > c->audio_plane_cap) {
+        int new_total = c->audio_nb_samples + dst->nb_samples;
+        if (new_total * (int)sizeof(float) > c->audio_plane_cap) {
             int new_cap = c->audio_plane_cap * 2;
-            while (new_total * bytes_per_frame > new_cap) new_cap *= 2;
+            while (new_total * (int)sizeof(float) > new_cap) new_cap *= 2;
             for (int i = 0; i < c->audio_channels; i++) {
                 uint8_t *p = (uint8_t *)realloc(c->audio_planes[i], (size_t)new_cap);
                 if (!p) {
                     pthread_mutex_unlock(&c->lock);
-                    CFRelease(blockBuf);
+                    av_frame_free(&dst);
                     return;
                 }
                 c->audio_planes[i] = p;
@@ -451,25 +636,13 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
             c->audio_plane_cap = new_cap;
         }
 
-        if (c->audio_fmt == AV_SAMPLE_FMT_FLT) {
-            AudioBuffer *ab = &bufList->mBuffers[0];
-            float *dst = (float *)c->audio_planes[0];
-            memcpy(dst + c->audio_nb_samples * c->audio_channels,
-                   ab->mData,
-                   nSamples * sizeof(float) * (size_t)c->audio_channels);
-        } else {
-            for (int ch = 0; ch < c->audio_channels && ch < (int)bufList->mNumberBuffers; ch++) {
-                AudioBuffer *ab = &bufList->mBuffers[ch];
-                float *dst = (float *)c->audio_planes[ch];
-                size_t copy = nSamples * sizeof(float);
-                if (copy > ab->mDataByteSize) copy = ab->mDataByteSize;
-                memcpy(dst + c->audio_nb_samples, ab->mData, copy);
-            }
-        }
+        for (int ch = 0; ch < c->audio_channels; ch++)
+            memcpy(c->audio_planes[ch] + (size_t)c->audio_nb_samples * sizeof(float),
+                   dst->data[ch], (size_t)dst->nb_samples * sizeof(float));
         c->audio_nb_samples = new_total;
+        av_frame_free(&dst);
 
         pthread_mutex_unlock(&c->lock);
-        CFRelease(blockBuf);
     }
 }
 
@@ -935,6 +1108,8 @@ void sck_capture_close(SckCapture *c)
 
     for (int i = 0; i < 2; i++)
         free(c->audio_planes[i]);
+
+    swr_free(&c->swr);
 
     pthread_mutex_destroy(&c->lock);
     c->sample_queue = nil;  /* release dispatch queues before freeing struct */

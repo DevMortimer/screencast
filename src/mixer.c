@@ -4,6 +4,7 @@
 #include <libavutil/error.h>
 #include <libavutil/mem.h>
 #include <libavutil/time.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,6 +88,12 @@ static int64_t mixer_default_now_us(void)
 
 static float clampf(float v)
 {
+    /* A NaN must not survive the clamp: it fails both comparisons below and
+       then spreads to every sample it is summed with, taking the whole track
+       out (one capture misreading its device's format is all it takes).
+       Silence is the honest output for a sample with no value.  Infinities
+       are already caught by the range checks. */
+    if (isnan(v)) return 0.0f;
     if (v >  1.0f) return  1.0f;
     if (v < -1.0f) return -1.0f;
     return v;

@@ -356,6 +356,69 @@ static void test_short_source_does_not_drag_the_mix_late(void)
     mixer_destroy(m);
 }
 
+/*
+ * A non-finite sample in one source must not poison the whole track.
+ *
+ * A capture that misreads its device's sample format hands the mixer floats
+ * that are not audio at all — NaN wherever the bit pattern decodes to nothing.
+ * NaN fails both clamp comparisons, so a naive clamp lets it through, and one
+ * poisoned sample then spreads to every sample it is summed with: the AAC
+ * encoder receives NaN and the track is gone.  The clamp must turn non-finite
+ * input into silence, and the other source must keep mixing normally.
+ */
+static void test_bad_samples_do_not_poison_the_mix(void)
+{
+    fprintf(stderr, "test_bad_samples_do_not_poison_the_mix\n");
+    sink_reset();
+
+    int active[MIX_SRC_COUNT] = { [MIX_SRC_MIC] = 1, [MIX_SRC_DESKTOP] = 1 };
+    MixerCtx *m = mixer_create(active, sink_fn, NULL);
+    assert(m);
+    g_now_us = 0;
+    mixer_set_clock(m, test_now_us);
+
+    /* Prime both sources (a source only joins the lockstep once it has
+       delivered, so the first feed drains alone). */
+    feed(m, MIX_SRC_MIC,     MS(10), 0.5f, 0);
+    feed(m, MIX_SRC_DESKTOP, MS(10), 0.0f, 0);
+
+    /* The desktop source goes bad: every sample it delivers is NaN. */
+    feed(m, MIX_SRC_MIC, MS(10), 0.5f, US(10));
+    AVFrame *bad = tone(MS(10), NAN);
+    AVChannelLayout ly;
+    av_channel_layout_default(&ly, MIX_CHANNELS);
+    mixer_feed(m, MIX_SRC_DESKTOP, bad, SR, &ly, AV_SAMPLE_FMT_FLTP, US(10));
+    av_channel_layout_uninit(&ly);
+    av_frame_free(&bad);
+
+    /* Desktop settles into silence; both sources keep the lockstep moving. */
+    for (int i = 2; i <= 10; i++) {
+        advance(10);
+        feed(m, MIX_SRC_MIC,     MS(10), 0.5f, US(10 * i));
+        feed(m, MIX_SRC_DESKTOP, MS(10), 0.0f, US(10 * i));
+    }
+
+    /* Every emitted sample must be finite.  The poisoned chunk mixes to
+       silence (0.5 + NaN, clamped to 0) one feed later, when the next mic
+       feed drains both FIFOs; the mic passes through untouched everywhere
+       else. */
+    for (int c = 0; c < MIX_CHANNELS; c++)
+        for (int i = 0; i < g_sink.n; i++)
+            CHECK(isfinite(g_sink.ch[c][i]),
+                  "non-finite sample leaked into the mix (ch%d[%d]=%f)",
+                  c, i, g_sink.ch[c][i]);
+
+    CHECK(g_sink.n == MS(110), "expected %d samples, got %d", MS(110), g_sink.n);
+    CHECK(sink_region_is(0, MS(20), 0.5f),
+          "warmup chunks corrupted");
+    CHECK(sink_region_is(MS(20), MS(30), 0.0f),
+          "NaN samples did not become silence");
+    CHECK(sink_region_is(MS(30), g_sink.n, 0.5f),
+          "mic corrupted after a bad desktop source");
+
+    mixer_destroy(m);
+}
+
 int main(void)
 {
     test_gap_becomes_silence();
@@ -364,6 +427,7 @@ int main(void)
     test_quiet_source_does_not_freeze_the_mix();
     test_one_sources_gap_is_not_the_mixs_shift();
     test_short_source_does_not_drag_the_mix_late();
+    test_bad_samples_do_not_poison_the_mix();
 
     for (int c = 0; c < MIX_CHANNELS; c++) free(g_sink.ch[c]);
 
