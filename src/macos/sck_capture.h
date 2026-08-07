@@ -72,6 +72,14 @@ void sck_pump_run_loop(void);
 int64_t sck_host_time_us(void);
 
 /*
+ * The session frame rate, from SCREENCAST_FPS (default 24).
+ *
+ * Shared by the capture config (minimumFrameInterval) and the encoder (GOP
+ * sizing) so the two cannot disagree.
+ */
+int sck_capture_fps(void);
+
+/*
  * Opens capture on the default display.  Populates info with display geometry
  * and audio stream parameters.  Blocks until the SCK stream is running and
  * the first video frame has arrived.

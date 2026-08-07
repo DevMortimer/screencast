@@ -1,14 +1,85 @@
 #include "encoder.h"
 #include "composite.h"
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
+#include <libavutil/audio_fifo.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
+#include <libavutil/samplefmt.h>
 #include <libavutil/time.h>
 #ifdef __APPLE__
 #include <libavutil/hwcontext.h>
 #include <CoreVideo/CoreVideo.h>
 #endif
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/*
+ * One recording's encoder state.  Kept out of the header: the platform mains
+ * talk to this module through its functions, and the accessors below are the
+ * only reads of this state from outside.
+ */
+struct EncoderCtx {
+    /* Output muxer */
+    AVFormatContext  *fmt_ctx;
+
+    /* ── Video ─────────────────────── */
+    AVCodecContext   *vid_enc;
+    AVStream         *vid_stream;
+    AVFrame          *vid_frame;     /* YUV420P at canvas size */
+    int               canvas_w, canvas_h;
+    int64_t           vid_pts;       /* in microseconds from t0 */
+
+    /* ── Audio ─────────────────────── */
+    AVCodecContext   *aud_enc;
+    AVStream         *aud_stream;
+    AVFrame          *aud_frame;     /* FLTP stereo, 1024 samples */
+    AVAudioFifo      *aud_fifo;
+    SwrContext       *swr;
+    AVChannelLayout   aud_in_layout; /* source layout stamped onto raw frames */
+    int64_t           aud_pts;       /* running sample counter */
+    int               aud_anchored;  /* aud_pts has been placed on the timeline */
+
+    /* ── Pixel-format conversion (libswscale) ──────── */
+    struct SwsContext *sws_screen;   /* screen_pix_fmt  → RGBA canvas */
+    struct SwsContext *sws_cam_raw;  /* cam_pix_fmt → RGBA at cam size */
+    struct SwsContext *sws_cam_main; /* RGBA cam crop → full canvas */
+    struct SwsContext *sws_cam_scale;/* RGBA square crop → overlay size */
+    struct SwsContext *sws_to_yuv;  /* canvas RGBA → YUV420P */
+
+    /* ── Webcam overlay geometry ───────────── */
+    int overlay_size;   /* side length of the square overlay (px) */
+    int overlay_x;      /* top-left x of overlay on canvas */
+    int overlay_y;      /* top-left y of overlay on canvas */
+    int64_t cam_overlay_seq; /* last webcam frame scaled into cam_overlay */
+    float *corner_mask; /* overlay_size² floats */
+
+    /* ── Scratch RGBA buffers ──────────────── */
+    uint8_t *canvas_rgba;  /* canvas_w * canvas_h * 4 */
+    uint8_t *cam_rgba;     /* cam_src_w * cam_src_h * 4 */
+    uint8_t *cam_overlay;  /* overlay_size² * 4 */
+    int cam_src_w, cam_src_h, cam_crop_size;
+    int cam_main_x, cam_main_y, cam_main_w, cam_main_h;
+    enum AVPixelFormat cam_pix_fmt; /* format the cam sws chain was built for */
+
+    /* ── Hardware video path (macOS) ─────────── */
+    /* When hw_frames is set the encoder takes CVPixelBuffers by reference and
+       none of the swscale chain above is built. */
+    AVBufferRef      *hw_device;
+    AVBufferRef      *hw_frames;
+
+    /* ── Thread safety ────────────────── */
+    pthread_mutex_t write_mutex;
+
+    /* ── Timing anchor ──────────────── */
+    int64_t t0;          /* av_gettime_relative() at start of recording */
+    int64_t last_key_pts;/* PTS of the last forced keyframe (µs), -1 if none */
+    int header_written;
+};
 
 /* Wall-clock spacing between forced keyframes. */
 #define KEYFRAME_INTERVAL_US (2 * 1000000LL)
@@ -90,6 +161,20 @@ static int setup_hw_frames(EncoderCtx *enc, int w, int h)
 int encoder_is_hardware(const EncoderCtx *enc)
 {
     return enc && enc->hw_frames != NULL;
+}
+
+int encoder_header_written(const EncoderCtx *enc)
+{
+    return enc && enc->header_written;
+}
+
+int64_t encoder_audio_pts_us(const EncoderCtx *enc)
+{
+    if (!enc || !enc->aud_enc || enc->aud_enc->sample_rate <= 0)
+        return -1;
+    return av_rescale_q(enc->aud_pts,
+                        (AVRational){1, enc->aud_enc->sample_rate},
+                        (AVRational){1, 1000000});
 }
 
 static int setup_video(EncoderCtx *enc, int w, int h, int fps)
@@ -407,14 +492,17 @@ static long s_aud_frames_encoded = 0;
 
 /* ── public: encoder_open ─────────────────────────────────── */
 
-int encoder_open(EncoderCtx *enc, const char *path,
-                  int canvas_w, int canvas_h, int fps,
-                  enum AVPixelFormat screen_pix_fmt,
-                  int audio_sample_rate,
-                  const AVChannelLayout *audio_ch_layout,
-                  enum AVSampleFormat audio_sample_fmt)
+EncoderCtx *encoder_open(const char *path,
+                         int canvas_w, int canvas_h, int fps,
+                         enum AVPixelFormat screen_pix_fmt,
+                         int audio_sample_rate,
+                         const AVChannelLayout *audio_ch_layout,
+                         enum AVSampleFormat audio_sample_fmt)
 {
-    memset(enc, 0, sizeof(*enc));
+    EncoderCtx *enc = calloc(1, sizeof(*enc));
+    if (!enc) return NULL;
+    /* Initialised up front so every failure path below can encoder_free(). */
+    pthread_mutex_init(&enc->write_mutex, NULL);
     s_aud_frames_encoded = 0;
     enc->canvas_w = canvas_w;
     enc->canvas_h = canvas_h;
@@ -429,34 +517,31 @@ int encoder_open(EncoderCtx *enc, const char *path,
     enc->cam_pix_fmt = AV_PIX_FMT_NONE; /* no webcam engaged yet */
 
     int ret = avformat_alloc_output_context2(&enc->fmt_ctx, NULL, NULL, path);
-    if (ret < 0) { log_err("avformat_alloc_output_context2", ret); return ret; }
+    if (ret < 0) { log_err("avformat_alloc_output_context2", ret); goto fail; }
 
-    if ((ret = setup_video(enc, canvas_w, canvas_h, fps)) < 0) return ret;
+    if ((ret = setup_video(enc, canvas_w, canvas_h, fps)) < 0) goto fail;
     if (audio_sample_rate > 0) {
-        if ((ret = setup_audio(enc, audio_sample_rate, audio_ch_layout, audio_sample_fmt)) < 0) return ret;
+        if ((ret = setup_audio(enc, audio_sample_rate, audio_ch_layout, audio_sample_fmt)) < 0) goto fail;
         av_channel_layout_copy(&enc->aud_in_layout, audio_ch_layout);
     }
     if (!encoder_is_hardware(enc) &&
-        (ret = setup_sws(enc, screen_pix_fmt)) < 0) return ret;
+        (ret = setup_sws(enc, screen_pix_fmt)) < 0) goto fail;
 
     if (!(enc->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open(&enc->fmt_ctx->pb, path, AVIO_FLAG_WRITE);
-        if (ret < 0) { log_err("avio_open", ret); return ret; }
+        if (ret < 0) { log_err("avio_open", ret); goto fail; }
     }
 
     ret = avformat_write_header(enc->fmt_ctx, NULL);
-    if (ret < 0) { log_err("avformat_write_header", ret); return ret; }
+    if (ret < 0) { log_err("avformat_write_header", ret); goto fail; }
     enc->header_written = 1;
 
     /* Scratch RGBA buffers — software compositing only. */
-    if (encoder_is_hardware(enc)) {
-        pthread_mutex_init(&enc->write_mutex, NULL);
-        enc->t0 = av_gettime_relative();
-        return 0;
-    }
+    if (encoder_is_hardware(enc))
+        return enc;
 
     enc->canvas_rgba = malloc((size_t)canvas_w * canvas_h * 4);
-    if (!enc->canvas_rgba) return AVERROR(ENOMEM);
+    if (!enc->canvas_rgba) goto fail;
 
     /* The overlay buffer and rounded-corner mask depend only on the canvas, so
      * build them up front; they are reused whenever the webcam engages.  The
@@ -466,16 +551,21 @@ int encoder_open(EncoderCtx *enc, const char *path,
     enc->corner_mask = malloc(sizeof(float) *
                                (size_t)enc->overlay_size * enc->overlay_size);
     if (!enc->cam_overlay || !enc->corner_mask)
-        return AVERROR(ENOMEM);
+        goto fail;
 
     /* Pre-build the rounded-corner mask (radius = 1/8 of overlay size) */
     composite_build_mask(enc->corner_mask,
                          enc->overlay_size, enc->overlay_size,
                          enc->overlay_size / 8);
 
-    pthread_mutex_init(&enc->write_mutex, NULL);
     enc->t0 = av_gettime_relative();
-    return 0;
+    return enc;
+
+fail:
+    if (enc->fmt_ctx && enc->fmt_ctx->pb)
+        avio_closep(&enc->fmt_ctx->pb);
+    encoder_free(enc);
+    return NULL;
 }
 
 /* ── recording-indicator dot (Linux only) ─────────────────── */
@@ -780,7 +870,7 @@ int encoder_feed_audio(EncoderCtx *enc, AVFrame *raw_frame, int64_t pts_us)
 
 int encoder_flush(EncoderCtx *enc)
 {
-    if (!enc->fmt_ctx || !enc->header_written) return 0;
+    if (!enc || !enc->fmt_ctx || !enc->header_written) return 0;
 
     if (getenv("SCREENCAST_DEBUG"))
         fprintf(stderr, "encoder: AAC frames encoded this session: %ld\n",
@@ -850,5 +940,5 @@ void encoder_free(EncoderCtx *enc)
     free(enc->corner_mask);
 
     pthread_mutex_destroy(&enc->write_mutex);
-    memset(enc, 0, sizeof(*enc));
+    free(enc);
 }

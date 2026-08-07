@@ -19,6 +19,7 @@
 #include "control.h"
 #include "encoder.h"
 #include "mixer.h"
+#include "audsrc.h"
 #include "sck_capture.h"
 #include "avf_camera.h"
 #include "avf_mic.h"
@@ -48,7 +49,7 @@ typedef struct {
     AvfCamera  *avf_cam;       /* held open only to make Presenter Overlay
                                   available; its frames are never read */
     AvfMic     *avf_mic;       /* microphone */
-    EncoderCtx enc;
+    EncoderCtx *enc;
     MixerCtx  *mixer;          /* mixes mic + desktop into one track */
     int canvas_w, canvas_h;
     int has_mic;
@@ -117,80 +118,71 @@ static void mixer_sink_encode(void *user, AVFrame *mixed)
                        atomic_load(&s_rec.audio_anchor_us));
 }
 
-/* ── microphone audio thread ───────────────────────────────── */
-
-/* Consecutive failed reads before a source is declared dead and dropped. */
-#define AUDIO_MAX_FAILS 40
+/* ── audio source adapters (the shared worker owns the policy) ── */
 
 /*
- * Reads microphone frames in a dedicated thread and feeds them into the mixer.
- * avf_mic already outputs 48 kHz stereo FLTP — the mixer's canonical format —
- * so the internal resampler is a no-op.  If the mic device dies mid-recording,
- * we drop it from the mix after a backoff run so the mixed track keeps flowing.
+ * Read one microphone frame (the adapter the shared audio source worker
+ * drives).  avf_mic already outputs 48 kHz stereo FLTP — the mixer's
+ * canonical format — so the worker hands it through untouched.  A NULL is a
+ * read timeout on a live session, which the worker counts toward its drop
+ * policy; if the session ended, the running predicate stops the loop first.
+ * The frame is owned by us: owned=1 tells the worker to free it after
+ * feeding.
  */
-static void *mic_thread(void *arg)
+static AudSrcRead mic_read(void *user)
 {
-    RecCtx *rec = arg;
-    struct timespec backoff = { .tv_nsec = 100000000L }; /* 100 ms */
-    int fails = 0;
-
-    while (atomic_load(&g_running) && atomic_load(&s_rec_open)) {
-        int64_t pts_us = 0;
-        AVFrame *f = avf_mic_read(rec->avf_mic, &pts_us);
-        if (!f) {
-            /* NULL can mean timeout (still recording) or stop. */
-            if (!atomic_load(&g_running) || !atomic_load(&s_rec_open))
-                break;
-            if (++fails >= AUDIO_MAX_FAILS) {
-                fprintf(stderr, "main: microphone died — dropping from mix\n");
-                mixer_drop_source(rec->mixer, MIX_SRC_MIC);
-                break;
-            }
-            nanosleep(&backoff, NULL);
-            continue;
-        }
-        fails = 0;
-        rec->mic_frames++;
-        note_audio_anchor(pts_us);
-        mixer_feed(rec->mixer, MIX_SRC_MIC, f,
-                   MIX_SAMPLE_RATE,
-                   &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO,
-                   AV_SAMPLE_FMT_FLTP, pts_us);
-        av_frame_free(&f);
-    }
-    return NULL;
+    RecCtx *rec = (RecCtx *)user;
+    int64_t pts_us = 0;
+    AVFrame *f = avf_mic_read(rec->avf_mic, &pts_us);
+    if (!f) return (AudSrcRead){ .result = AUDSRC_ERROR };
+    rec->mic_frames++;
+    note_audio_anchor(pts_us);
+    return (AudSrcRead){
+        .result = AUDSRC_FRAME, .frame = f, .owned = 1,
+        .in_sample_rate = MIX_SAMPLE_RATE, .in_channels = MIX_CHANNELS,
+        .in_fmt = AV_SAMPLE_FMT_FLTP, .pts_us = pts_us,
+    };
 }
 
-/* ── desktop audio thread ──────────────────────────────────── */
-
 /*
- * Drains system audio from the ScreenCaptureKit stream.
+ * Read accumulated desktop audio from the ScreenCaptureKit stream.
  *
  * This has to be its own thread.  It used to run inline in the record loop,
  * pulling audio only when a video frame arrived — which was survivable when
  * every frame was delivered, but the capture layer now skips frames while the
  * screen is static.  On a talking-head screencast that is most of them, so
- * audio would sit in the capture buffer growing unboundedly and then arrive in
- * one lump whenever the picture finally changed.
+ * audio would sit in the capture buffer growing unboundedly and then arrive
+ * in one lump whenever the picture finally changed.
+ *
+ * Nothing queued is AUDSRC_EMPTY, never a failure: desktop audio legitimately
+ * has no samples while nothing plays, so the worker polls it on the short
+ * cadence and never counts it toward the drop policy.
  */
-static void *desktop_audio_thread(void *arg)
+static AudSrcRead desk_read(void *user)
 {
-    RecCtx *rec = arg;
-    struct timespec tick = { .tv_nsec = 10000000L }; /* 10 ms */
+    RecCtx *rec = (RecCtx *)user;
+    int64_t pts_us = 0;
+    AVFrame *f = sck_capture_grab_audio(rec->sck, &pts_us);
+    if (!f) return (AudSrcRead){ .result = AUDSRC_EMPTY };
+    rec->desk_frames++;
+    note_audio_anchor(pts_us);
+    return (AudSrcRead){
+        .result = AUDSRC_FRAME, .frame = f, .owned = 1,
+        .in_sample_rate = MIX_SAMPLE_RATE, .in_channels = MIX_CHANNELS,
+        .in_fmt = AV_SAMPLE_FMT_FLTP, .pts_us = pts_us,
+    };
+}
 
-    while (atomic_load(&g_running) && atomic_load(&s_rec_open)) {
-        int64_t pts_us = 0;
-        AVFrame *f = sck_capture_grab_audio(rec->sck, &pts_us);
-        if (!f) { nanosleep(&tick, NULL); continue; }
+/* The worker runs until the recording session is over. */
+static int rec_running(void *user)
+{
+    (void)user;
+    return atomic_load(&g_running) && atomic_load(&s_rec_open);
+}
 
-        rec->desk_frames++;
-        note_audio_anchor(pts_us);
-        mixer_feed(rec->mixer, MIX_SRC_DESKTOP, f,
-                   MIX_SAMPLE_RATE,
-                   &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO,
-                   AV_SAMPLE_FMT_FLTP, pts_us);
-        av_frame_free(&f);
-    }
+static void *worker_thread(void *arg)
+{
+    audsrc_run((const AudSrcWorker *)arg);
     return NULL;
 }
 
@@ -273,19 +265,6 @@ static int recording_open(void)
 
     s_rec.has_aud = s_rec.has_mic || s_rec.has_desktop;
 
-    /* Build mixer */
-    if (s_rec.has_aud) {
-        int active[MIX_SRC_COUNT] = {
-            [MIX_SRC_MIC]     = s_rec.has_mic,
-            [MIX_SRC_DESKTOP] = s_rec.has_desktop,
-        };
-        s_rec.mixer = mixer_create(active, mixer_sink_encode, &s_rec.enc);
-        if (!s_rec.mixer) {
-            fprintf(stderr, "main: mixer init failed — recording video only\n");
-            s_rec.has_mic = s_rec.has_desktop = s_rec.has_aud = 0;
-        }
-    }
-
     const char *audio_sources =
         !s_rec.has_aud                     ? "none (video only)"
         : s_rec.has_mic && s_rec.has_desktop ? "mic + desktop (mixed)"
@@ -306,19 +285,33 @@ static int recording_open(void)
         audio_fmt = AV_SAMPLE_FMT_FLTP;
     }
 
-    int enc_ret = encoder_open(&s_rec.enc, s_rec.output_path,
-                     s_rec.canvas_w, s_rec.canvas_h, FPS,
+    s_rec.enc = encoder_open(s_rec.output_path,
+                     s_rec.canvas_w, s_rec.canvas_h, sck_capture_fps(),
                      AV_PIX_FMT_BGRA,  /* SCK delivers BGRA */
                      audio_sr, audio_ch, audio_fmt);
     if (s_rec.has_aud) av_channel_layout_uninit(&mix_ch);
 
-    if (enc_ret < 0) {
+    if (!s_rec.enc) {
         fprintf(stderr, "main: encoder open failed\n");
         if (s_rec.avf_mic) avf_mic_close(s_rec.avf_mic);
         if (s_rec.avf_cam) avf_camera_close(s_rec.avf_cam);
         sck_capture_close(s_rec.sck);
-        if (s_rec.mixer) { mixer_destroy(s_rec.mixer); s_rec.mixer = NULL; }
         return -1;
+    }
+
+    /* Build the mixer once the encoder exists: the sink hands mixed audio
+       straight to it, so the context must be live before any feed can drain. */
+    s_rec.mixer = NULL;
+    if (s_rec.has_aud) {
+        int active[MIX_SRC_COUNT] = {
+            [MIX_SRC_MIC]     = s_rec.has_mic,
+            [MIX_SRC_DESKTOP] = s_rec.has_desktop,
+        };
+        s_rec.mixer = mixer_create(active, mixer_sink_encode, s_rec.enc);
+        if (!s_rec.mixer) {
+            fprintf(stderr, "main: mixer init failed — recording video only\n");
+            s_rec.has_mic = s_rec.has_desktop = s_rec.has_aud = 0;
+        }
     }
 
     /*
@@ -344,14 +337,30 @@ static void recording_loop(void)
 {
     pthread_t mic_tid = 0;
     pthread_t desk_tid = 0;
+    /* The feed-loop policy lives in the shared audio source worker; these
+       configs drive it with the two macOS adapters above. */
+    AudSrcWorker mic_worker = {
+        .src = MIX_SRC_MIC, .mixer = s_rec.mixer, .label = "microphone",
+        .max_fails = AUDSRC_MAX_FAILS,
+        .error_backoff_ns = AUDSRC_ERROR_BACKOFF_NS,
+        .empty_poll_ns    = AUDSRC_EMPTY_POLL_NS,
+        .read = mic_read, .running = rec_running, .user = &s_rec,
+    };
+    AudSrcWorker desk_worker = {
+        .src = MIX_SRC_DESKTOP, .mixer = s_rec.mixer, .label = "desktop",
+        .max_fails = AUDSRC_MAX_FAILS,
+        .error_backoff_ns = AUDSRC_ERROR_BACKOFF_NS,
+        .empty_poll_ns    = AUDSRC_EMPTY_POLL_NS,
+        .read = desk_read, .running = rec_running, .user = &s_rec,
+    };
     int debug = getenv("SCREENCAST_DEBUG") != NULL;
     int64_t next_report = 10 * 1000000LL;
     long frames_encoded = 0;
 
     if (s_rec.has_mic)
-        pthread_create(&mic_tid, NULL, mic_thread, &s_rec);
+        pthread_create(&mic_tid, NULL, worker_thread, &mic_worker);
     if (s_rec.has_desktop && s_rec.mixer)
-        pthread_create(&desk_tid, NULL, desktop_audio_thread, &s_rec);
+        pthread_create(&desk_tid, NULL, worker_thread, &desk_worker);
 
     /*
      * The screen clocks the output, and nothing else does.
@@ -408,7 +417,7 @@ static void recording_loop(void)
 
         /* Nothing is composited, so the capture buffer goes to the encoder
            untouched — no GPU pass, no CPU pass, no copy at all. */
-        encoder_write_pixbuf(&s_rec.enc, screen, pts);
+        encoder_write_pixbuf(s_rec.enc, screen, pts);
         frames_encoded++;
         sck_capture_release_frame(screen);
 
@@ -420,11 +429,8 @@ static void recording_loop(void)
          * catching here rather than by watching the finished video.
          */
         if (debug && screen_pts >= next_report) {
-            int64_t aud_us = 0;
-            if (s_rec.enc.aud_enc && s_rec.enc.aud_enc->sample_rate > 0)
-                aud_us = av_rescale_q(s_rec.enc.aud_pts,
-                            (AVRational){1, s_rec.enc.aud_enc->sample_rate},
-                            (AVRational){1, 1000000});
+            int64_t aud_us = encoder_audio_pts_us(s_rec.enc);
+            if (aud_us < 0) aud_us = 0;
             fprintf(stderr,
                     "[SYNC] t=%llds video_pts=%lldms audio_pts=%lldms "
                     "delta=%+lldms frames=%ld\n",
@@ -466,8 +472,9 @@ static void recording_close(void)
                             "recording keeps the remaining sources\n");
     }
 
-    encoder_flush(&s_rec.enc);
-    encoder_free(&s_rec.enc);
+    encoder_flush(s_rec.enc);
+    encoder_free(s_rec.enc);
+    s_rec.enc = NULL;
 
     if (s_rec.mixer) { mixer_destroy(s_rec.mixer); s_rec.mixer = NULL; }
 

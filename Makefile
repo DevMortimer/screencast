@@ -15,7 +15,7 @@ OBJDIR  := build
 PROTODIR:= protocols
 
 # Shared sources (both platforms)
-SHARED_SRCS := $(SRCDIR)/control.c $(SRCDIR)/encoder.c $(SRCDIR)/composite.c $(SRCDIR)/mixer.c
+SHARED_SRCS := $(SRCDIR)/control.c $(SRCDIR)/encoder.c $(SRCDIR)/composite.c $(SRCDIR)/mixer.c $(SRCDIR)/audsrc.c
 
 # Platform-specific sources
 ifeq ($(PLATFORM),macos)
@@ -150,6 +150,20 @@ MIXER_TEST_BIN  := $(OBJDIR)/test_mixer
 MIXER_TEST_SRCS := tests/test_mixer.c src/mixer.c
 MIXER_TEST_PKGS := libswresample libavutil
 
+# The audio source worker: the feed-loop policy (backoff, drop after a run of
+# errors) driven by a scripted fake reader against the real mixer.
+AUDSRC_TEST_BIN  := $(OBJDIR)/test_audsrc
+AUDSRC_TEST_SRCS := tests/test_audsrc.c src/audsrc.c src/mixer.c
+AUDSRC_TEST_PKGS := libswresample libavutil
+
+# The encoder, through its interface: open, feed audio, read the track's
+# position back via the accessors.  Needs the full libav codec stack plus the
+# platform encoder (h264_videotoolbox / h264_nvenc) the recorder itself
+# requires, so it runs wherever the project builds.
+ENCODER_TEST_BIN  := $(OBJDIR)/test_encoder
+ENCODER_TEST_SRCS := tests/test_encoder.c src/encoder.c src/composite.c
+ENCODER_TEST_PKGS := libavformat libavcodec libswscale libswresample libavutil
+
 # VideoToolbox hardware-frame probe (macOS only).  Standalone: verifies that
 # h264_videotoolbox accepts CVPixelBuffers by reference, both from libav's own
 # hardware pool and wrapped from an external source.  Links nothing from src/.
@@ -171,13 +185,28 @@ test-mixer: | $(OBJDIR)
 	    $(shell pkg-config --libs $(MIXER_TEST_PKGS)) -lm -pthread
 	$(MIXER_TEST_BIN)
 
+test-audsrc: | $(OBJDIR)
+	$(CC) -Isrc -pthread -O2 -Wall -Wextra -std=c11 \
+	    $(shell pkg-config --cflags $(AUDSRC_TEST_PKGS)) \
+	    -o $(AUDSRC_TEST_BIN) $(AUDSRC_TEST_SRCS) \
+	    $(shell pkg-config --libs $(AUDSRC_TEST_PKGS)) -lm -pthread
+	$(AUDSRC_TEST_BIN)
+
+test-encoder: | $(OBJDIR)
+	$(CC) -Isrc -pthread -O2 -Wall -Wextra -std=c11 \
+	    $(shell pkg-config --cflags $(ENCODER_TEST_PKGS)) \
+	    -o $(ENCODER_TEST_BIN) $(ENCODER_TEST_SRCS) \
+	    $(shell pkg-config --libs $(ENCODER_TEST_PKGS)) -lm -pthread \
+	    $(if $(filter macos,$(PLATFORM)),-framework CoreVideo -framework CoreFoundation)
+	$(ENCODER_TEST_BIN)
+
 ifneq ($(PLATFORM),macos)
-test: test-mixer | $(OBJDIR)
+test: test-mixer test-audsrc test-encoder | $(OBJDIR)
 	$(CC) -Isrc -Isrc/linux -pthread -O2 -Wall -Wextra -std=c11 \
 	    -o $(TEST_BIN) $(TEST_SRCS)
 	$(TEST_BIN)
 else
-test: test-mixer
+test: test-mixer test-audsrc test-encoder
 endif
 
-.PHONY: all clean test test-mixer probe
+.PHONY: all clean test test-mixer test-audsrc test-encoder probe

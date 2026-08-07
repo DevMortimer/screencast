@@ -1,85 +1,37 @@
 #pragma once
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
-#include <libswscale/swscale.h>
-#include <libswresample/swresample.h>
-#include <libavutil/audio_fifo.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
 #include <libavutil/samplefmt.h>
-#include <pthread.h>
-
-typedef struct {
-    /* Output muxer */
-    AVFormatContext  *fmt_ctx;
-
-    /* ── Video ────────────────────────────────────── */
-    AVCodecContext   *vid_enc;
-    AVStream         *vid_stream;
-    AVFrame          *vid_frame;     /* YUV420P at canvas size */
-    int               canvas_w, canvas_h;
-    int64_t           vid_pts;       /* in microseconds from t0 */
-
-    /* ── Audio ────────────────────────────────────── */
-    AVCodecContext   *aud_enc;
-    AVStream         *aud_stream;
-    AVFrame          *aud_frame;     /* FLTP stereo, 1024 samples */
-    AVAudioFifo      *aud_fifo;
-    SwrContext       *swr;
-    AVChannelLayout   aud_in_layout; /* source layout stamped onto raw frames */
-    int64_t           aud_pts;       /* running sample counter */
-    int               aud_anchored;  /* aud_pts has been placed on the timeline */
-
-    /* ── Pixel-format conversion (libswscale) ─────── */
-    struct SwsContext *sws_screen;   /* screen_pix_fmt  → RGBA canvas */
-    struct SwsContext *sws_cam_raw;  /* cam_pix_fmt → RGBA at cam size */
-    struct SwsContext *sws_cam_main; /* RGBA cam crop → full canvas */
-    struct SwsContext *sws_cam_scale;/* RGBA square crop → overlay size */
-    struct SwsContext *sws_to_yuv;  /* canvas RGBA → YUV420P */
-
-    /* ── Webcam overlay geometry ──────────────────── */
-    int overlay_size;   /* side length of the square overlay (px) */
-    int overlay_x;      /* top-left x of overlay on canvas */
-    int overlay_y;      /* top-left y of overlay on canvas */
-    int64_t cam_overlay_seq; /* last webcam frame scaled into cam_overlay */
-    float *corner_mask; /* overlay_size² floats */
-
-    /* ── Scratch RGBA buffers ─────────────────────── */
-    uint8_t *canvas_rgba;  /* canvas_w * canvas_h * 4 */
-    uint8_t *cam_rgba;     /* cam_src_w * cam_src_h * 4 */
-    uint8_t *cam_overlay;  /* overlay_size² * 4 */
-    int cam_src_w, cam_src_h, cam_crop_size;
-    int cam_main_x, cam_main_y, cam_main_w, cam_main_h;
-    enum AVPixelFormat cam_pix_fmt; /* format the cam sws chain was built for */
-
-    /* ── Hardware video path (macOS) ──────────────── */
-    /* When hw_frames is set the encoder takes CVPixelBuffers by reference and
-       none of the swscale chain above is built. */
-    AVBufferRef      *hw_device;
-    AVBufferRef      *hw_frames;
-
-    /* ── Thread safety ────────────────────────────── */
-    pthread_mutex_t write_mutex;
-
-    /* ── Timing anchor ────────────────────────────── */
-    int64_t t0;          /* av_gettime_relative() at start of recording */
-    int64_t last_key_pts;/* PTS of the last forced keyframe (µs), -1 if none */
-    int header_written;
-} EncoderCtx;
 
 /*
- * Open the output MP4 at `path`.  The output stream set is fixed for the whole
- * recording: the canvas video stream plus, when audio_sample_rate > 0, one
- * audio stream.  The webcam is *not* a stream — it is composited onto the
- * canvas — so it is engaged and released dynamically via encoder_set_webcam()
- * / encoder_clear_webcam() rather than being wired up here.
- * audio_ch_layout is the layout reported by the capture context.
+ * Encoder: one MP4 out of captured frames and mixed audio.
+ *
+ * The webcam is *not* a stream — it is composited onto the canvas — so it is
+ * engaged and released dynamically via encoder_set_webcam() /
+ * encoder_clear_webcam() rather than being wired up at open.
+ *
+ * The context is opaque: the platform mains read nothing inside it.  State
+ * they used to reach for (has the header been written, where does the audio
+ * track sit on the timeline) is exposed through accessors so the module's
+ * invariants stay the module's business.
  */
-int  encoder_open(EncoderCtx *enc, const char *path,
-                  int canvas_w, int canvas_h, int fps,
-                  enum AVPixelFormat screen_pix_fmt,
-                  int audio_sample_rate,
-                  const AVChannelLayout *audio_ch_layout,
-                  enum AVSampleFormat audio_sample_fmt);
+typedef struct EncoderCtx EncoderCtx;
+
+/*
+ * Open the output MP4 at `path`.  The output stream set is fixed for the
+ * whole recording: the canvas video stream plus, when audio_sample_rate > 0,
+ * one audio stream.
+ * audio_ch_layout is the layout reported by the capture context.
+ *
+ * Returns a new context, or NULL on failure (nothing to free).
+ */
+EncoderCtx *encoder_open(const char *path,
+                         int canvas_w, int canvas_h, int fps,
+                         enum AVPixelFormat screen_pix_fmt,
+                         int audio_sample_rate,
+                         const AVChannelLayout *audio_ch_layout,
+                         enum AVSampleFormat audio_sample_fmt);
 
 /*
  * Engage the webcam compositing path for a camera stream of the given geometry
@@ -131,6 +83,18 @@ int  encoder_write_pixbuf(EncoderCtx *enc, void *pixbuf, int64_t pts_us);
 /* Was the encoder opened on the hardware path? */
 int  encoder_is_hardware(const EncoderCtx *enc);
 
+/* 1 once the MP4 header is in the file.  A recording that never reached this
+   point has nothing worth rendering. */
+int  encoder_header_written(const EncoderCtx *enc);
+
+/*
+ * Where the audio track sits on the session timeline, in microseconds, or -1
+ * when the encoder has no audio track.  The track anchors once — on the
+ * first fed frame's PTS — and then counts samples, so this is the position a
+ * [SYNC]-style check compares against the video PTS.
+ */
+int64_t encoder_audio_pts_us(const EncoderCtx *enc);
+
 /*
  * Resample raw audio into FIFO; encodes full 1024-sample chunks.
  *
@@ -143,5 +107,5 @@ int  encoder_feed_audio(EncoderCtx *enc, AVFrame *raw_frame, int64_t pts_us);
 /* Flush encoders, write MP4 trailer. */
 int  encoder_flush(EncoderCtx *enc);
 
-/* Free all resources. */
+/* Free the context (NULL-safe). */
 void encoder_free(EncoderCtx *enc);

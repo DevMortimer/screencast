@@ -20,6 +20,7 @@
 #include "encoder.h"
 #include "composite.h"
 #include "mixer.h"
+#include "audsrc.h"
 #include "arbiter.h"
 
 /* ── configuration ─────────────────────────────────────────── */
@@ -97,7 +98,7 @@ typedef struct {
     PwCam     *pwcam;      /* webcam via PipeWire; NULL when the node is not held */
     CaptureCtx mic_cap;    /* microphone (default source) */
     CaptureCtx desk_cap;   /* desktop audio (default sink's monitor) */
-    EncoderCtx enc;
+    EncoderCtx *enc;
     MixerCtx  *mixer;      /* mixes mic + desktop into one track */
     int canvas_w, canvas_h; /* captured output size */
     int cam_w, cam_h;
@@ -439,7 +440,7 @@ static Availability webcam_verdict(RecordMode requested, int64_t now)
 static void apply_plan(const ArbiterPlan *p)
 {
     if (p->active.webcam) {
-        if (encoder_set_webcam(&s_rec.enc,
+        if (encoder_set_webcam(s_rec.enc,
                                s_rec.cam_w, s_rec.cam_h, s_rec.cam_fmt) < 0) {
             /* Could not build the compositing chain — hand the node back so the
              * next tick declines cleanly to display rather than a black frame. */
@@ -447,7 +448,7 @@ static void apply_plan(const ArbiterPlan *p)
         }
     } else if (s_rec.pwcam) {
         cam_release();
-        encoder_clear_webcam(&s_rec.enc);
+        encoder_clear_webcam(s_rec.enc);
     }
 
     if (p->notes & ARB_NOTE_WEBCAM_UNAVAILABLE)
@@ -457,7 +458,7 @@ static void apply_plan(const ArbiterPlan *p)
         control_notify("Screencast webcam engaged", NULL);
 }
 
-/* ── audio threads ─────────────────────────────────────────── */
+/* ── audio threads ────────────────────────────────────────── */
 
 /* Mixed audio is delivered here and handed to the encoder's audio path. */
 static void mixer_sink_encode(void *user, AVFrame *mixed)
@@ -468,44 +469,42 @@ static void mixer_sink_encode(void *user, AVFrame *mixed)
     encoder_feed_audio((EncoderCtx *)user, mixed, -1);
 }
 
-typedef struct { CaptureCtx *cap; MixerCtx *mixer; MixSource src;
-                 const char *label; } AudioArg;
-
-/* Consecutive failed reads before a source is declared dead and dropped. */
-#define AUDIO_MAX_FAILS 40
-
 /*
- * One audio source's capture loop.  A source that dies mid-recording (device
- * busy or unplugged) is dropped cleanly rather than fought over: on a run of
- * persistent read errors we back off (no tight retry), and once the run passes
- * AUDIO_MAX_FAILS we drop the source from the mix and exit.  The mixed track
- * keeps flowing over whatever sources remain.
+ * Read one frame from a libav/Pulse/PipeWire capture source (the adapter the
+ * shared audio source worker drives).  The frame stays owned by the
+ * CaptureCtx — it is reused by the next read — so owned=0 tells the worker
+ * not to free it.  AVERROR_EXIT means the session was interrupted for a
+ * normal stop; anything else negative is a dead source.
  */
-static void *audio_thread(void *arg)
+static AudSrcRead linux_audio_read(void *user)
 {
-    AudioArg *a = (AudioArg *)arg;
-    struct timespec backoff = { .tv_nsec = 100000000L }; /* 100 ms */
-    int fails = 0;
+    CaptureCtx *cap = (CaptureCtx *)user;
+    int ret = capture_read(cap);
+    if (ret == AVERROR_EXIT)
+        return (AudSrcRead){ .result = AUDSRC_STOP };
+    if (ret < 0)
+        return (AudSrcRead){ .result = AUDSRC_ERROR };
+    return (AudSrcRead){
+        .result = AUDSRC_FRAME,
+        .frame  = cap->frame,
+        .owned  = 0,
+        .in_sample_rate = cap->sample_rate,
+        .in_channels    = cap->ch_layout.nb_channels,
+        .in_fmt         = cap->sample_fmt,
+        .pts_us         = capture_frame_pts_us(cap),
+    };
+}
 
-    while (atomic_load(&g_running) && atomic_load(&s_rec_open)) {
-        int ret = capture_read(a->cap);
-        if (ret == AVERROR_EXIT)
-            break;                       /* interrupted for a normal stop */
-        if (ret < 0) {
-            if (++fails >= AUDIO_MAX_FAILS) {
-                fprintf(stderr, "main: %s audio source died — dropping it "
-                                "from the mix\n", a->label);
-                mixer_drop_source(a->mixer, a->src);
-                break;
-            }
-            nanosleep(&backoff, NULL);   /* bounded backoff, never busy-spin */
-            continue;
-        }
-        fails = 0;
-        mixer_feed(a->mixer, a->src, a->cap->frame,
-                   a->cap->sample_rate, &a->cap->ch_layout, a->cap->sample_fmt,
-                   capture_frame_pts_us(a->cap));
-    }
+/* The worker runs until the recording session is over. */
+static int rec_running(void *user)
+{
+    (void)user;
+    return atomic_load(&g_running) && atomic_load(&s_rec_open);
+}
+
+static void *worker_thread(void *arg)
+{
+    audsrc_run((const AudSrcWorker *)arg);
     return NULL;
 }
 
@@ -579,22 +578,6 @@ static int recording_open(void)
 
     s_rec.has_aud = s_rec.has_mic || s_rec.has_desktop;
 
-    /* Build the mixer over whichever sources opened. */
-    s_rec.mixer = NULL;
-    if (s_rec.has_aud) {
-        int active[MIX_SRC_COUNT] = {
-            [MIX_SRC_MIC]     = s_rec.has_mic,
-            [MIX_SRC_DESKTOP] = s_rec.has_desktop,
-        };
-        s_rec.mixer = mixer_create(active, mixer_sink_encode, &s_rec.enc);
-        if (!s_rec.mixer) {
-            fprintf(stderr, "main: mixer init failed — recording video only\n");
-            if (s_rec.has_mic)     capture_free(&s_rec.mic_cap);
-            if (s_rec.has_desktop) capture_free(&s_rec.desk_cap);
-            s_rec.has_mic = s_rec.has_desktop = s_rec.has_aud = 0;
-        }
-    }
-
     const char *audio_sources =
         !s_rec.has_aud                     ? "none (video only)"
         : s_rec.has_mic && s_rec.has_desktop ? "mic + desktop (mixed)"
@@ -617,20 +600,37 @@ static int recording_open(void)
 
     /* The webcam is not an output stream — it is composited onto the canvas and
      * engaged/released mid-recording via encoder_set_webcam/clear_webcam. */
-    int enc_ret = encoder_open(&s_rec.enc, s_rec.capture_path,
+    s_rec.enc = encoder_open(s_rec.capture_path,
                      s_rec.canvas_w, s_rec.canvas_h, FPS,
                      s_rec.screen_cap.pix_fmt,
                      audio_sr, audio_ch, audio_fmt);
     if (s_rec.has_aud) av_channel_layout_uninit(&mix_ch);
 
-    if (enc_ret < 0) {
+    if (!s_rec.enc) {
         fprintf(stderr, "main: encoder open failed\n");
         capture_free(&s_rec.screen_cap);
         cam_release();
         if (s_rec.has_mic)     capture_free(&s_rec.mic_cap);
         if (s_rec.has_desktop) capture_free(&s_rec.desk_cap);
-        if (s_rec.mixer) { mixer_destroy(s_rec.mixer); s_rec.mixer = NULL; }
         return -1;
+    }
+
+    /* Build the mixer over whichever sources opened, once the encoder exists:
+       the sink hands mixed audio straight to it, so the context must be live
+       before any feed can drain. */
+    s_rec.mixer = NULL;
+    if (s_rec.has_aud) {
+        int active[MIX_SRC_COUNT] = {
+            [MIX_SRC_MIC]     = s_rec.has_mic,
+            [MIX_SRC_DESKTOP] = s_rec.has_desktop,
+        };
+        s_rec.mixer = mixer_create(active, mixer_sink_encode, s_rec.enc);
+        if (!s_rec.mixer) {
+            fprintf(stderr, "main: mixer init failed — recording video only\n");
+            if (s_rec.has_mic)     capture_free(&s_rec.mic_cap);
+            if (s_rec.has_desktop) capture_free(&s_rec.desk_cap);
+            s_rec.has_mic = s_rec.has_desktop = s_rec.has_aud = 0;
+        }
     }
 
     atomic_store(&s_rec_open, 1);
@@ -642,18 +642,35 @@ static int recording_open(void)
 static void recording_loop(void)
 {
     pthread_t mic_tid = 0, desk_tid = 0;
-    AudioArg mic_arg  = { &s_rec.mic_cap,  s_rec.mixer, MIX_SRC_MIC,     "microphone" };
-    AudioArg desk_arg = { &s_rec.desk_cap, s_rec.mixer, MIX_SRC_DESKTOP, "desktop" };
+    /* The feed-loop policy (backoff, drop after a run of errors) lives in the
+       shared audio source worker; these two configs drive it with the libav
+       capture adapter.  The webcam has no thread here: while the camera node
+       is held, the PipeWire capture thread pushes frames into s_cam_latest
+       via cam_frame_cb.  The node is acquired/released dynamically below,
+       driven by the arbiter. */
+    AudSrcWorker mic_worker = {
+        .src = MIX_SRC_MIC, .mixer = s_rec.mixer, .label = "microphone",
+        .max_fails = AUDSRC_MAX_FAILS,
+        .error_backoff_ns = AUDSRC_ERROR_BACKOFF_NS,
+        .empty_poll_ns    = AUDSRC_EMPTY_POLL_NS,
+        .read = linux_audio_read, .running = rec_running,
+        .user = &s_rec.mic_cap,
+    };
+    AudSrcWorker desk_worker = {
+        .src = MIX_SRC_DESKTOP, .mixer = s_rec.mixer, .label = "desktop",
+        .max_fails = AUDSRC_MAX_FAILS,
+        .error_backoff_ns = AUDSRC_ERROR_BACKOFF_NS,
+        .empty_poll_ns    = AUDSRC_EMPTY_POLL_NS,
+        .read = linux_audio_read, .running = rec_running,
+        .user = &s_rec.desk_cap,
+    };
     int64_t last_webcam_seq = -1;
     struct timespec cam_poll = { .tv_nsec = 1000000L };
 
-    /* The webcam has no thread here: while the camera node is held, the
-     * PipeWire capture thread pushes frames into s_cam_latest via cam_frame_cb.
-     * The node is acquired/released dynamically below, driven by the arbiter. */
     if (s_rec.has_mic)
-        pthread_create(&mic_tid, NULL, audio_thread, &mic_arg);
+        pthread_create(&mic_tid, NULL, worker_thread, &mic_worker);
     if (s_rec.has_desktop)
-        pthread_create(&desk_tid, NULL, audio_thread, &desk_arg);
+        pthread_create(&desk_tid, NULL, worker_thread, &desk_worker);
 
     while (atomic_load(&g_running) && atomic_load(&g_recording)) {
         RecordMode requested = atomic_load(&g_mode);
@@ -717,7 +734,7 @@ static void recording_loop(void)
 
         /* -1: no capture timestamp from wlr-screencopy yet, so the encoder
            falls back to stamping wall-clock time at encode. */
-        encoder_write_video(&s_rec.enc, mode,
+        encoder_write_video(s_rec.enc, mode,
                             s_rec.screen_cap.frame, cam_copy, cam_seq, -1);
 
         if (cam_copy) av_frame_free(&cam_copy);
@@ -732,7 +749,7 @@ static void recording_loop(void)
 
 static void recording_close(void)
 {
-    int should_render = s_rec.enc.header_written &&
+    int should_render = encoder_header_written(s_rec.enc) &&
                         s_rec.capture_path[0] &&
                         s_rec.final_path[0];
 
@@ -740,8 +757,9 @@ static void recording_close(void)
     struct timespec ts = { .tv_nsec = 50000000L };
     nanosleep(&ts, NULL);
 
-    encoder_flush(&s_rec.enc);
-    encoder_free(&s_rec.enc);
+    encoder_flush(s_rec.enc);
+    encoder_free(s_rec.enc);
+    s_rec.enc = NULL;
     if (s_rec.mixer) { mixer_destroy(s_rec.mixer); s_rec.mixer = NULL; }
     capture_free(&s_rec.screen_cap);
     /* Release the camera node if still held (stops the PipeWire thread first,
