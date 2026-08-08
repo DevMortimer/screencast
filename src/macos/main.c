@@ -28,7 +28,8 @@
 
 /* ── configuration ─────────────────────────────────────────── */
 
-#define FPS         30
+/* Frame rate comes from SCREENCAST_FPS via sck_capture_fps() — capture and
+   encoder must agree, so there is one source. */
 #define WEBCAM_DEV  "auto"
 
 /* ── shared state ──────────────────────────────────────────── */

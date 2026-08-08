@@ -169,7 +169,44 @@ _Avoid_: frame time, capture time (ambiguous)
 The priority rule the whole pipeline is built around: A/V sync is inviolable,
 and video frames are the resource that gives under load. Drop frames and let
 variable frame rate carry it; never re-stamp a timestamp, never drop audio.
-_Avoid_: frame skipping, throttling
+_Avoid_: frame skipping, rate limiting
+
+**Stall**:
+A pause in the recording pipeline — capture, encode, or write blocked —
+during which no frames flow. In the finished file a stall shows as a frozen
+stretch: the picture holds while audio continues, then jumps to the frame the
+timeline was already at. A stall is a timeline gap; a drop is a missing frame.
+_Avoid_: lag, freeze, hiccup
+
+**Drop**:
+A frame evicted before encoding because the pipeline is behind. The recording
+becomes choppier for the duration; nothing freezes and the timeline never
+moves. This is the elastic-video rule made concrete: under load it is the
+frames that give, never the timestamps and never the audio.
+_Avoid_: skipping, dropping frames (vague)
+
+## System impact
+
+**Saturation**:
+A shared machine resource — the GPU, memory bandwidth, or RAM — at 100% for a
+moment. Everything on screen freezes briefly because the window server
+starves. A burst from another app (a simulator boot, a build, a compile) can
+do this when the recorder has already spent the machine's headroom.
+_Avoid_: lag
+
+**Throttle**:
+The machine cutting sustained power because of heat; the whole system slows
+for the duration rather than freezing for a moment. Distinct from saturation
+in cause (thermal, not contention) and in shape (sustained, not a burst).
+_Avoid_: slowdown, thermal lag
+
+**Headroom**:
+The rule that the recording must cost the machine little enough that the rest
+of the system never starves: capture size and rate are bounded, queues and
+buffers are shallow, and when the machine is under load the recorder yields —
+drops frames, covers audio with silence — before the system saturates. The
+recorder is a guest that must stay invisible.
+_Avoid_: low impact, lightweight, efficiency
 
 **Nearest-PTS matching** (Linux):
 Pairing a webcam frame with the screen frame it was actually captured alongside,

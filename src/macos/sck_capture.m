@@ -26,11 +26,63 @@
 
 /* ── constants ─────────────────────────────────────────────── */
 
-/* ~1 s at 30 fps.  Deep enough to absorb the record loop briefly holding a
-   frame back while it waits for the matching webcam frame to arrive. */
-#define VIDEO_QUEUE_DEPTH   32
+/*
+ * Queue capacity, ~270 ms at 24 fps.  Deliberately shallow: a backlog is
+ * dropped, not drained.  Encoding queued frames back-to-back after a stall
+ * would add a GPU burst at exactly the moment the system is recovering from
+ * one — the headroom rule (ADR 0007) says the recorder yields instead.
+ */
+#define VIDEO_QUEUE_DEPTH   8
 #define AUDIO_INIT_SAMPLES  (1024 * 8)
-#define SCK_TARGET_FPS      30
+
+/*
+ * At most this many canonical samples of desktop audio may accumulate before
+ * capture drops the newest.  The desktop thread drains every ~10 ms, so the
+ * bound is only ever reached while the downstream pipeline is stalled;
+ * without it a long stall balloons RAM on a machine already under memory
+ * pressure.  The timeline stays anchored at the head — dropping newest, never
+ * oldest — and the mixer covers the hole with silence.
+ */
+#define AUDIO_MAX_SAMPLES   (48000 * 2)
+
+/* ── tuning ────────────────────────────────────────────────── */
+
+/*
+ * Session frame rate.  24 fps default: a talking head and a shared screen
+ * read perfectly at 24, and every frame saved is GPU time the rest of the
+ * system keeps when a burst arrives (see CONTEXT.md: Headroom).
+ */
+int sck_capture_fps(void)
+{
+    const char *e = getenv("SCREENCAST_FPS");
+    if (!e || !e[0]) return 24;
+    int v = atoi(e);
+    if (v < 10 || v > 60) {
+        fprintf(stderr, "sck_capture: SCREENCAST_FPS=%s out of range (10-60) — "
+                        "using 24\n", e);
+        return 24;
+    }
+    return v;
+}
+
+/*
+ * Ceiling on the captured canvas's longer edge, in pixels.  Default 1440:
+ * still oversamples a 1440x900-point desktop, at ~40% of the pixels the old
+ * 1920 cap cost — the pixel count multiplies the price of every stage after
+ * it, so this is the headroom dial.
+ */
+static int capture_cap(void)
+{
+    const char *e = getenv("SCREENCAST_CAPTURE_CAP");
+    if (!e || !e[0]) return 1440;
+    int v = atoi(e);
+    if (v < 640 || v > 4096) {
+        fprintf(stderr, "sck_capture: SCREENCAST_CAPTURE_CAP=%s out of range "
+                        "(640-4096) — using 1440\n", e);
+        return 1440;
+    }
+    return v;
+}
 
 /* How long the stream may go without delivering a single video callback before
    we say so on stderr.  Deliberately a warning and not a verdict: SCK is
@@ -97,6 +149,7 @@ struct SckCapture {
     atomic_int              failed;
     atomic_llong            last_video_cb_us;
     int                     stall_warned;
+    int                     drop_warned;   /* backlog warning said once per episode */
 
     /* diagnostics (SCREENCAST_DEBUG=1) — each counter is touched by exactly
        one serial queue, so plain increments are safe */
@@ -258,40 +311,34 @@ static int64_t sample_pts_us(CMSampleBufferRef sb)
  * first thing that costs.
  *
  * The default is measured, not assumed: the ratio between the current mode's
- * pixel width and its point width.
+ * pixel width and its point width.  Be clear about what that measures.  It is
+ * the *backing framebuffer* macOS composites into, which on a scaled HiDPI
+ * mode is larger than the panel — a MacBook Air running 1440x900 points
+ * reports 2880x1800 here, and the display resamples that down to its own
+ * 2560x1664.  So this captures everything the window server drew, at the cost
+ * of ~22% more pixels than the screen can actually show.  Measuring is still
+ * right (a display set to an unscaled mode reports its true 1:1 or 2:1 ratio
+ * rather than a guessed one), but it is not the panel's resolution and should
+ * not be described as such.
  *
- * Be clear about what that measures.  It is the *backing framebuffer* macOS
- * composites into, which on a scaled HiDPI mode is larger than the panel — a
- * MacBook Air running 1440x900 points reports 2880x1800 here, and the display
- * resamples that down to its own 2560x1664.  So this captures everything the
- * window server drew, at the cost of ~22% more pixels than the screen can
- * actually show.  Measuring is still right (a display set to an unscaled mode
- * reports its true 1:1 or 2:1 ratio rather than a guessed one), but it is not
- * the panel's resolution and should not be described as such.
- *
- * Capturing all of it, though, is not worth what it costs.  The full backing
- * store is ~5.2 megapixels; every one of them is paid for again at each stage
- * downstream — the encode, the memory bandwidth, the file — and on a fanless
- * machine that is the difference between a recording that keeps up and one that
- * drops frames.  So the default is capped at CAPTURE_LONG_EDGE_MAX on the
- * longer edge.  1920 is the standard delivery size for a screencast and still
- * oversamples a 1440x900 desktop by a third, which is where text sharpness
- * actually comes from.
+ * Capturing all of it, though, is not worth what it costs.  Every pixel is
+ * paid for again at each stage downstream — the encode, the memory bandwidth,
+ * the file — and on a machine where other apps are also encoding (a video
+ * call, a simulator) that standing cost is headroom the rest of the system
+ * cannot use.  So the default is capped at 1440 on the longer edge, which
+ * still oversamples a 1440x900-point desktop at ~40% of the pixels of the old
+ * 1920 cap.  See ADR 0007; SCREENCAST_CAPTURE_CAP dials it.
  *
  * Two bounds therefore apply, and the log says which one bit: the measured
  * native ratio, and the cap.  The result is the smaller — never more than the
  * framebuffer holds, because upscaling costs encode bandwidth and memory
  * without adding any detail, and never more than the cap.
- *
- * There is no knob.  Both bounds are measured or fixed, and a recording that
- * comes out wrong is a bug in one of them rather than something to be tuned
- * per-run from the environment.
  */
-#define CAPTURE_LONG_EDGE_MAX 1920
 
 static double display_capture_scale(CGDirectDisplayID did,
                                     int pt_w, int pt_h,
-                                    const char **bound_by)
+                                    int cap_max,
+                                    char *bound_by, size_t bound_by_n)
 {
     double native = 1.0;
 
@@ -309,10 +356,13 @@ static double display_capture_scale(CGDirectDisplayID did,
        below 1 — a deliberate downscale, not a clamp. */
     int    long_pt   = pt_w > pt_h ? pt_w : pt_h;
     double cap_scale = long_pt > 0
-                       ? (double)CAPTURE_LONG_EDGE_MAX / (double)long_pt
+                       ? (double)cap_max / (double)long_pt
                        : native;
 
-    *bound_by = native < cap_scale ? "native" : "1920 cap";
+    if (native < cap_scale)
+        snprintf(bound_by, bound_by_n, "native");
+    else
+        snprintf(bound_by, bound_by_n, "%d px cap", cap_max);
     return native < cap_scale ? native : cap_scale;
 }
 
@@ -399,8 +449,16 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
         }
 
         if (c->video_count >= VIDEO_QUEUE_DEPTH) {
-            /* Encoder is behind.  Video is the elastic resource: drop the
-               oldest frame rather than stall capture or delay a timestamp. */
+            /* Downstream is behind.  Video is the elastic resource: drop the
+               oldest frame rather than stall capture, delay a timestamp, or
+               let the backlog grow into a burst.  Warn once per episode so a
+               real recording says when it happened. */
+            if (!c->drop_warned) {
+                c->drop_warned = 1;
+                fprintf(stderr, "sck_capture: capture falling behind — "
+                                "dropping frames while the system is under "
+                                "load\n");
+            }
             CVPixelBufferRelease(c->video_queue[c->video_head]);
             c->video_queue[c->video_head] = NULL;
             c->video_head = (c->video_head + 1) % VIDEO_QUEUE_DEPTH;
@@ -621,6 +679,18 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
             c->audio_head_pts = apts - c->t0_us;
 
         int new_total = c->audio_nb_samples + dst->nb_samples;
+        if (new_total > AUDIO_MAX_SAMPLES) {
+            /* Downstream is stalled — a video encode or write is holding the
+               shared path.  Drop the newest samples rather than balloon RAM:
+               the head stays anchored and the mixer covers the hole with
+               silence (see CONTEXT.md: Silence padding). */
+            if (c->debug)
+                fprintf(stderr, "sck: desktop audio backlog — dropping %d "
+                                "samples\n", new_total - AUDIO_MAX_SAMPLES);
+            pthread_mutex_unlock(&c->lock);
+            av_frame_free(&dst);
+            return;
+        }
         if (new_total * (int)sizeof(float) > c->audio_plane_cap) {
             int new_cap = c->audio_plane_cap * 2;
             while (new_total * (int)sizeof(float) > new_cap) new_cap *= 2;
@@ -784,9 +854,10 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
             break;
         }
 
-        const char *bound_by = "native";
+        char bound_by[32];
+        int cap_max = capture_cap();
         c->scale  = display_capture_scale(display.displayID, pt_w, pt_h,
-                                          &bound_by);
+                                          cap_max, bound_by, sizeof(bound_by));
         c->width  = scaled_even(pt_w, c->scale);
         c->height = scaled_even(pt_h, c->scale);
         fprintf(stderr, "[REC] Display: id %u, %dx%d px "
@@ -819,9 +890,9 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
         config.queueDepth = 4;
         config.showsCursor = YES;
         /* Without this SCK delivers at the display's refresh rate — 60 Hz or
-           120 Hz — and every one of those frames was being converted and
-           encoded, doubling or quadrupling the cost of a 30 fps recording. */
-        config.minimumFrameInterval = CMTimeMake(1, SCK_TARGET_FPS);
+           120 Hz — and every one of those frames would be encoded, doubling
+           or quadrupling the cost of the recording. */
+        config.minimumFrameInterval = CMTimeMake(1, sck_capture_fps());
 
         /*
          *  Presenter Overlay settings (macOS 14+).
@@ -978,6 +1049,7 @@ static void *dequeue_video(SckCapture *c, int64_t *pts_us)
     c->video_queue[c->video_head] = NULL;
     c->video_head = (c->video_head + 1) % VIDEO_QUEUE_DEPTH;
     c->video_count--;
+    if (c->video_count == 0) c->drop_warned = 0;  /* backlog episode over */
     pthread_mutex_unlock(&c->lock);
     return pb;   /* ownership passes to the caller */
 }

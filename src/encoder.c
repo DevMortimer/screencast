@@ -51,7 +51,7 @@ struct EncoderCtx {
     struct SwsContext *sws_cam_scale;/* RGBA square crop → overlay size */
     struct SwsContext *sws_to_yuv;  /* canvas RGBA → YUV420P */
 
-    /* ── Webcam overlay geometry ───────────── */
+    /* ── Webcam overlay geometry ────────────── */
     int overlay_size;   /* side length of the square overlay (px) */
     int overlay_x;      /* top-left x of overlay on canvas */
     int overlay_y;      /* top-left y of overlay on canvas */
@@ -66,16 +66,16 @@ struct EncoderCtx {
     int cam_main_x, cam_main_y, cam_main_w, cam_main_h;
     enum AVPixelFormat cam_pix_fmt; /* format the cam sws chain was built for */
 
-    /* ── Hardware video path (macOS) ─────────── */
+    /* ── Hardware video path (macOS) ──────────── */
     /* When hw_frames is set the encoder takes CVPixelBuffers by reference and
        none of the swscale chain above is built. */
     AVBufferRef      *hw_device;
     AVBufferRef      *hw_frames;
 
-    /* ── Thread safety ────────────────── */
+    /* ── Thread safety ─────────────────── */
     pthread_mutex_t write_mutex;
 
-    /* ── Timing anchor ──────────────── */
+    /* ── Timing anchor ─────────────────── */
     int64_t t0;          /* av_gettime_relative() at start of recording */
     int64_t last_key_pts;/* PTS of the last forced keyframe (µs), -1 if none */
     int header_written;
@@ -86,8 +86,20 @@ struct EncoderCtx {
 
 /* VideoToolbox constant-quality target, 0-100.  65 is visually clean on screen
    content — text stays crisp — without spending the bits that the top of the
-   range costs for detail a screen recording does not contain. */
-#define VT_QUALITY 65
+   range costs for detail a screen recording does not contain.  Quality is
+   bits, and bits are encode time — SCREENCAST_VT_QUALITY dials it. */
+static int vt_quality(void)
+{
+    const char *e = getenv("SCREENCAST_VT_QUALITY");
+    if (!e || !e[0]) return 65;
+    int v = atoi(e);
+    if (v < 1 || v > 100) {
+        fprintf(stderr, "encoder: SCREENCAST_VT_QUALITY=%s out of range "
+                        "(1-100) — using 65\n", e);
+        return 65;
+    }
+    return v;
+}
 
 /* ── logging ──────────────────────────────────────────────── */
 
@@ -245,14 +257,19 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
     av_opt_set(enc->vid_enc->priv_data, "surfaces","16",     0);
 #else
     /*
-     * VideoToolbox: real-time hardware encoding, tuned for a fanless laptop
-     * running for half an hour at a stretch.  power_efficient lets the encoder
-     * pick its low-power path (it defaults to -1, "unset", not to on), and
-     * prio_speed keeps per-frame latency down so the capture queue does not
-     * back up under load.
+     * VideoToolbox: real-time hardware encoding.  prio_speed keeps per-frame
+     * latency down so the capture queue does not back up under load.
+     *
+     * power_efficient defaults OFF (SCREENCAST_VT_POWER_EFFICIENT=1 restores
+     * it): the full encoder finishes each frame sooner, freeing the GPU while
+     * the rest of the system is under load — the headroom rule (ADR 0007).
+     * The low-power path exists for battery sessions on a fanless machine
+     * when nothing is competing for the GPU.
      */
+    const char *pe = getenv("SCREENCAST_VT_POWER_EFFICIENT");
+    const char *power_efficient = (pe && pe[0] && pe[0] != '0') ? "1" : "0";
     av_opt_set(enc->vid_enc->priv_data, "realtime",        "1", 0);
-    av_opt_set(enc->vid_enc->priv_data, "power_efficient", "1", 0);
+    av_opt_set(enc->vid_enc->priv_data, "power_efficient", power_efficient, 0);
     av_opt_set(enc->vid_enc->priv_data, "prio_speed",      "1", 0);
 
     /*
@@ -272,7 +289,7 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
      */
 #if defined(__aarch64__)
     enc->vid_enc->flags         |= AV_CODEC_FLAG_QSCALE;
-    enc->vid_enc->global_quality = VT_QUALITY * FF_QP2LAMBDA;
+    enc->vid_enc->global_quality = vt_quality() * FF_QP2LAMBDA;
 #else
     enc->vid_enc->bit_rate = (int64_t)w * h * fps / 7;
 #endif

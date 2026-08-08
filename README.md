@@ -171,11 +171,11 @@ appends to the same log itself.
 - **No webcam modes.** Linux has `display`, `webcam` and `both`, and composites the camera itself. macOS records the display and leaves the presenter to the system — see [ADR 0005](docs/adr/0005-macos-records-the-display-only.md). Sending `webcam` or `both` to a macOS build is rejected with a pointer to Control Center.
 - **Presenter Overlay needs macOS 14 on Apple silicon.** On macOS 13 or Intel, screencast records the display and there is no way to appear in it.
 - **Presenter Overlay is not scriptable.** It is a Control Center toggle. Nothing can bind it to a key or turn it on from the command line.
-- **Capture is capped at 1920 on the long edge**, below the full backing store on a HiDPI panel. The pixel count multiplies the cost of every stage after it, and beyond that point buys detail nobody watching a screencast can see.
+- **Capture is capped at 1440 on the long edge by default** (`SCREENCAST_CAPTURE_CAP`), below the full backing store on a HiDPI panel. The pixel count multiplies the cost of every stage after it, and beyond that point buys detail nobody watching a screencast can see.
 - **Single-pass encode.** No two-pass NVENC render; VideoToolbox encodes directly to the final file at constant quality.
 - **No recording indicator.** macOS enforces its own system recording indicator in the menu bar.
 - **No display override.** The daemon locks to the display the cursor was on when it started.
-- **No tuning variables.** Every `SCREENCAST_*` variable except `SCREENCAST_DEBUG` is Linux-only. There is no intermediate capture file to keep.
+- **A small tuning surface.** macOS was deliberately knob-less (ADR 0005); the four variables in the table below exist because a recording on a loaded machine must be able to yield (ADR 0007). There is no intermediate capture file to keep.
 
 ## Usage (Linux)
 
@@ -240,13 +240,20 @@ The recorder can be tuned with environment variables:
 
 ### macOS configuration
 
-There isn't any. macOS reads no configuration variables except
-`SCREENCAST_DEBUG`, which reports rather than tunes: per-frame delivery
-counts, a periodic A/V sync line, and whether Presenter Overlay is on.
+macOS reads four tuning variables, all optional — the defaults are the
+headroom values (ADR 0007):
 
-Capture resolution, encoder quality and camera format are all fixed —
-measured from the display, or chosen once. If one of them is wrong on your
-hardware that is a bug worth fixing rather than a value worth overriding.
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SCREENCAST_CAPTURE_CAP` | `1440` | Ceiling on the longer edge of the captured canvas, in pixels. Lower it to make the recording cost less; raise it for more detail. |
+| `SCREENCAST_FPS` | `24` | Capture and encode rate. `30` is the old behaviour. |
+| `SCREENCAST_VT_QUALITY` | `65` | VideoToolbox constant-quality target, 0-100. |
+| `SCREENCAST_VT_POWER_EFFICIENT` | unset | Set to `1` to use the encoder's low-power path — less battery and heat, frames take longer, best when nothing is competing for the GPU. |
+
+`SCREENCAST_DEBUG=1` reports rather than tunes: per-frame delivery counts, a
+periodic A/V sync line, whether Presenter Overlay is on, and — with the
+default headroom settings — a warning each time the recording has to drop
+frames because the system is under load.
 
 Example:
 
