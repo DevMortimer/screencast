@@ -9,9 +9,9 @@
  * ScreenCaptureKit display + system audio capture backend for macOS.
  *
  * Bridges the async SCK stream model into a synchronous grab interface.
- * Captures the main display at native resolution with BGRA pixel format
- * and captures system audio (any Linear PCM the output device negotiates,
- * normalised to 48 kHz stereo FLTP before it is queued).
+ * Captures the display under the cursor as NV12 CVPixelBuffers, capped by
+ * SCREENCAST_CAPTURE_CAP, and captures system audio (any Linear PCM the
+ * output device negotiates, normalised to 48 kHz stereo FLTP before queueing).
  *
  * The header is pure C — callers need not know about Objective-C or Apple
  * frameworks.
@@ -22,14 +22,15 @@ typedef struct SckCapture SckCapture; // opaque
 typedef struct {
     int                width;          // pixels
     int                height;         // pixels
+    unsigned int       display_id;     // CGDirectDisplayID being recorded
     /*
-     * Pixels captured per point of display geometry (see SCREENCAST_SCALE).
+     * Pixels captured per point after the capture cap is applied.
      * width/height are already in pixels; this is here so that callers placing
      * overlays can size them in points and have them occupy the same fraction
      * of the frame whatever scale the capture ended up at.
      */
     double             scale;
-    enum AVPixelFormat pix_fmt;       // BGRA expected
+    enum AVPixelFormat pix_fmt;       // AV_PIX_FMT_NV12
     int                sample_rate;   // audio sample rate, 0 if no audio
     int                channels;      // audio channels, 0 if no audio
     enum AVSampleFormat sample_fmt;   // audio sample format
@@ -40,10 +41,8 @@ typedef struct {
  *
  * Call early in main() when the process may have been launched from a
  * terminal multiplexer (Zellij, tmux, etc.) where AppKit is not
- * automatically initialised.  Without this call macOS may not offer
- * Presenter Overlay in Control Center, because ScreenCaptureKit and
- * AVFoundation need the NSApplication infrastructure to register the
- * process as a camera + screen client.
+ * automatically initialised.  Presenter mode needs that infrastructure for
+ * its camera window even though the recorder is otherwise a command-line app.
  *
  * Safe to call multiple times — only the first call does anything.
  */
@@ -52,11 +51,9 @@ void sck_bootstrap_app(void);
 /*
  * Pump one iteration of the AppKit run loop.
  *
- * Call this periodically during recording so that AppKit can process
- * system messages (including Presenter Overlay registration and state
- * changes).  The main thread blocks for seconds at a time inside the
- * capture loop, so without this help the system may never recognise
- * this process as a live screen+camera client.
+ * Call this continuously on the main thread while recording so AppKit can
+ * process presenter-window dragging, resizing, and display changes.  The call
+ * waits for at most 10 ms, which prevents a busy loop when no event is ready.
  */
 void sck_pump_run_loop(void);
 
@@ -122,11 +119,8 @@ void *sck_capture_grab_video(SckCapture *c, int64_t *pts_us);
 /*
  * Same, but returns NULL immediately when no frame is waiting.
  *
- * The webcam modes cannot block on the screen: ScreenCaptureKit stops
- * delivering entirely while the display is static, and a loop that waits for it
- * would hold the camera at whatever frame it had when the screen went still.
- * They drain the screen queue with this instead and take their cadence from the
- * camera.
+ * Use this when a caller must drain queued frames without waiting for display
+ * motion.  ScreenCaptureKit can stop delivering while the display is static.
  */
 void *sck_capture_try_grab_video(SckCapture *c, int64_t *pts_us);
 

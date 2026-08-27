@@ -9,10 +9,10 @@ implement `wlr-screencopy-unstable-v1`.
 
 **Platforms:** Linux (wlroots Wayland) | macOS 13+
 
-The two platforms record different things. Linux composites a webcam into the
-picture itself and has modes for it; macOS records the display and leaves the
-presenter to the system's Presenter Overlay. The features below describe the
-Linux build — see [macOS](#macos) for that one.
+The two platforms expose the camera differently. Linux composites webcam
+frames in its video pipeline and has switchable modes; macOS captures a live,
+movable camera window in `presenter` recordings. The features below describe
+the Linux build — see [macOS](#macos) for that one.
 
 ## Features (Linux)
 
@@ -82,14 +82,15 @@ make clean
 
 On macOS, screencast uses native frameworks:
 - **ScreenCaptureKit** for display capture and system audio
-- **AVFoundation** for the microphone
+- **AVFoundation** for the camera and microphone
+- **AppKit** for the borderless presenter window
 - **VideoToolbox** for hardware-accelerated H.264 encoding, at constant quality
 
 Frames never leave GPU memory between capture and encode.
 
 ### Requirements (macOS)
 
-- macOS 13 (Ventura) or later; macOS 14 (Sonoma) on Apple silicon for Presenter Overlay
+- macOS 13 (Ventura) or later
 - Xcode Command Line Tools (`xcode-select --install`)
 - FFmpeg development libraries:
   - `libavformat`, `libavcodec`, `libavdevice`, `libswscale`, `libswresample`, `libavutil`
@@ -119,29 +120,29 @@ sign with a stable certificate instead.
 macOS records the display. There are two commands:
 
 ```sh
-screencast            # record the display + microphone + desktop audio
-screencast presenter  # the same, but make Presenter Overlay available
+screencast            # use the menu-selected mode (Display by default)
+screencast presenter  # explicitly start with a live camera window
 screencast stop
 ```
 
-**To appear in the recording**, run `screencast presenter` and turn on
-Presenter Overlay from the Video Effects menu in Control Center. macOS
-segments you from your background and composites you into the capture
-itself — you can switch it on and off, and between the small and large
-layouts, as often as you like while recording.
+**To appear in the recording**, run `screencast presenter`. A borderless
+camera window opens above the recorded display. Drag it while recording; when
+you release it, it snaps to the nearest corner of the display's usable area. Resize
+it from any edge or corner. The selected corner and size persist for the next
+presenter recording.
 
-The `presenter` form exists because that menu item only appears for an app
-using the camera and the screen at once. Plain `screencast` opens no camera,
-so it costs no power and lights no camera indicator.
+The camera fills a square surface with rounded corners: no title bar,
+controls, border, or shadow. The 16:9 camera is centered and cropped slightly
+on the left and right rather than stretched. Plain `screencast` follows the
+menu's selected mode; choose Display to
+avoid opening the camera, or choose Presenter to make that the default. An
+explicit `screencast presenter` always wins.
 
 `presenter` hands the recording off to `~/Applications/Screencast.app`
-(via LaunchServices) rather than recording in the calling process. Control
-Center attributes a camera stream to the responsible process, and the Video
-Effects panel only lists processes with an app identity — launched bare from
-skhd or a zellij server there is no app on the chain, so the camera runs but
-the overlay is unreachable. The bundle gives every launcher the same
-identity. The first bundled run asks for Camera, Microphone, and Screen
-Recording permissions under the name **Screencast**.
+(via LaunchServices) rather than keeping UI in the calling process. This gives
+Terminal, skhd, and zellij one stable AppKit and privacy-permission identity.
+The first bundled run asks for Camera, Microphone, and Screen Recording
+permissions under the name **Screencast**.
 
 Bind them with **skhd** (or any macOS hotkey tool):
 
@@ -163,14 +164,13 @@ appends to the same log itself.
 |---|---|
 | Output recordings | `~/Movies/screencast_YYYYMMDD_HHMMSS.mp4` |
 | Control socket | `~/Library/Caches/screencast/screencast.sock` |
-| App bundle (presenter identity) | `~/Applications/Screencast.app` |
+| App bundle (presenter UI) | `~/Applications/Screencast.app` |
 | Daemon log | `~/Library/Logs/screencast.log` |
 
 ### macOS limitations vs Linux
 
-- **No webcam modes.** Linux has `display`, `webcam` and `both`, and composites the camera itself. macOS records the display and leaves the presenter to the system — see [ADR 0005](docs/adr/0005-macos-records-the-display-only.md). Sending `webcam` or `both` to a macOS build is rejected with a pointer to Control Center.
-- **Presenter Overlay needs macOS 14 on Apple silicon.** On macOS 13 or Intel, screencast records the display and there is no way to appear in it.
-- **Presenter Overlay is not scriptable.** It is a Control Center toggle. Nothing can bind it to a key or turn it on from the command line.
+- **No switchable webcam modes.** Linux has `display`, `webcam`, and `both`. On macOS, `presenter` is selected when recording starts and stays visible until that recording stops. Sending `webcam` or `both` to a running macOS recorder is rejected with a pointer to `screencast presenter`.
+- **The presenter is a captured window.** Moving or resizing it changes the recording immediately. It does not segment the presenter from the camera background.
 - **Capture is capped at 1440 on the long edge by default** (`SCREENCAST_CAPTURE_CAP`), below the full backing store on a HiDPI panel. The pixel count multiplies the cost of every stage after it, and beyond that point buys detail nobody watching a screencast can see.
 - **Single-pass encode.** No two-pass NVENC render; VideoToolbox encodes directly to the final file at constant quality.
 - **No recording indicator.** macOS enforces its own system recording indicator in the menu bar.
@@ -251,9 +251,8 @@ headroom values (ADR 0007):
 | `SCREENCAST_VT_POWER_EFFICIENT` | unset | Set to `1` to use the encoder's low-power path — less battery and heat, frames take longer, best when nothing is competing for the GPU. |
 
 `SCREENCAST_DEBUG=1` reports rather than tunes: per-frame delivery counts, a
-periodic A/V sync line, whether Presenter Overlay is on, and — with the
-default headroom settings — a warning each time the recording has to drop
-frames because the system is under load.
+periodic A/V sync line, and — with the default headroom settings — a warning
+each time the recording has to drop frames because the system is under load.
 
 Example:
 

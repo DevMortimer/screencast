@@ -279,9 +279,26 @@ void sck_bootstrap_app(void)
 
 void sck_pump_run_loop(void)
 {
-    /* Pump one pass of the AppKit run loop so it can process system
-       messages related to Presenter Overlay registration and state. */
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+    /*
+     * CFRunLoopRunInMode services sources and timers, but it does not run
+     * NSApplication's event dispatcher.  That left the presenter window
+     * visible while mouse events sat in AppKit's queue, producing a beachball
+     * cursor and making both drag and resize appear dead.
+     *
+     * Pull the queued events through NSApplication explicitly.  Keep the
+     * deadline short so the recording worker and status menu remain separate
+     * from this main-thread UI pump.
+     */
+    NSApplication *app = [NSApplication sharedApplication];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.010];
+    for (;;) {
+        NSEvent *event = [app nextEventMatchingMask:NSEventMaskAny
+                                          untilDate:deadline
+                                             inMode:NSDefaultRunLoopMode
+                                            dequeue:YES];
+        if (!event) break;
+        [app sendEvent:event];
+    }
 }
 
 int64_t sck_host_time_us(void)
@@ -747,33 +764,6 @@ static BOOL frame_is_complete(CMSampleBufferRef sb)
     /* Wake anyone blocked on a frame that is never going to arrive. */
     dispatch_semaphore_signal(c->video_sem);
 }
-
-/*
- * Presenter Overlay went on or off.
- *
- * Nothing to do — the system composites the presenter into the frames this
- * stream already delivers, so the pipeline is unaffected either way.  It is
- * worth recording all the same, because it changes the cost of a recording
- * out of all recognition: with the overlay off a static screen delivers
- * almost no frames, and with it on the presenter is always moving, so frames
- * arrive continuously for as long as it is switched on.  Two recordings from
- * the same binary can look nothing alike, and this is the only line that says
- * which one you are looking at.
- */
-- (void)outputVideoEffectDidStartForStream:(SCStream *)stream
-{
-    (void)stream;
-    if (getenv("SCREENCAST_DEBUG"))
-        fprintf(stderr, "sck: presenter overlay on — the system is "
-                        "compositing into the capture\n");
-}
-
-- (void)outputVideoEffectDidStopForStream:(SCStream *)stream
-{
-    (void)stream;
-    if (getenv("SCREENCAST_DEBUG"))
-        fprintf(stderr, "sck: presenter overlay off\n");
-}
 @end
 
 /* ── public API ────────────────────────────────────────────── */
@@ -894,19 +884,6 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
            or quadrupling the cost of the recording. */
         config.minimumFrameInterval = CMTimeMake(1, sck_capture_fps());
 
-        /*
-         *  Presenter Overlay settings (macOS 14+).
-         *
-         * Let the system manage the privacy alert for Presenter Overlay.
-         * This setting exists to prevent constant re-prompting; it does NOT
-         * enable or disable the overlay itself — that is controlled by the
-         * user through Control Center.
-         */
-        if (@available(macOS 14.0, *)) {
-            config.presenterOverlayPrivacyAlertSetting =
-                SCPresenterOverlayAlertSettingSystem;
-        }
-
         /* ── stream output + stream delegate ── */
         /* Built before the stream, because the stream wants it at init: SCK
            holds the delegate weakly, so it is also retained for the lifetime of
@@ -933,8 +910,7 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
         }
         c->sample_queue = sq;   /* prevent ARC release after scope exit */
 
-        /* Audio gets its own queue: a shared serial queue would serialise
-         * every audio buffer behind a full-frame BGRA memcpy at 30 fps. */
+        /* Audio gets its own queue so video delivery cannot delay samples. */
         dispatch_queue_t aq = dispatch_queue_create(
             "screencast.sck.audio", DISPATCH_QUEUE_SERIAL);
         if (!aq) {
@@ -987,10 +963,11 @@ SckCapture *sck_capture_open(SckCaptureInfo *info)
 
         /* ── populate info ── */
         if (info) {
-            info->width   = c->width;
-            info->height  = c->height;
-            info->scale   = c->scale;
-            info->pix_fmt = AV_PIX_FMT_BGRA;
+            info->width      = c->width;
+            info->height     = c->height;
+            info->display_id = (unsigned int)display.displayID;
+            info->scale      = c->scale;
+            info->pix_fmt = AV_PIX_FMT_NV12;
             if (c->audio_sample_rate > 0) {
                 info->sample_rate = c->audio_sample_rate;
                 info->channels    = c->audio_channels;
@@ -1169,6 +1146,14 @@ void sck_capture_close(SckCapture *c)
         CFBridgingRelease(c->stream);
         c->stream = NULL;
     }
+
+    /* stopCapture's completion means no new samples will be scheduled.  Drain
+       both serial delivery queues before releasing their delegate and the C
+       state that callbacks reference. */
+    if (c->sample_queue)
+        dispatch_sync(c->sample_queue, ^{});
+    if (c->audio_queue)
+        dispatch_sync(c->audio_queue, ^{});
 
     if (c->helper) {
         CFBridgingRelease(c->helper);

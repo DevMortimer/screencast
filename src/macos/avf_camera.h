@@ -10,7 +10,8 @@
  *
  * Replaces the Linux PipeWire pwcam.c with the same callback-based delivery
  * pattern.  Uses AVCaptureSession + AVCaptureVideoDataOutput under the hood.
- * Frames are delivered on a background dispatch queue.
+ * Frames are delivered on a background dispatch queue.  The same capture
+ * session can also drive the borderless presenter window.
  *
  * The header is pure C — callers need not know about Objective-C or Apple
  * frameworks.
@@ -43,13 +44,10 @@ typedef void (*AvfCameraFrameFn)(void *user, void *pixbuf, int64_t pts_us);
 void avf_camera_release_frame(void *pixbuf);
 
 /*
- * Open the default (or specified) camera and start capture, at the smallest
- * stream the device offers.
- *
- * There is no size to ask for because there is nothing to size.  The camera
- * is held open so macOS offers Presenter Overlay for this app; the system
- * renders the presenter from the device itself, and the frames delivered here
- * are discarded.
+ * Open the default (or specified) camera and start a 720p capture session.
+ * The frame callback stays available for capture-pipeline users; presenter
+ * mode releases those frames because AVCaptureVideoPreviewLayer displays the
+ * same session without a CPU copy.
  *
  * target selects a specific camera: a device UID, name substring, or
  * NULL / "" / "auto" for the system default.
@@ -61,6 +59,21 @@ void avf_camera_release_frame(void *pixbuf);
  */
 AvfCamera *avf_camera_open(const char *target, AvfCameraInfo *info,
                            AvfCameraFrameFn on_frame, void *user);
+
+/*
+ * Show the camera as a borderless, resizable window on `display_id`.
+ *
+ * The window fills edge to edge with the camera, floats above normal windows,
+ * and snaps to the nearest corner of the display's usable area after a drag. Its
+ * corner and size persist between presenter sessions.  Because the active
+ * ScreenCaptureKit filter records the complete display, this window is also
+ * the camera overlay in the finished recording.
+ *
+ * Must be called on the main thread after avf_camera_open().  Returns 0 on
+ * success or -1 when the window cannot be created.  avf_camera_close() hides
+ * and releases it.
+ */
+int avf_camera_show_overlay(AvfCamera *cam, unsigned int display_id);
 
 /*
  * Anchor the session timeline and discard everything captured before it.

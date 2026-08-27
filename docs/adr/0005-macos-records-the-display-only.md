@@ -2,7 +2,7 @@
 
 ## Status
 
-accepted
+superseded by [0008](0008-presenter-is-a-captured-camera-window.md)
 
 Supersedes parts of [0003](0003-cross-platform-macos-support.md): the webcam
 row of its backend table, its mode-switching UX, and its reasoning that the

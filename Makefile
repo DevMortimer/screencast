@@ -21,7 +21,7 @@ SHARED_SRCS := $(SRCDIR)/control.c $(SRCDIR)/encoder.c $(SRCDIR)/composite.c $(S
 ifeq ($(PLATFORM),macos)
     PLATFORM_SRCS := $(SRCDIR)/macos/main.c
     OBJC_SRCS     := $(SRCDIR)/macos/sck_capture.m $(SRCDIR)/macos/avf_camera.m \
-                     $(SRCDIR)/macos/avf_mic.m
+                     $(SRCDIR)/macos/avf_mic.m $(SRCDIR)/macos/status_menu.m
     SRCS          := $(SHARED_SRCS) $(PLATFORM_SRCS) $(OBJC_SRCS)
 else
     PLATFORM_SRCS := $(SRCDIR)/linux/main.c $(SRCDIR)/linux/wlcap.c \
@@ -106,9 +106,8 @@ $(OBJDIR)/macos/%.o: $(SRCDIR)/macos/%.m | $(OBJDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # ── macOS app bundle ────────────────────────────────────────
-# Presenter Overlay is offered in Control Center's Video Effects panel, which
-# only lists camera clients macOS can attribute to an app.  The bundle gives
-# the recorder that identity; main.c hands `screencast presenter` off to it.
+# Presenter mode owns a borderless AppKit camera window.  The bundle gives the
+# UI and its TCC permissions one stable identity; main.c hands presenter to it.
 # Ad-hoc signed by default (CODESIGN_ID=-), which means TCC re-asks for
 # permissions after a rebuild — an ad-hoc seal names the exact build.  Pass
 # CODESIGN_ID=<identity> to sign with a stable certificate instead.
@@ -168,6 +167,8 @@ ENCODER_TEST_PKGS := libavformat libavcodec libswscale libswresample libavutil
 # h264_videotoolbox accepts CVPixelBuffers by reference, both from libav's own
 # hardware pool and wrapped from an external source.  Links nothing from src/.
 PROBE_BIN := $(OBJDIR)/vt_hwframe_probe
+APPKIT_EVENT_TEST_BIN := $(OBJDIR)/test_appkit_event_pump
+OVERLAY_GEOMETRY_TEST_BIN := $(OBJDIR)/test_overlay_geometry
 
 probe: | $(OBJDIR)
 ifeq ($(PLATFORM),macos)
@@ -200,13 +201,29 @@ test-encoder: | $(OBJDIR)
 	    $(if $(filter macos,$(PLATFORM)),-framework CoreVideo -framework CoreFoundation)
 	$(ENCODER_TEST_BIN)
 
+test-overlay-geometry: | $(OBJDIR)
+	$(CC) -Isrc/macos -O2 -Wall -Wextra -std=c11 \
+	    -o $(OVERLAY_GEOMETRY_TEST_BIN) tests/test_overlay_geometry.c -lm
+	$(OVERLAY_GEOMETRY_TEST_BIN)
+
+test-appkit-events: | $(OBJDIR)
+ifeq ($(PLATFORM),macos)
+	$(CC) $(CFLAGS) -fobjc-arc -o $(APPKIT_EVENT_TEST_BIN) \
+	    tests/test_appkit_event_pump.m $(OBJDIR)/macos/sck_capture.o \
+	    $(LDFLAGS)
+	$(APPKIT_EVENT_TEST_BIN)
+else
+	@echo "appkit event pump test is macOS only"
+endif
+
 ifneq ($(PLATFORM),macos)
-test: test-mixer test-audsrc test-encoder | $(OBJDIR)
+test: test-mixer test-audsrc test-encoder test-overlay-geometry | $(OBJDIR)
 	$(CC) -Isrc -Isrc/linux -pthread -O2 -Wall -Wextra -std=c11 \
 	    -o $(TEST_BIN) $(TEST_SRCS)
 	$(TEST_BIN)
 else
-test: test-mixer test-audsrc test-encoder
+test: test-mixer test-audsrc test-encoder test-overlay-geometry test-appkit-events
 endif
 
-.PHONY: all clean test test-mixer test-audsrc test-encoder probe
+.PHONY: all clean test test-mixer test-audsrc test-encoder \
+          test-overlay-geometry test-appkit-events probe

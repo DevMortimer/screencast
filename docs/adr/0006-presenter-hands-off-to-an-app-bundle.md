@@ -2,7 +2,7 @@
 
 ## Status
 
-accepted
+superseded in part by [0008](0008-presenter-is-a-captured-camera-window.md)
 
 Extends [0005](0005-macos-records-the-display-only.md): the presenter is the
 system's Presenter Overlay, and this records how the overlay is made reachable

@@ -219,8 +219,9 @@ static int setup_video(EncoderCtx *enc, int w, int h, int fps)
         enc->vid_enc->pix_fmt       = AV_PIX_FMT_VIDEOTOOLBOX;
         enc->vid_enc->hw_frames_ctx = av_buffer_ref(enc->hw_frames);
     } else {
-        fprintf(stderr, "encoder: hardware frames unavailable — "
-                        "falling back to software frames\n");
+        fprintf(stderr, "encoder: VideoToolbox hardware frames unavailable; "
+                        "macOS capture cannot start\n");
+        return AVERROR(ENOSYS);
     }
 #endif
     enc->vid_enc->gop_size     = fps * 2;

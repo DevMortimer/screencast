@@ -104,24 +104,15 @@ int control_parse_mode(const char *cmd)
     if (!strcmp(cmd, "display") || !strcmp(cmd, "d")) return MODE_DISPLAY;
 
 #ifdef __APPLE__
-    /*
-     * macOS records the display and nothing else.  The webcam is Control
-     * Center's Presenter Overlay, which ScreenCaptureKit composites into the
-     * capture itself, so there is no mode here to switch into.
-     *
-     * Say that rather than quietly accepting the word and doing nothing: this
-     * message is the only place the webcam went that a reader will find.  The
-     * platform's whole command vocabulary is defined in this function, which
-     * is where someone looking for the divergence would come.
-     */
+    /* macOS keeps one display-recording mode.  `presenter` is a start-time
+       choice that adds a camera window; it is not switchable through the
+       running daemon's mode socket. */
     if (!strcmp(cmd, "webcam") || !strcmp(cmd, "w") ||
         !strcmp(cmd, "both")   || !strcmp(cmd, "b")) {
         fprintf(stderr,
-                "screencast: '%s' is Linux-only.  On macOS the webcam is "
-                "Presenter Overlay —\n"
-                "            turn it on from the Video Effects menu in "
-                "Control Center while\n"
-                "            a recording is running.\n", cmd);
+                "screencast: '%s' is Linux-only.  On macOS, stop and run\n"
+                "            `screencast presenter` for the camera overlay.\n",
+                cmd);
         return -1;
     }
 #else

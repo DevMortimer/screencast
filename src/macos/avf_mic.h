@@ -14,9 +14,9 @@ typedef struct {
     enum AVSampleFormat sample_fmt;
 } AvfMicInfo;
 
-// Opens the default microphone. Populates info.
-// Returns NULL on failure (no mic, permission denied).
-AvfMic *avf_mic_open(AvfMicInfo *info);
+/* Opens the selected microphone, or the system default when target is NULL or
+ * empty. `target` may be an AVCaptureDevice unique ID or name substring. */
+AvfMic *avf_mic_open(const char *target, AvfMicInfo *info);
 
 // Anchors the session timeline and drops everything captured before it.
 // The microphone is opened during recording setup and starts delivering

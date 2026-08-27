@@ -356,11 +356,26 @@ static int asbd_to_avfmt(const AudioStreamBasicDescription *asbd,
 
 /* ── public API ────────────────────────────────────────────── */
 
-AvfMic *avf_mic_open(AvfMicInfo *info)
+static AVCaptureDevice *find_microphone(const char *target)
+{
+    NSArray *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeAudio];
+    if (!target || !target[0] || !strcmp(target, "auto"))
+        return [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+
+    NSString *needle = [NSString stringWithUTF8String:target];
+    for (AVCaptureDevice *device in devices) {
+        if ([device.uniqueID isEqualToString:needle] ||
+            [device.localizedName rangeOfString:needle
+                options:NSCaseInsensitiveSearch].location != NSNotFound)
+            return device;
+    }
+    return [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+}
+
+AvfMic *avf_mic_open(const char *target, AvfMicInfo *info)
 {
     /* ---- check mic availability ---- */
-    AVCaptureDevice *device =
-        [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+    AVCaptureDevice *device = find_microphone(target);
     if (!device) {
         fprintf(stderr, "avf_mic: no default microphone found\n");
         return NULL;

@@ -23,6 +23,7 @@
 #include "sck_capture.h"
 #include "avf_camera.h"
 #include "avf_mic.h"
+#include "status_menu.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreVideo/CoreVideo.h>
 
@@ -30,11 +31,11 @@
 
 /* Frame rate comes from SCREENCAST_FPS via sck_capture_fps() — capture and
    encoder must agree, so there is one source. */
-#define WEBCAM_DEV  "auto"
+#define DEVICE_TARGET_CAP 512
 
 /* ── shared state ──────────────────────────────────────────── */
 
-/* Set from the command line: open the camera so Presenter Overlay is offered. */
+/* Set from the command line: show the local camera overlay. */
 static int s_want_camera;
 
 /* Set from the command line: leave desktop audio out of the mix. */
@@ -47,8 +48,7 @@ static atomic_int s_rec_open = 0;
 
 typedef struct {
     SckCapture *sck;           /* screen + desktop audio */
-    AvfCamera  *avf_cam;       /* held open only to make Presenter Overlay
-                                  available; its frames are never read */
+    AvfCamera  *avf_cam;       /* camera + borderless presenter window */
     AvfMic     *avf_mic;       /* microphone */
     EncoderCtx *enc;
     MixerCtx  *mixer;          /* mixes mic + desktop into one track */
@@ -92,19 +92,9 @@ static void make_output_path(char *buf, size_t n)
 
 /* ── webcam frame callback (AVFoundation delivery queue) ───── */
 
-/*
- * Nothing here reads the camera.
- *
- * The device is opened so that macOS offers Presenter Overlay for this stream
- * — ScreenCaptureKit makes the effect available to an app that is capturing
- * the screen and using the camera at the same time — and once the overlay is
- * on, the system takes the camera and composites the presenter into the SCK
- * frames we already receive.  AVFoundation stops delivering a live camera
- * stream at that point anyway.
- *
- * So every frame that does arrive is released immediately.  Compositing an
- * overlay ourselves is what this replaced.
- */
+/* The presenter window displays the AVCaptureSession directly.  The data
+ * output remains only as the camera module's format/health seam, so release
+ * each callback buffer immediately. */
 static void cam_frame_cb(void *user, void *pixbuf, int64_t pts_us)
 {
     (void)user; (void)pts_us;
@@ -203,57 +193,52 @@ static int recording_open(void)
     }
     s_rec.canvas_w = sck_info.width;
     s_rec.canvas_h = sck_info.height;
-    s_rec.has_desktop = (sck_info.sample_rate > 0 && sck_info.channels > 0);
+    s_rec.has_desktop = (sck_info.sample_rate > 0 && sck_info.channels > 0 &&
+                          status_menu_desktop_audio_enabled());
     if (s_mute_desktop) {
         s_rec.has_desktop = 0;
         printf("[REC] Desktop audio muted by request.\n");
     }
 
     printf("[REC] Output: %s\n", s_rec.output_path);
-    printf("[REC] Capture: %dx%d BGRA\n", s_rec.canvas_w, s_rec.canvas_h);
+    printf("[REC] Capture: %dx%d NV12\n", s_rec.canvas_w, s_rec.canvas_h);
 
-    /*
-     * Open the camera, and read nothing from it.
-     *
-     * Its only job is to make this app a camera client while an SCK stream is
-     * running, which is the condition macOS attaches Presenter Overlay to.
-     * With that satisfied the overlay appears in the Video Effects menu, and
-     * turning it on has ScreenCaptureKit composite the presenter into the
-     * frames this process already receives.
-     *
-     * At the smallest format the device offers, because nothing here looks at
-     * a single one of those pixels — the system takes the camera when the
-     * overlay engages and renders the presenter from it directly.  Asking for
-     * 1080p would light up the ISP for the length of the recording to fill a
-     * buffer that goes straight in the bin.
-     *
-     * Only when asked for.  Most recordings are a screen and a voice, and an
-     * open camera on those costs power and holds the camera indicator on for
-     * a feature that was never going to be used.
-     *
-     * A camera we cannot open is not a failure: it costs the overlay, not the
-     * recording.
-     */
+    /* Presenter is the only command that opens the camera.  Its preview window
+       is captured as part of the display: edge-to-edge video, no title bar,
+       no border and no shadow.  A missing camera costs the overlay, not the
+       recording. */
     if (s_want_camera) {
+        char camera_target[DEVICE_TARGET_CAP];
+        status_menu_camera_target(camera_target, sizeof(camera_target));
         AvfCameraInfo cam_info;
-        s_rec.avf_cam = avf_camera_open(WEBCAM_DEV, &cam_info,
+        s_rec.avf_cam = avf_camera_open(camera_target[0] ? camera_target : NULL,
+                                        &cam_info,
                                         cam_frame_cb, NULL);
         if (s_rec.avf_cam) {
-            printf("[REC] Camera held open for Presenter Overlay (%dx%d %s)\n",
+            printf("[REC] Camera: %dx%d %s\n",
                    cam_info.width, cam_info.height,
                    av_get_pix_fmt_name(cam_info.pix_fmt));
-            printf("[REC] Turn the overlay on from Control Center > "
-                   "Video Effects.\n");
+            if (avf_camera_show_overlay(s_rec.avf_cam,
+                                        sck_info.display_id) == 0) {
+                printf("[REC] Presenter window ready — drag it to any corner; "
+                       "resize from an edge or corner.\n");
+            } else {
+                fprintf(stderr, "main: camera opened, but presenter window "
+                                "could not be shown\n");
+            }
         } else {
             fprintf(stderr, "main: camera unavailable — recording the display "
-                            "without Presenter Overlay\n");
+                            "without the presenter window\n");
         }
     }
 
     /* Open microphone */
     s_rec.has_mic = 0;
+    char microphone_target[DEVICE_TARGET_CAP];
+    status_menu_microphone_target(microphone_target, sizeof(microphone_target));
     AvfMicInfo mic_info;
-    s_rec.avf_mic = avf_mic_open(&mic_info);
+    s_rec.avf_mic = avf_mic_open(microphone_target[0] ? microphone_target : NULL,
+                                 &mic_info);
     if (s_rec.avf_mic) {
         s_rec.has_mic = 1;
         printf("[REC] Microphone: %d Hz, %d channel%s, %s\n",
@@ -288,15 +273,22 @@ static int recording_open(void)
 
     s_rec.enc = encoder_open(s_rec.output_path,
                      s_rec.canvas_w, s_rec.canvas_h, sck_capture_fps(),
-                     AV_PIX_FMT_BGRA,  /* SCK delivers BGRA */
+                     sck_info.pix_fmt, /* SCK delivers NV12 CVPixelBuffers */
                      audio_sr, audio_ch, audio_fmt);
     if (s_rec.has_aud) av_channel_layout_uninit(&mix_ch);
 
     if (!s_rec.enc) {
         fprintf(stderr, "main: encoder open failed\n");
-        if (s_rec.avf_mic) avf_mic_close(s_rec.avf_mic);
-        if (s_rec.avf_cam) avf_camera_close(s_rec.avf_cam);
+        if (s_rec.avf_mic) {
+            avf_mic_close(s_rec.avf_mic);
+            s_rec.avf_mic = NULL;
+        }
+        if (s_rec.avf_cam) {
+            avf_camera_close(s_rec.avf_cam);
+            s_rec.avf_cam = NULL;
+        }
         sck_capture_close(s_rec.sck);
+        s_rec.sck = NULL;
         return -1;
     }
 
@@ -363,19 +355,9 @@ static void recording_loop(void)
     if (s_rec.has_desktop && s_rec.mixer)
         pthread_create(&desk_tid, NULL, worker_thread, &desk_worker);
 
-    /*
-     * The screen clocks the output, and nothing else does.
-     *
-     * ScreenCaptureKit stops delivering while the picture is static, so a still
-     * display encodes nothing at all and variable frame rate carries the image
-     * for as long as it lasts.  That is the cheapest a screen recording gets.
-     *
-     * It holds now because the presenter is no longer ours to draw.  When
-     * Presenter Overlay is on, the frames arriving here already have the
-     * presenter composited into them by the system, and they keep arriving
-     * because the presenter is moving even when the screen is not — the cost
-     * of the overlay is paid only while it is switched on.
-     */
+    /* The screen clocks the output.  The presenter is an ordinary floating
+       window in that screen capture, so its motion also causes SCK to deliver
+       frames; there is still no second video clock or compositor here. */
     int64_t last_emit_pts = INT64_MIN;   /* keeps output PTS strictly rising */
 
     while (atomic_load(&g_running) && atomic_load(&g_recording)) {
@@ -399,11 +381,6 @@ static void recording_loop(void)
         int64_t pts = -1;
         void *screen = sck_capture_grab_video(s_rec.sck, &pts);
         if (!screen) {
-            /*
-             * Pump the AppKit run loop while waiting for the next frame so
-             * the system can communicate Presenter Overlay state changes.
-             */
-            sck_pump_run_loop();
             if (!atomic_load(&g_running) || !atomic_load(&g_recording))
                 break;
             continue;
@@ -447,6 +424,13 @@ static void recording_loop(void)
     atomic_store(&s_rec_open, 0);
     if (mic_tid)  pthread_join(mic_tid, NULL);
     if (desk_tid) pthread_join(desk_tid, NULL);
+}
+
+static void *recording_thread(void *unused)
+{
+    (void)unused;
+    recording_loop();
+    return NULL;
 }
 
 /* ── close / flush one recording session ───────────────────── */
@@ -507,10 +491,9 @@ static void usage(const char *argv0)
         "usage: %s [presenter|stop] [mute]\n"
         "\n"
         "  (no argument)  record the display + audio (mic + desktop)\n"
-        "  presenter      the same, but hold the camera open so macOS offers\n"
-        "                 Presenter Overlay in Control Center > Video Effects.\n"
-        "                 Turning it on there composites you into the capture;\n"
-        "                 you can switch it on and off as often as you like.\n"
+        "  presenter      add a borderless camera window to that recording.\n"
+        "                 Drag it while recording to snap it to any corner;\n"
+        "                 resize it from any edge or corner.\n"
         "  mute           leave desktop audio out of the mix (mic only)\n"
         "  stop           stop the running recorder\n"
         "\n"
@@ -523,9 +506,8 @@ static void usage(const char *argv0)
 
 /* ── app-bundle handoff ────────────────────────────────────── */
 
-/* A bare executable's main bundle has no identifier; only a real .app with
-   an Info.plist does.  That identity is what Control Center attributes the
-   camera stream to. */
+/* A bare executable's main bundle has no identifier.  Presenter uses the app
+   bundle so AppKit, TCC, and every launcher agree on one UI process. */
 static int running_in_bundle(void)
 {
     CFBundleRef b = CFBundleGetMainBundle();
@@ -580,7 +562,7 @@ int main(int argc, char **argv)
      * `screencast presenter mute`); whatever else is on the line is the
      * command itself.
      */
-    const char *arg = "display";
+    const char *arg = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "mute"))
             s_mute_desktop = 1;
@@ -588,66 +570,49 @@ int main(int argc, char **argv)
             arg = argv[i];
     }
 
-    /*
-     * `presenter` is a start-time choice, not a mode.
-     *
-     * It records exactly what a plain invocation records; the difference is
-     * that it opens the camera, which is what makes macOS offer Presenter
-     * Overlay for this stream.  There is nothing to switch mid-recording —
-     * whether you actually appear is decided in Control Center, at any point,
-     * as often as you like.
-     */
-    int want_camera = !strcmp(arg, "presenter");
-    const char *cmd = want_camera ? "display" : arg;
-
-    /* If a daemon is already running, this invocation is just a controller. */
-    if (control_client_send(cmd) == 0) {
-        if (want_camera)
-            fprintf(stderr, "screencast: already recording, and the camera is "
-                            "opened at start — stop\n"
-                            "            and run `screencast presenter` to "
-                            "record with the overlay available.\n");
+    /* A running daemon always receives the explicit CLI command semantics:
+       a plain invocation is the display controller, while presenter asks the
+       user to restart in presenter mode.  Preferences only affect a new start. */
+    const char *control_cmd = arg ? arg : "display";
+    const char *existing_cmd = (arg && !strcmp(arg, "presenter"))
+        ? "display" : control_cmd;
+    if (control_client_send(existing_cmd) == 0) {
+        if (arg && !strcmp(arg, "presenter"))
+            fprintf(stderr, "screencast: already recording — stop and run\n"
+                            "            `screencast presenter` to start with "
+                            "the camera window.\n");
         if (s_mute_desktop)
             fprintf(stderr, "screencast: already recording — `mute` applies "
                             "when a recording starts, not mid-recording.\n");
         return 0;
     }
 
-    /* No daemon running. */
-    if (control_is_stop(cmd))
+    /* No daemon running.  A mode selected in the status menu is the default
+       for a bare `screencast`; an explicit CLI mode always wins. */
+    if (control_is_stop(control_cmd))
         return 0; /* nothing to stop */
-
+    int want_camera = arg ? !strcmp(arg, "presenter")
+                          : status_menu_preferred_presenter();
+    const char *cmd = want_camera ? "display" : control_cmd;
     int mode = control_parse_mode(cmd);
     if (mode < 0) {
         usage(argv[0]);
         return 1;
     }
 
-    /*
-     * Presenter Overlay lives in Control Center's Video Effects panel, and
-     * that panel only lists camera clients macOS can attribute to an app.
-     * Attribution follows the responsible process: launched from Terminal
-     * that is Terminal.app and the panel appears under Terminal's name, but
-     * launched from skhd or a zellij server there is no app anywhere on the
-     * chain — the camera runs, its indicator lights, and the overlay is
-     * unreachable.  No in-process AppKit setup changes who macOS says owns
-     * the camera, which is why bootstrapping NSApplication here never fixed
-     * it.
-     *
-     * So when the overlay is wanted and this process has no app identity of
-     * its own, hand the recording to the installed bundle and exit.  Every
-     * launcher converges on the same identity: Screencast.app.
-     */
+    /* The presenter is real AppKit UI.  Hand it to the installed accessory
+       bundle so Terminal, skhd, and zellij all start the same identified UI
+       process with stable camera and screen-recording permissions. */
     if (want_camera && !running_in_bundle()) {
         if (relaunch_as_bundle() == 0) {
-            fprintf(stderr, "screencast: handing off to Screencast.app so "
-                            "Presenter Overlay is offered "
+            fprintf(stderr, "screencast: handing off to Screencast.app for "
+                            "the presenter window "
                             "(log: ~/Library/Logs/screencast.log)\n");
             return 0;
         }
         fprintf(stderr, "screencast: Screencast.app not installed (run `make "
-                        "install`) — recording here; Control Center may not "
-                        "offer Presenter Overlay\n");
+                        "install`) — trying the presenter window in this "
+                        "process\n");
     }
 
     if (running_in_bundle())
@@ -659,6 +624,8 @@ int main(int argc, char **argv)
      * or AVFoundation see it.
      */
     sck_bootstrap_app();
+    status_menu_start();
+    status_menu_set_recording(0, want_camera);
 
     signal(SIGINT,  sig_stop);
     signal(SIGTERM, sig_stop);
@@ -673,25 +640,38 @@ int main(int argc, char **argv)
     if (control_server_start() < 0)
         return 1;
 
-    control_notify("Screencast recording", control_mode_label(mode));
+    control_notify("Screencast recording",
+                   want_camera ? "Display + camera + mic" : control_mode_label(mode));
 
     while (atomic_load(&g_running)) {
         if (atomic_load(&g_recording)) {
             if (recording_open() == 0) {
+                status_menu_set_recording(1, s_want_camera);
                 printf("[REC] Recording.\n");
-                recording_loop();
+
+                /* Encoding runs off the main thread.  AppKit keeps the main
+                   thread so dragging and resizing remain fluid while frames
+                   and audio are being recorded. */
+                pthread_t record_tid;
+                if (pthread_create(&record_tid, NULL,
+                                   recording_thread, NULL) == 0) {
+                    while (atomic_load(&s_rec_open))
+                        sck_pump_run_loop();
+                    pthread_join(record_tid, NULL);
+                } else {
+                    fprintf(stderr, "main: could not start recording worker — "
+                                    "presenter interaction may be delayed\n");
+                    recording_loop();
+                }
             } else {
                 /* Capture could not start — don't spin re-opening it. */
                 atomic_store(&g_recording, 0);
                 atomic_store(&g_running, 0);
             }
             recording_close();
+            status_menu_set_recording(0, s_want_camera);
         } else {
-            /*
-             * Pump the AppKit run loop instead of sleeping so the system
-             * can communicate state changes — especially Presenter Overlay
-             * availability — even while no recording is active.
-             */
+            /* Keep accessory-app events responsive between sessions. */
             sck_pump_run_loop();
         }
     }
@@ -703,6 +683,7 @@ int main(int argc, char **argv)
     }
 
     control_notify("Screencast stopped", NULL);
+    status_menu_stop();
     control_server_stop();
     printf("[INFO] Exited cleanly.\n");
     return 0;
