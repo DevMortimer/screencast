@@ -22,6 +22,7 @@
 #include "mixer.h"
 #include "audsrc.h"
 #include "arbiter.h"
+#include "presenter.h"
 
 /* ── configuration ─────────────────────────────────────────── */
 
@@ -96,6 +97,7 @@ static int recording_interrupted(void *opaque)
 typedef struct {
     CaptureCtx screen_cap;
     PwCam     *pwcam;      /* webcam via PipeWire; NULL when the node is not held */
+    Presenter *presenter;  /* live layer-shell camera window; presenter mode only */
     CaptureCtx mic_cap;    /* microphone (default source) */
     CaptureCtx desk_cap;   /* desktop audio (default sink's monitor) */
     EncoderCtx *enc;
@@ -104,6 +106,7 @@ typedef struct {
     int cam_w, cam_h;
     enum AVPixelFormat cam_fmt; /* webcam frame format negotiated by PipeWire */
     int has_cam;           /* 1 while the camera node is held (pwcam != NULL) */
+    int presenter_failed;  /* do not retry a missing layer-shell every frame */
     int has_mic;
     int has_desktop;
     int has_aud;           /* has_mic || has_desktop */
@@ -353,6 +356,7 @@ static void cam_frame_cb(void *user, AVFrame *frame)
     if (s_cam_latest) av_frame_free(&s_cam_latest);
     s_cam_latest = frame;
     atomic_fetch_add(&s_cam_seq, 1);
+    if (s_rec.presenter) presenter_submit(s_rec.presenter, frame);
     pthread_mutex_unlock(&s_cam_mutex);
 }
 
@@ -392,13 +396,27 @@ static Availability cam_acquire(void)
 /* Release the camera node (handing it back to any meeting) and drop any frame
  * still buffered, so a stale frame cannot be composited after a later re-open.
  * Idempotent. */
+static void presenter_release(void)
+{
+    pthread_mutex_lock(&s_cam_mutex);
+    Presenter *presenter = s_rec.presenter;
+    s_rec.presenter = NULL;
+    pthread_mutex_unlock(&s_cam_mutex);
+    presenter_close(presenter);
+}
+
 static void cam_release(void)
 {
-    if (!s_rec.pwcam) return;
+    if (!s_rec.pwcam) {
+        presenter_release();
+        return;
+    }
     /* Stop the PipeWire thread first so no late cam_frame_cb races the free. */
     pwcam_close(s_rec.pwcam);
     s_rec.pwcam   = NULL;
     s_rec.has_cam = 0;
+    presenter_release();
+    s_rec.presenter_failed = 0;
     pthread_mutex_lock(&s_cam_mutex);
     if (s_cam_latest) av_frame_free(&s_cam_latest);
     s_cam_latest = NULL;
@@ -439,7 +457,26 @@ static Availability webcam_verdict(RecordMode requested, int64_t now)
  */
 static void apply_plan(const ArbiterPlan *p)
 {
-    if (p->active.webcam) {
+    RecordMode requested = atomic_load(&g_mode);
+    if (p->active.webcam && requested == MODE_PRESENTER) {
+        /* The layer surface is part of display capture, so the encoder must not
+           composite the same webcam a second time. */
+        encoder_clear_webcam(s_rec.enc);
+        if (!s_rec.presenter && !s_rec.presenter_failed) {
+            Presenter *presenter = presenter_open(screen_output());
+            if (presenter) {
+                pthread_mutex_lock(&s_cam_mutex);
+                s_rec.presenter = presenter;
+                pthread_mutex_unlock(&s_cam_mutex);
+            } else {
+                s_rec.presenter_failed = 1;
+                control_notify("Screencast presenter unavailable",
+                               "The compositor did not provide a presenter window");
+            }
+        }
+    } else if (p->active.webcam) {
+        presenter_release();
+        s_rec.presenter_failed = 0;
         if (encoder_set_webcam(s_rec.enc,
                                s_rec.cam_w, s_rec.cam_h, s_rec.cam_fmt) < 0) {
             /* Could not build the compositing chain — hand the node back so the
@@ -541,6 +578,8 @@ static int recording_open(void)
     arbiter_init(&s_rec.arb);
     s_rec.has_cam        = 0;
     s_rec.pwcam          = NULL;
+    s_rec.presenter      = NULL;
+    s_rec.presenter_failed = 0;
     s_rec.cam_w          = 0;
     s_rec.cam_h          = 0;
     s_rec.cam_fmt        = AV_PIX_FMT_NONE;
@@ -785,11 +824,12 @@ static void sig_stop(int sig)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "usage: %s <display|webcam|both|stop> [mute]\n"
+        "usage: %s <display|webcam|both|presenter|stop> [mute]\n"
         "\n"
         "  display   record the screen + audio (mic + desktop)\n"
         "  webcam    record the webcam + audio (mic + desktop)\n"
-        "  both      record screen + webcam overlay + audio (mic + desktop)\n"
+        "  both      record screen + encoded webcam overlay + audio\n"
+        "  presenter record screen + live movable webcam window + audio\n"
         "  mute      leave desktop audio out of the mix (mic only)\n"
         "  stop      stop the running recorder and render the final file\n"
         "\n"

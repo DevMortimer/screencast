@@ -5,11 +5,11 @@ optional webcam and audio) and renders an MP4. Runs on Linux (wlroots Wayland
 compositors) and macOS. This glossary pins down the capture, audio and timing
 vocabulary so the code and docs agree.
 
-Where a term is platform-specific it says so, and several are: Linux composites
-a webcam into the picture itself and has modes for it, while macOS records the
-display and leaves the presenter to the system. The two platforms deliberately
-share the encoder, the mixer, and the timing vocabulary below; they share
-nothing else.
+Where a term is platform-specific it says so, and several are: Linux can
+composite a webcam into the picture or expose it as a captured layer-shell
+window, while macOS exposes it as a captured AppKit window. The two platforms
+deliberately share the encoder, the mixer, and the timing vocabulary below;
+they share nothing else.
 
 ## Language
 
@@ -23,31 +23,30 @@ _Avoid_: screen grab, output capture
 
 **Webcam** (Linux):
 The user's camera video, captured as a PipeWire client. Distinct from display
-capture; overlaid on the display in `both` mode. macOS has no equivalent term:
-there the camera reaches a recording only as a presenter overlay, which this
-project does not capture, composite, or position.
+capture; composited by the encoder in `both` mode or rendered in the presenter
+window in `presenter` mode. macOS uses an AVFoundation camera session instead.
 _Avoid_: camera video, cam, facecam
 
 **Mode** (Linux):
-What the recording currently shows: `display`, `webcam`, or `both`. Switchable
-mid-recording over the control socket, which is why the output stream's
-dimensions and the overlay geometry are fixed for a whole session — they cannot
-change under a running encoder. macOS records the display and has no modes.
+What the recording currently shows: `display`, `webcam`, `both`, or
+`presenter`. Switchable mid-recording over the control socket, which is why the
+output stream's dimensions and the encoded overlay geometry are fixed for a
+whole session — they cannot change under a running encoder. macOS records the
+display and has no modes.
 _Avoid_: layout, view, scene
 
-**Presenter overlay** (macOS):
-The system feature that segments the user from their background and composites
-them into a ScreenCaptureKit stream. Offered by macOS — in Control Center,
-while an app is capturing the screen and using the camera at once — and
-rendered by macOS, so a recording either arrives with the presenter already in
-it or does not. Nothing here decides its size, position, or whether it is on.
-_Avoid_: webcam overlay, facecam, picture-in-picture
+**Presenter window**:
+A live, borderless webcam surface that display capture records as part of the
+screen. On Linux it is an overlay-layer `wlr-layer-shell` surface; on macOS it
+is an AppKit window. It stays above normal windows, has four permitted corner
+anchors, and supports proportional resize. It is distinct from Linux `both`,
+where the encoder adds a webcam overlay that the user cannot see or move.
+_Avoid_: encoded webcam overlay, facecam, picture-in-picture
 
 **Camera client**:
-An app holding a capture device open. On macOS this is the whole reason the
-camera is opened at all: the presenter overlay is offered only to an app that
-is a camera client and a screen capturer simultaneously. The frames it
-delivers are discarded.
+An app holding a capture device open. On Linux the PipeWire client supplies
+frames to the encoder or presenter window. On macOS the AppKit presenter uses
+the AVFoundation preview layer directly, so callback frames are discarded.
 _Avoid_: camera user, capture session
 
 **Points and pixels** (macOS):

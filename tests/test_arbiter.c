@@ -78,6 +78,15 @@ static void test_webcam_available_engages(void)
     CHECK(p.effective == MODE_BOTH, "both available: effective both");
     CHECK(p.active.webcam == 1, "both available: webcam active");
     CHECK(p.notes == 0, "both available: no notification (common case)");
+
+    /* Presenter keeps display capture as the encoder input.  The visible
+       camera surface is captured by wlr-screencopy exactly once. */
+    arbiter_init(&s);
+    p = arbiter_step(&s, MODE_PRESENTER, all_ok());
+    CHECK(p.effective == MODE_DISPLAY,
+          "presenter available: encoder records display");
+    CHECK(p.active.webcam == 1, "presenter available: webcam active");
+    CHECK(p.notes == 0, "presenter available: no notification");
 }
 
 /* ── webcam / both with the camera busy decline gracefully (US4,5,6,7,12) ── */
@@ -237,6 +246,8 @@ static void test_wants_webcam(void)
     CHECK(arbiter_wants_webcam(MODE_DISPLAY) == 0, "display does not want webcam");
     CHECK(arbiter_wants_webcam(MODE_WEBCAM) == 1, "webcam wants webcam");
     CHECK(arbiter_wants_webcam(MODE_BOTH) == 1, "both wants webcam");
+    CHECK(arbiter_wants_webcam(MODE_PRESENTER) == 1,
+          "presenter wants webcam");
     CHECK(arbiter_wants_webcam(MODE_IDLE) == 0, "idle does not want webcam");
 }
 

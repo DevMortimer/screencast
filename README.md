@@ -9,15 +9,19 @@ implement `wlr-screencopy-unstable-v1`.
 
 **Platforms:** Linux (wlroots Wayland) | macOS 13+
 
-The two platforms expose the camera differently. Linux composites webcam
-frames in its video pipeline and has switchable modes; macOS captures a live,
-movable camera window in `presenter` recordings. The features below describe
-the Linux build — see [macOS](#macos) for that one.
+The two platforms expose the camera differently. Linux can composite webcam
+frames in its video pipeline or capture a live layer-shell presenter window;
+macOS captures a live AppKit presenter window. The features below describe the
+Linux build — see [macOS](#macos) for that one.
 
 ## Features (Linux)
 
 - Records a Wayland output via `wlr-screencopy` (shm buffers).
-- Supports display-only, webcam-only, and display-plus-webcam modes. (macOS records the display only.)
+- Supports display-only, webcam-only, encoded display-plus-webcam, and live
+  presenter modes. (macOS records the display only.)
+- Shows `presenter` as a borderless, rounded, always-on-top camera window. It
+  stays in one of the display's four corners, can be resized, and is captured
+  as part of the display.
 - Captures the webcam as a **PipeWire** client. The webcam path is
   display-server-agnostic and works under both Xorg and Wayland.
 - **Cooperative camera capture.** `display` recording never touches the webcam
@@ -36,7 +40,8 @@ the Linux build — see [macOS](#macos) for that one.
 
 ## Requirements
 
-- A wlroots-based Wayland compositor with `wlr-screencopy-unstable-v1`.
+- A wlroots-based Wayland compositor with `wlr-screencopy-unstable-v1` and,
+  for presenter mode, `wlr-layer-shell-unstable-v1`.
 - GCC and `make`.
 - `wayland-scanner` and the `wayland-client` library.
 - FFmpeg development libraries:
@@ -186,7 +191,8 @@ daemon/controller:
 ```sh
 screencast display   # start recording the screen + audio (becomes a daemon)
 screencast webcam    # switch the running recorder to webcam + audio
-screencast both      # switch to screen + webcam overlay + audio
+screencast both      # switch to screen + encoded webcam overlay + audio
+screencast presenter # switch to screen + live presenter window + audio
 screencast stop      # stop and render the final MP4
 ```
 
@@ -194,6 +200,13 @@ The first record command starts a background daemon and begins recording. Later
 invocations reach that daemon over a control socket
 (`$XDG_RUNTIME_DIR/screencast.sock`) and switch its mode live within the same
 file. `screencast stop` ends the recording and kicks off the final render.
+
+In `presenter` mode, drag the middle of the camera window toward a different
+corner and release it to snap there. Drag an edge or corner and release it to
+resize proportionally; scrolling over the window also resizes it. The last
+corner and size are saved in `$XDG_CONFIG_HOME/screencast/presenter` (or
+`~/.config/screencast/presenter`). `both` remains the non-interactive overlay
+that is composited directly by the encoder.
 
 Bind these to compositor keys. For **niri** (`config.kdl`), using the original
 screencast shortcuts:
@@ -203,6 +216,7 @@ binds {
     Mod+Shift+D { spawn "screencast" "display"; }
     Mod+Shift+W { spawn "screencast" "webcam"; }
     Mod+Shift+B { spawn "screencast" "both"; }
+    Mod+Shift+P { spawn "screencast" "presenter"; }
     Mod+Escape  { spawn "screencast" "stop"; }
 }
 ```

@@ -10,7 +10,8 @@ void arbiter_init(ArbiterState *s)
 
 int arbiter_wants_webcam(RecordMode requested)
 {
-    return requested == MODE_WEBCAM || requested == MODE_BOTH;
+    return requested == MODE_WEBCAM || requested == MODE_BOTH ||
+           requested == MODE_PRESENTER;
 }
 
 ArbiterPlan arbiter_step(ArbiterState *s, RecordMode requested,
@@ -31,7 +32,9 @@ ArbiterPlan arbiter_step(ArbiterState *s, RecordMode requested,
     if (requested == MODE_DISPLAY || requested == MODE_IDLE)
         effective = MODE_DISPLAY;
     else if (webcam_active)
-        effective = requested;          /* webcam or both */
+        /* The presenter is a real window in display capture, not an encoder
+           composite.  Keep display as the encoder input to avoid duplication. */
+        effective = requested == MODE_PRESENTER ? MODE_DISPLAY : requested;
     else
         effective = MODE_DISPLAY;        /* cooperative decline */
 

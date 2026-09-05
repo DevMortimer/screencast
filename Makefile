@@ -26,7 +26,7 @@ ifeq ($(PLATFORM),macos)
 else
     PLATFORM_SRCS := $(SRCDIR)/linux/main.c $(SRCDIR)/linux/wlcap.c \
                      $(SRCDIR)/linux/pwcam.c $(SRCDIR)/linux/capture.c \
-                     $(SRCDIR)/linux/arbiter.c
+                     $(SRCDIR)/linux/arbiter.c $(SRCDIR)/linux/presenter.c
     SRCS          := $(SHARED_SRCS) $(PLATFORM_SRCS)
 endif
 
@@ -39,6 +39,15 @@ PROTO_XML := $(PROTODIR)/wlr-screencopy-unstable-v1.xml
 PROTO_HDR := $(OBJDIR)/wlr-screencopy-unstable-v1-client-protocol.h
 PROTO_SRC := $(OBJDIR)/wlr-screencopy-unstable-v1-protocol.c
 PROTO_OBJ := $(OBJDIR)/wlr-screencopy-unstable-v1-protocol.o
+
+LAYER_XML := $(PROTODIR)/wlr-layer-shell-unstable-v1.xml
+LAYER_HDR := $(OBJDIR)/wlr-layer-shell-unstable-v1-client-protocol.h
+LAYER_SRC := $(OBJDIR)/wlr-layer-shell-unstable-v1-protocol.c
+LAYER_OBJ := $(OBJDIR)/wlr-layer-shell-unstable-v1-protocol.o
+
+XDG_XML := $(PROTODIR)/xdg-shell.xml
+XDG_SRC := $(OBJDIR)/xdg-shell-protocol.c
+XDG_OBJ := $(OBJDIR)/xdg-shell-protocol.o
 
 SCANNER := wayland-scanner
 
@@ -76,12 +85,28 @@ $(PROTO_SRC): $(PROTO_XML) | $(OBJDIR)
 $(PROTO_OBJ): $(PROTO_SRC)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+$(LAYER_HDR): $(LAYER_XML) | $(OBJDIR)
+	$(SCANNER) client-header $< $@
+
+$(LAYER_SRC): $(LAYER_XML) | $(OBJDIR)
+	$(SCANNER) private-code $< $@
+
+$(LAYER_OBJ): $(LAYER_SRC)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(XDG_SRC): $(XDG_XML) | $(OBJDIR)
+	$(SCANNER) private-code $< $@
+
+$(XDG_OBJ): $(XDG_SRC)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 # Collect link dependencies
 TARGET_DEPS := $(OBJS)
 ifneq ($(PLATFORM),macos)
 # wlcap.c is the only source that includes the generated header.
 $(OBJDIR)/linux/wlcap.o: $(PROTO_HDR)
-TARGET_DEPS += $(PROTO_OBJ)
+$(OBJDIR)/linux/presenter.o: $(LAYER_HDR)
+TARGET_DEPS += $(PROTO_OBJ) $(LAYER_OBJ) $(XDG_OBJ)
 endif
 
 $(TARGET): $(TARGET_DEPS)
@@ -141,6 +166,7 @@ clean:
 # only src/arbiter.c, so it needs no camera, PipeWire, or libav.
 TEST_BIN  := $(OBJDIR)/test_arbiter
 TEST_SRCS := tests/test_arbiter.c src/linux/arbiter.c
+CONTROL_TEST_BIN := $(OBJDIR)/test_control
 
 # The mixer is the other pure seam: given frames in, it decides what comes out
 # and when silence has to stand in for a source.  It needs libav (swresample +
@@ -169,6 +195,7 @@ ENCODER_TEST_PKGS := libavformat libavcodec libswscale libswresample libavutil
 PROBE_BIN := $(OBJDIR)/vt_hwframe_probe
 APPKIT_EVENT_TEST_BIN := $(OBJDIR)/test_appkit_event_pump
 OVERLAY_GEOMETRY_TEST_BIN := $(OBJDIR)/test_overlay_geometry
+PRESENTER_GEOMETRY_TEST_BIN := $(OBJDIR)/test_presenter_geometry
 
 probe: | $(OBJDIR)
 ifeq ($(PLATFORM),macos)
@@ -178,6 +205,11 @@ ifeq ($(PLATFORM),macos)
 else
 	@echo "probe is macOS only"
 endif
+
+test-control: | $(OBJDIR)
+	$(CC) -Isrc -pthread -O2 -Wall -Wextra -std=c11 \
+	    -o $(CONTROL_TEST_BIN) tests/test_control.c src/control.c
+	$(CONTROL_TEST_BIN)
 
 test-mixer: | $(OBJDIR)
 	$(CC) -Isrc -pthread -O2 -Wall -Wextra -std=c11 \
@@ -206,6 +238,11 @@ test-overlay-geometry: | $(OBJDIR)
 	    -o $(OVERLAY_GEOMETRY_TEST_BIN) tests/test_overlay_geometry.c -lm
 	$(OVERLAY_GEOMETRY_TEST_BIN)
 
+test-presenter-geometry: | $(OBJDIR)
+	$(CC) -Isrc/linux -O2 -Wall -Wextra -std=c11 \
+	    -o $(PRESENTER_GEOMETRY_TEST_BIN) tests/test_presenter_geometry.c
+	$(PRESENTER_GEOMETRY_TEST_BIN)
+
 test-appkit-events: | $(OBJDIR)
 ifeq ($(PLATFORM),macos)
 	$(CC) $(CFLAGS) -fobjc-arc -o $(APPKIT_EVENT_TEST_BIN) \
@@ -217,7 +254,8 @@ else
 endif
 
 ifneq ($(PLATFORM),macos)
-test: test-mixer test-audsrc test-encoder test-overlay-geometry | $(OBJDIR)
+test: test-control test-mixer test-audsrc test-encoder test-overlay-geometry \
+      test-presenter-geometry | $(OBJDIR)
 	$(CC) -Isrc -Isrc/linux -pthread -O2 -Wall -Wextra -std=c11 \
 	    -o $(TEST_BIN) $(TEST_SRCS)
 	$(TEST_BIN)
@@ -225,5 +263,5 @@ else
 test: test-mixer test-audsrc test-encoder test-overlay-geometry test-appkit-events
 endif
 
-.PHONY: all clean test test-mixer test-audsrc test-encoder \
-          test-overlay-geometry test-appkit-events probe
+.PHONY: all clean test test-control test-mixer test-audsrc test-encoder \
+          test-overlay-geometry test-presenter-geometry test-appkit-events probe

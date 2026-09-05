@@ -2,10 +2,11 @@
 #include <stdatomic.h>
 
 typedef enum {
-    MODE_IDLE    = 0,
-    MODE_DISPLAY = 1,
-    MODE_WEBCAM  = 2,
-    MODE_BOTH    = 3,
+    MODE_IDLE      = 0,
+    MODE_DISPLAY   = 1,
+    MODE_WEBCAM    = 2,
+    MODE_BOTH      = 3,
+    MODE_PRESENTER = 4,
 } RecordMode;
 
 /* Updated by the control listener thread; read by the record loop. */

@@ -92,8 +92,9 @@ const char *control_mode_label(RecordMode mode)
 #else
     case MODE_DISPLAY: return "Display + mic";
 #endif
-    case MODE_WEBCAM:  return "Webcam + mic";
-    case MODE_BOTH:    return "Display + webcam + mic";
+    case MODE_WEBCAM:    return "Webcam + mic";
+    case MODE_BOTH:      return "Display + webcam + mic";
+    case MODE_PRESENTER: return "Display + live presenter + mic";
     default:           return NULL;
     }
 }
@@ -116,8 +117,9 @@ int control_parse_mode(const char *cmd)
         return -1;
     }
 #else
-    if (!strcmp(cmd, "webcam")  || !strcmp(cmd, "w")) return MODE_WEBCAM;
-    if (!strcmp(cmd, "both")    || !strcmp(cmd, "b")) return MODE_BOTH;
+    if (!strcmp(cmd, "webcam")    || !strcmp(cmd, "w")) return MODE_WEBCAM;
+    if (!strcmp(cmd, "both")      || !strcmp(cmd, "b")) return MODE_BOTH;
+    if (!strcmp(cmd, "presenter") || !strcmp(cmd, "p")) return MODE_PRESENTER;
 #endif
     return -1;
 }
@@ -246,8 +248,8 @@ int control_server_start(void)
 #ifdef __APPLE__
     printf("  screencast stop  ->  stop and exit\n\n");
 #else
-    printf("  screencast display | webcam | both  ->  switch mode\n");
-    printf("  screencast stop                      ->  stop and exit\n\n");
+    printf("  screencast display | webcam | both | presenter  ->  switch mode\n");
+    printf("  screencast stop                                ->  stop and exit\n\n");
 #endif
     return 0;
 }
