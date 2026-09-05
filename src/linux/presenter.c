@@ -452,12 +452,42 @@ static void pointer_axis(void *data, struct wl_pointer *pointer,
     }
 }
 
+/* Pointer version 5 groups every event sequence with frame and can report
+   axis metadata.  Even when the presenter does not use that metadata, every
+   advertised opcode needs a listener: libwayland aborts on a null callback. */
+static void pointer_frame(void *data, struct wl_pointer *pointer)
+{
+    (void)data; (void)pointer;
+}
+
+static void pointer_axis_source(void *data, struct wl_pointer *pointer,
+                                uint32_t source)
+{
+    (void)data; (void)pointer; (void)source;
+}
+
+static void pointer_axis_stop(void *data, struct wl_pointer *pointer,
+                              uint32_t time, uint32_t axis)
+{
+    (void)data; (void)pointer; (void)time; (void)axis;
+}
+
+static void pointer_axis_discrete(void *data, struct wl_pointer *pointer,
+                                  uint32_t axis, int32_t discrete)
+{
+    (void)data; (void)pointer; (void)axis; (void)discrete;
+}
+
 static const struct wl_pointer_listener pointer_listener = {
     .enter = pointer_enter,
     .leave = pointer_leave,
     .motion = pointer_motion,
     .button = pointer_button,
     .axis = pointer_axis,
+    .frame = pointer_frame,
+    .axis_source = pointer_axis_source,
+    .axis_stop = pointer_axis_stop,
+    .axis_discrete = pointer_axis_discrete,
 };
 
 static void seat_capabilities(void *data, struct wl_seat *seat,
